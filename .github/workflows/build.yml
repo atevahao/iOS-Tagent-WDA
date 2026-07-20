@@ -40,12 +40,16 @@ jobs:
         run: |
           APP=$(find base/ios-app/build -name "Test.app" -type d | head -1)
           echo "App: $APP"
+          if [ -z "$APP" ]; then
+            echo "ERROR: Test.app not found"
+            find base/ios-app/build -name "*.app" -type d 2>/dev/null
+            exit 1
+          fi
           ls -la "$APP" | head -5
-          mkdir Payload
+          mkdir -p Payload
           cp -r "$APP" Payload/
-          zip -r exploit_A14_iOS26.ipa Payload/
-          ls -lh exploit_A14_iOS26.ipa
-          cp exploit_A14_iOS26.ipa $GITHUB_WORKSPACE/
+          zip -r $GITHUB_WORKSPACE/exploit_A14_iOS26.ipa Payload/
+          ls -lh $GITHUB_WORKSPACE/exploit_A14_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
         with:
