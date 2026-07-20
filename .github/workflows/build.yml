@@ -1,39 +1,55 @@
-name: Build
+name: Build SwiftSword IPA
 
 on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone base project
-        run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF.git base
-
-      - name: Inject exploit code
+      - name: Clone Cyanide (base Xcode project)
         run: |
-          cp exploit/*.h base/ios-app/Test/
-          cp exploit/*.m base/ios-app/Test/
-          python3 scripts/patch_pbxproj.py base/ios-app/Test.xcodeproj/project.pbxproj
-          echo "--- Files in Test group: ---"
-          ls base/ios-app/Test/
+          git clone --depth=1 https://github.com/zeroxjf/cyanide.git base
+          echo "Cyanide cloned"
 
-      - name: Show build settings
+      - name: Verify Cyanide builds
         run: |
-          cd base/ios-app
-          xcodebuild -project Test.xcodeproj -scheme Test -sdk iphoneos \
-            -configuration Release -showBuildSettings 2>&1 \
-            | grep -E "BUILD_DIR|BUILT_PRODUCTS_DIR|TARGET_BUILD_DIR|PRODUCT_NAME" \
-            | head -10
+          cd base
+          xcodebuild -project Cyanide.xcodeproj -scheme Cyanide \
+            -sdk iphoneos -configuration Release \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO -derivedDataPath build build 2>&1 | tail -5
+          echo "Cyanide base builds OK"
 
-      - name: Build
+      - name: Replace with SwiftSword source
         run: |
-          cd base/ios-app
+          # Remove Cyanide app source, keep kexploit framework
+          rm -f base/Cyanide/*.m base/Cyanide/*.h
+          rm -rf base/Cyanide/Assets.xcassets
+
+          # Copy our source files
+          cp SwiftSword/*.m base/Cyanide/
+          cp SwiftSword/*.h base/Cyanide/
+          cp SwiftSword/*.plist base/Cyanide/
+
+          # Copy exploit & payload modules
+          mkdir -p base/Cyanide/Exploit base/Cyanide/Payload
+          cp SwiftSword/Exploit/*.m base/Cyanide/Exploit/
+          cp SwiftSword/Exploit/*.h base/Cyanide/Exploit/
+          cp SwiftSword/Payload/*.m base/Cyanide/Payload/
+          cp SwiftSword/Payload/*.h base/Cyanide/Payload/
+
+          echo "Source injected"
+          ls base/Cyanide/
+
+      - name: Build IPA
+        run: |
+          cd base
           xcodebuild \
-            -project Test.xcodeproj \
-            -scheme Test \
+            -project Cyanide.xcodeproj \
+            -scheme Cyanide \
             -sdk iphoneos \
             -configuration Release \
             CODE_SIGN_IDENTITY="-" \
@@ -41,33 +57,28 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
             CONFIGURATION_BUILD_DIR="$PWD/build_output" \
-            2>&1 | tail -25
-          echo "--- Build products: ---"
-          ls -la build_output/ 2>/dev/null || echo "no build_output"
+            2>&1 | tail -15
+          echo "Build exit: $?"
 
       - name: Package IPA
         run: |
-          APP=$(find base/ios-app/build_output -name "*.app" -type d | head -1)
+          APP=$(find base/build_output -name "*.app" -type d | head -1)
           if [ -z "$APP" ]; then
-            APP=$(find base/ios-app -name "Test.app" -type d -path "*/Release-iphoneos/*" | head -1)
+            APP=$(find base/build -name "Cyanide.app" -type d | head -1)
           fi
           if [ -z "$APP" ]; then
-            APP=$(find . -name "Test.app" -type d 2>/dev/null | head -1)
-          fi
-          if [ -z "$APP" ]; then
-            echo "FAILED: Test.app not found anywhere"
-            find . -name "*.app" -type d 2>/dev/null
+            echo "FAILED: .app not found"
+            find base -name "*.app" -type d 2>/dev/null
             exit 1
           fi
           echo "Found: $APP"
-          ls -la "$APP" | head -5
           mkdir Payload
           cp -r "$APP" Payload/
-          zip -r $GITHUB_WORKSPACE/exploit_A14_iOS26.ipa Payload/
-          ls -lh $GITHUB_WORKSPACE/exploit_A14_iOS26.ipa
+          zip -r "$GITHUB_WORKSPACE/SwiftSword_iOS26.ipa" Payload/
+          ls -lh "$GITHUB_WORKSPACE/SwiftSword_iOS26.ipa"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: exploit_A14_iOS26
-          path: exploit_A14_iOS26.ipa
+          name: SwiftSword_iOS26
+          path: SwiftSword_iOS26.ipa
           retention-days: 7

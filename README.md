@@ -1,45 +1,47 @@
-# iOS 26.2 Kernel Exploit — iPhone 12 Pro Max (A14)
+# SwiftSword — iOS 26.2 Kernel Exploit
 
-基于 CVE-2026-20687 AppleJPEGDriver UAF + pois0nSword 后利用框架
+**CVE-2026-28992** IOHIDFamily FastPathUserClient UAF
+A14 (iPhone 12 Pro Max) • iOS 26.2 • No MTE
 
-## 编译 IPA (自动)
+## Build IPA
 
-1. 把这个仓库推到 GitHub
-2. Actions → Build iOS 26.2 Exploit IPA → Run workflow
-3. 下载 artifact `exploit_A14_iOS26`
+1. Push to GitHub
+2. Actions → Build SwiftSword IPA → Run workflow
+3. Download `SwiftSword_iOS26` artifact
 
-## 安装到 iPhone
+## Install
 
-```bash
-# Windows 上 (需要 pymobiledevice3)
-pymobiledevice3 apps install exploit_A14_iOS26.ipa
-
-# 或 SideStore / BreakFree
+```
+pymobiledevice3 apps install SwiftSword_iOS26.ipa
 ```
 
-## 运行
+Or SideStore / BreakFree / Sideloadly.
 
-1. 打开 App → 点 Panic 按钮
-2. 打开相机 App 触发内核 UAF
-
-## 实时调试
+## Test
 
 ```bash
-# 终端抓内核日志
-python test_device.py
+# Terminal 1: capture kernel logs
+python scripts/capture_logs.py
+
+# Terminal 2: install & run the app
+# Tap "EXPLOIT (UAF)" button
+# Watch Terminal 1 for panic output
 ```
 
-## 依赖
+## Architecture
 
-| 项目 | 作用 |
-|------|------|
-| [zeroxjf/CVE-2026-20687](https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF) | Xcode 项目框架 + IOKit 利用 |
-| [GenericCoding/pois0nSword](https://github.com/GenericCoding/pois0nSword) | PAC 绕过 + 后利用 |
+```
+SwiftSword/
+├── Exploit/IOHIDFamilyUAF.m   # CVE-2026-28992 kernel entry
+├── Payload/collector.m        # SMS/Photo/Contact/Keychain/walletdb dump
+├── ViewController.m           # UI + orchestrator
+├── AppDelegate.m              # Minimal app delegate
+├── SceneDelegate.m            # Scene setup
+└── Info.plist                 # App metadata
+```
 
-## 状态
+## Credits
 
-- [ ] 第1步: UAF → PC 控制
-- [ ] 第2步: PC → 内核 r/w
-- [ ] 第3步: r/w → 提权
-- [ ] 第4步: Keychain dump
-- [ ] 第5步: TRON 私钥
+- Johnny Franks (@zeroxjf) — CVE-2026-28992 discovery
+- clogan9019 — IOHIDFamily PoC
+- Cyanide project — Xcode base framework
