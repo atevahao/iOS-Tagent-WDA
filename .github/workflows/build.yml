@@ -1,6 +1,8 @@
 name: Build Exploit IPA
 
-on: [workflow_dispatch]
+on:
+  workflow_dispatch:
+  push:
 
 jobs:
   build:
@@ -9,108 +11,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone base Xcode project (zeroxjf CVE-2026-20687)
+      - name: Clone base project (zeroxjf CVE-2026-20687)
         run: |
-          git clone --depth=1 https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF.git base/
+          git clone --depth=1 https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF.git base
+          echo "Base project cloned"
+
+      - name: Verify base project compiles
+        run: |
           cd base/ios-app
-          # 确认能编译
           xcodebuild -project Test.xcodeproj -scheme Test -sdk iphoneos \
-            -configuration Release CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath ../../derived build 2>&1 | tail -5
-          echo "BASE_BUILD_OK"
+            -configuration Release \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            -derivedDataPath ../../derived build 2>&1 | tail -10
 
-      - name: Inject exploit payload into Xcode project
+      - name: Copy exploit files into project
         run: |
-          PROJECT="base/ios-app/Test.xcodeproj/project.pbxproj"
-          MAIN_GROUP="base/ios-app/Test/"
+          cp exploit/applejpeg_krw.h base/ios-app/Test/
+          cp exploit/applejpeg_krw.m base/ios-app/Test/
+          cp exploit/collector.h base/ios-app/Test/
+          cp exploit/collector.m base/ios-app/Test/
+          echo "Exploit files copied"
 
-          # 复制 exploit 源文件到项目中
-          cp exploit/applejpeg_krw.h exploit/applejpeg_krw.m ${MAIN_GROUP}
-          cp exploit/collector.h exploit/collector.m ${MAIN_GROUP}
-
-          echo "Exploit files copied into Xcode project"
-
-      - name: Patch Xcode project to include new sources
+      - name: Patch Xcode project
         run: |
-          PROJECT="base/ios-app/Test.xcodeproj/project.pbxproj"
-
-          # 生成唯一的文件引用 ID
-          KRW_FILE_ID=$(uuidgen | tr '[:lower:]' '[:upper:]' | tr -d '-' | cut -c1-24)
-          KRW_BUILD_ID=$(uuidgen | tr '[:lower:]' '[:upper:]' | tr -d '-' | cut -c1-24)
-          COLL_FILE_ID=$(uuidgen | tr '[:lower:]' '[:upper:]' | tr -d '-' | cut -c1-24)
-          COLL_BUILD_ID=$(uuidgen | tr '[:lower:]' '[:upper:]' | tr -d '-' | cut -c1-24)
-
-          # 找到主 group 的 ID
-          MAIN_GROUP_ID=$(grep -o '[A-F0-9]\{24\} /\* Test \*/' "$PROJECT" | head -1 | cut -d' ' -f1)
-          echo "Main group ID: ${MAIN_GROUP_ID}"
-
-          # 添加新文件到 project.pbxproj
-          # 在 "End PBXFileReference" 之前插入新的文件引用
-          sed -i '' "/\/\* End PBXFileReference \*\//i\\
-\t\t${KRW_FILE_ID} \/\* applejpeg_krw.m \*\/ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = applejpeg_krw.m; sourceTree = \"\<group\>\"; };\\
-\t\t${KRW_FILE_ID}_h \/\* applejpeg_krw.h \*\/ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = applejpeg_krw.h; sourceTree = \"\<group\>\"; };\\
-\t\t${COLL_FILE_ID} \/\* collector.m \*\/ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = collector.m; sourceTree = \"\<group\>\"; };\\
-\t\t${COLL_FILE_ID}_h \/\* collector.h \*\/ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = collector.h; sourceTree = \"\<group\>\"; };\\
-" "$PROJECT" 2>/dev/null || echo "sed failed, trying alternative"
-
-          # 用 Python 做更靠谱的注入
-          python3 << PYEOF
-import re, sys
-
-with open('${PROJECT}', 'r') as f:
-    content = f.read()
-
-# 文件引用
-file_refs = f"""\t\t${KRW_FILE_ID} /* applejpeg_krw.m */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = applejpeg_krw.m; sourceTree = "<group>"; }};
-\t\t${KRW_FILE_ID}_H /* applejpeg_krw.h */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = applejpeg_krw.h; sourceTree = "<group>"; }};
-\t\t${COLL_FILE_ID} /* collector.m */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = collector.m; sourceTree = "<group>"; }};
-\t\t${COLL_FILE_ID}_H /* collector.h */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = collector.h; sourceTree = "<group>"; }};"""
-
-content = content.replace('/* End PBXFileReference section */',
-                          file_refs + '\n/* End PBXFileReference section */')
-
-# 编译文件引用
-build_files = f"""\t\t${KRW_BUILD_ID} /* applejpeg_krw.m in Sources */ = {{isa = PBXBuildFile; fileRef = ${KRW_FILE_ID} /* applejpeg_krw.m */; }};
-\t\t${COLL_BUILD_ID} /* collector.m in Sources */ = {{isa = PBXBuildFile; fileRef = ${COLL_FILE_ID} /* collector.m */; }};"""
-
-content = content.replace('/* End PBXBuildFile section */',
-                          build_files + '\n/* End PBXBuildFile section */')
-
-# 添加到 children 列表 (Test group)
-children_block = 'children = (\n'
-for fname in ['applejpeg_krw.h', 'applejpeg_krw.m', 'collector.h', 'collector.m']:
-    fid = {'applejpeg_krw.h': f'${KRW_FILE_ID}_H',
-           'applejpeg_krw.m': f'${KRW_FILE_ID}',
-           'collector.h': f'${COLL_FILE_ID}_H',
-           'collector.m': f'${COLL_FILE_ID}'}[fname]
-    ref = f'\t\t\t\t{fid} /* {fname} */,\n'
-    if ref not in content:
-        content = content.replace(children_block, children_block + ref)
-
-# 添加到编译阶段
-sources_phase = 'PBXSourcesBuildPhase section'
-src_insert = f"""\t\t\t\t${KRW_BUILD_ID} /* applejpeg_krw.m in Sources */,
-\t\t\t\t${COLL_BUILD_ID} /* collector.m in Sources */,"""
-for suf in ['/* Sources */,\n', '/* Sources */,\n\t\t\t']:
-    if src_insert not in content:
-        content = content.replace(
-            'files = (\n\t\t\t' if 'files = (' in content else 'files = (',
-            'files = (\n' + src_insert + '\n\t\t\t')
-        break
-
-with open('${PROJECT}', 'w') as f:
-    f.write(content)
-
-print("pbxproj patched successfully")
-print(f"KRW: {KRW_FILE_ID} | COLL: {COLL_FILE_ID}")
-PYEOF
-          echo "Xcode project patched"
+          python3 scripts/patch_pbxproj.py base/ios-app/Test.xcodeproj/project.pbxproj
 
       - name: Build IPA
         run: |
           cd base/ios-app
-          rm -rf /tmp/archive
           xcodebuild archive \
             -project Test.xcodeproj \
             -scheme Test \
@@ -119,19 +49,28 @@ PYEOF
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=NO 2>&1 | tail -30
+            ONLY_ACTIVE_ARCH=NO 2>&1 | tail -15
+          echo "Build exit code: $?"
 
       - name: Package IPA
         run: |
+          if [ -d "/tmp/archive.xcarchive/Products/Applications/Test.app" ]; then
+            APP="/tmp/archive.xcarchive/Products/Applications/Test.app"
+          elif [ -d "/tmp/archive/Products/Applications/Test.app" ]; then
+            APP="/tmp/archive/Products/Applications/Test.app"
+          else
+            echo "Cannot find .app bundle"
+            find /tmp/archive* -name "*.app" 2>/dev/null
+            exit 1
+          fi
           mkdir Payload
-          cp -r /tmp/archive.xcarchive/Products/Applications/Test.app Payload/ 2>/dev/null || \
-          cp -r /tmp/archive/Products/Applications/Test.app Payload/ 2>/dev/null || \
-          { echo "Build failed - check logs above"; exit 1; }
+          cp -r "$APP" Payload/
           zip -r exploit_A14_iOS26.ipa Payload/
           ls -lh exploit_A14_iOS26.ipa
+          cp exploit_A14_iOS26.ipa $GITHUB_WORKSPACE/
 
       - uses: actions/upload-artifact@v4
         with:
           name: exploit_A14_iOS26
-          path: base/ios-app/exploit_A14_iOS26.ipa
+          path: exploit_A14_iOS26.ipa
           retention-days: 7
