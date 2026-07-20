@@ -44,27 +44,26 @@ jobs:
           xcodebuild archive \
             -project Test.xcodeproj \
             -scheme Test \
-            -archivePath /tmp/archive \
+            -archivePath /tmp/App \
             -configuration Release \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO 2>&1 | tail -15
-          echo "Build exit code: $?"
+          echo "Archive exit: $?"
+          ls -la /tmp/App.xcarchive/
 
       - name: Package IPA
         run: |
-          if [ -d "/tmp/archive.xcarchive/Products/Applications/Test.app" ]; then
-            APP="/tmp/archive.xcarchive/Products/Applications/Test.app"
-          elif [ -d "/tmp/archive/Products/Applications/Test.app" ]; then
-            APP="/tmp/archive/Products/Applications/Test.app"
-          else
-            echo "Cannot find .app bundle"
-            find /tmp/archive* -name "*.app" 2>/dev/null
+          APP_DIR=$(find /tmp/App.xcarchive -name "Test.app" -type d | head -1)
+          if [ -z "$APP_DIR" ]; then
+            echo "Failed to find Test.app"
+            find /tmp/App.xcarchive -type d | head -20
             exit 1
           fi
+          echo "Found app: $APP_DIR"
           mkdir Payload
-          cp -r "$APP" Payload/
+          cp -r "$APP_DIR" Payload/
           zip -r exploit_A14_iOS26.ipa Payload/
           ls -lh exploit_A14_iOS26.ipa
           cp exploit_A14_iOS26.ipa $GITHUB_WORKSPACE/
