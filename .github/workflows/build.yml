@@ -1,25 +1,32 @@
-name: Build Exploit IPA
+name: Build
 
-on: [workflow_dispatch, push]
+on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
       - name: Clone base project
-        run: |
-          git clone --depth=1 https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF.git base
+        run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF.git base
 
       - name: Inject exploit code
         run: |
-          cp exploit/applejpeg_krw.h base/ios-app/Test/
-          cp exploit/applejpeg_krw.m base/ios-app/Test/
-          cp exploit/collector.h base/ios-app/Test/
-          cp exploit/collector.m base/ios-app/Test/
+          cp exploit/*.h base/ios-app/Test/
+          cp exploit/*.m base/ios-app/Test/
           python3 scripts/patch_pbxproj.py base/ios-app/Test.xcodeproj/project.pbxproj
+          echo "--- Files in Test group: ---"
+          ls base/ios-app/Test/
+
+      - name: Show build settings
+        run: |
+          cd base/ios-app
+          xcodebuild -project Test.xcodeproj -scheme Test -sdk iphoneos \
+            -configuration Release -showBuildSettings 2>&1 \
+            | grep -E "BUILD_DIR|BUILT_PRODUCTS_DIR|TARGET_BUILD_DIR|PRODUCT_NAME" \
+            | head -10
 
       - name: Build
         run: |
@@ -29,24 +36,32 @@ jobs:
             -scheme Test \
             -sdk iphoneos \
             -configuration Release \
-            -derivedDataPath build \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=NO 2>&1 | tail -15
-          echo "Build done"
+            ONLY_ACTIVE_ARCH=NO \
+            CONFIGURATION_BUILD_DIR="$PWD/build_output" \
+            2>&1 | tail -25
+          echo "--- Build products: ---"
+          ls -la build_output/ 2>/dev/null || echo "no build_output"
 
-      - name: Find and package IPA
+      - name: Package IPA
         run: |
-          APP=$(find base/ios-app/build -name "Test.app" -type d | head -1)
-          echo "App: $APP"
+          APP=$(find base/ios-app/build_output -name "*.app" -type d | head -1)
           if [ -z "$APP" ]; then
-            echo "ERROR: Test.app not found"
-            find base/ios-app/build -name "*.app" -type d 2>/dev/null
+            APP=$(find base/ios-app -name "Test.app" -type d -path "*/Release-iphoneos/*" | head -1)
+          fi
+          if [ -z "$APP" ]; then
+            APP=$(find . -name "Test.app" -type d 2>/dev/null | head -1)
+          fi
+          if [ -z "$APP" ]; then
+            echo "FAILED: Test.app not found anywhere"
+            find . -name "*.app" -type d 2>/dev/null
             exit 1
           fi
+          echo "Found: $APP"
           ls -la "$APP" | head -5
-          mkdir -p Payload
+          mkdir Payload
           cp -r "$APP" Payload/
           zip -r $GITHUB_WORKSPACE/exploit_A14_iOS26.ipa Payload/
           ls -lh $GITHUB_WORKSPACE/exploit_A14_iOS26.ipa
