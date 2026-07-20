@@ -1,8 +1,6 @@
 name: Build Exploit IPA
 
-on:
-  workflow_dispatch:
-  push:
+on: [workflow_dispatch, push]
 
 jobs:
   build:
@@ -11,65 +9,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone base project (zeroxjf CVE-2026-20687)
+      - name: Clone base project
         run: |
           git clone --depth=1 https://github.com/zeroxjf/CVE-2026-20687-AppleJPEGDriver-UAF.git base
-          echo "Base project cloned"
 
-      - name: Verify base project compiles
-        run: |
-          cd base/ios-app
-          xcodebuild -project Test.xcodeproj -scheme Test -sdk iphoneos \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath ../../derived build 2>&1 | tail -10
-
-      - name: Copy exploit files into project
+      - name: Inject exploit code
         run: |
           cp exploit/applejpeg_krw.h base/ios-app/Test/
           cp exploit/applejpeg_krw.m base/ios-app/Test/
           cp exploit/collector.h base/ios-app/Test/
           cp exploit/collector.m base/ios-app/Test/
-          echo "Exploit files copied"
-
-      - name: Patch Xcode project
-        run: |
           python3 scripts/patch_pbxproj.py base/ios-app/Test.xcodeproj/project.pbxproj
 
-      - name: Build IPA
+      - name: Build
         run: |
           cd base/ios-app
-          xcodebuild archive \
+          xcodebuild \
             -project Test.xcodeproj \
             -scheme Test \
-            -archivePath /tmp/App \
+            -sdk iphoneos \
             -configuration Release \
+            -derivedDataPath build \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO 2>&1 | tail -15
-          echo "Archive exit: $?"
-          ls -la /tmp/App.xcarchive/
+          echo "Build done"
 
-      - name: Package IPA
+      - name: Find and package IPA
         run: |
-          APP_DIR=$(find /tmp/App.xcarchive -name "Test.app" -type d | head -1)
-          if [ -z "$APP_DIR" ]; then
-            echo "Failed to find Test.app"
-            find /tmp/App.xcarchive -type d | head -20
-            exit 1
-          fi
-          echo "Found app: $APP_DIR"
+          APP=$(find base/ios-app/build -name "Test.app" -type d | head -1)
+          echo "App: $APP"
+          ls -la "$APP" | head -5
           mkdir Payload
-          cp -r "$APP_DIR" Payload/
+          cp -r "$APP" Payload/
           zip -r exploit_A14_iOS26.ipa Payload/
           ls -lh exploit_A14_iOS26.ipa
-          cp exploit_A14_iOS26.ipa $GITHUB_WORKSPACE/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: exploit_A14_iOS26
-          path: exploit_A14_iOS26.ipa
-          retention-days: 7
