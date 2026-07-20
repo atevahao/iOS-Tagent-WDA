@@ -45,3 +45,10 @@ jobs:
           cp -r "$APP" Payload/
           zip -r exploit_A14_iOS26.ipa Payload/
           ls -lh exploit_A14_iOS26.ipa
+          cp exploit_A14_iOS26.ipa $GITHUB_WORKSPACE/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exploit_A14_iOS26
+          path: exploit_A14_iOS26.ipa
+          retention-days: 7
