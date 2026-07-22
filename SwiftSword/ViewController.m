@@ -112,19 +112,6 @@
         NSRange end = NSMakeRange(self.logView.text.length - 1, 1);
         [self.logView scrollRangeToVisible:end];
     });
-    // 同时写本地文件——panic 重启后可用爱思助手导出
-    static dispatch_once_t once;
-    static NSFileHandle *fh;
-    dispatch_once(&once, ^{
-        NSString *path = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:@"sword.log"];
-        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        [fh seekToEndOfFile];
-    });
-    NSString *line = [msg stringByAppendingString:@"\n"];
-    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh synchronizeFile];  // 确保 panic 前刷盘
 }
 
 - (void)setStatus:(NSString *)text color:(UIColor *)color {
