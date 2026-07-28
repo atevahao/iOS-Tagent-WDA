@@ -21,7 +21,7 @@ jobs:
         run: |
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
-            -sdk iphoneos -configuration Debug \
+            -sdk iphoneos -configuration Release \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | grep -iE "error:|BUILD FAILED" | head -10
@@ -45,8 +45,8 @@ jobs:
 
       - name: Package
         run: |
-          APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
-          [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           rm -rf Payload && mkdir Payload
