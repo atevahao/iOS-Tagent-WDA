@@ -36,12 +36,30 @@ jobs:
             CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | tail -20
 
+      - name: Inspect .app
+        run: |
+          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
+          [ -z "$APP" ] && { echo "FAIL: no .app"; exit 1; }
+          echo "=== App path: $APP ==="
+          echo "=== Top-level contents ==="
+          ls -la "$APP" | head -20
+          echo "=== Info.plist check ==="
+          if [ -f "$APP/Info.plist" ]; then
+            echo "YES - Info.plist found"
+            plutil -p "$APP/Info.plist" | grep -E "CFBundleName|CFBundleDisplayName|CFBundleIdentifier|CFBundleExecutable" | head -5
+          else
+            echo "NO Info.plist in .app root"
+            find "$APP" -name "Info.plist" -type f
+          fi
+          echo "=== Bundle executable ==="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist" 2>/dev/null && ls -la "$APP/$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist" 2>/dev/null)" 2>/dev/null || echo "Can't read executable"
+
       - name: Package
         run: |
           APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
-          [ -z "$APP" ] && { echo "FAIL: no .app"; find . -name "*.app" -type d 2>/dev/null; exit 1; }
-          echo "App: $APP"
+          [ -z "$APP" ] && { echo "FAIL: no .app"; exit 1; }
           rm -rf Payload
           mkdir Payload
           cp -R "$APP" Payload/SwiftSword.app
