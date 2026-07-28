@@ -49,20 +49,12 @@ jobs:
           [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
-          echo "App: $APP"
-          echo "Contents:"
-          ls -la "$APP" | head -10
-          echo "Info.plist exists:"
-          [ -f "$APP/Info.plist" ] && echo "YES" || { echo "NO"; find "$APP" -name "Info.plist"; }
-          mkdir Payload
+          rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          echo "=== Info.plist dump ==="
-          /usr/libexec/PlistBuddy -c "Print" "Payload/UAFPoc.app/Info.plist" 2>/dev/null || plutil -p "Payload/UAFPoc.app/Info.plist"
-          echo "=== Binary check ==="
-          file "Payload/UAFPoc.app/UAFPoc"
-          echo "=== Payload contents ==="
-          ls -la Payload/
-          ls -la Payload/UAFPoc.app/ 2>/dev/null || echo "UAFPoc.app not found in Payload"
+          # Ad-hoc sign the binary so Sideloadly can parse the IPA
+          codesign -s - -f "Payload/UAFPoc.app" 2>&1 || true
+          echo "=== Code sign check ==="
+          codesign -d -v "Payload/UAFPoc.app" 2>&1 || true
           zip -r -X UAFPoc_iOS26.ipa Payload/
           ls -lh UAFPoc_iOS26.ipa
 
