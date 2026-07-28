@@ -56,7 +56,11 @@ jobs:
           [ -f "$APP/Info.plist" ] && echo "YES" || { echo "NO"; find "$APP" -name "Info.plist"; }
           mkdir Payload
           cp -R "$APP" Payload/
-          echo "Payload contents:"
+          echo "=== Info.plist dump ==="
+          /usr/libexec/PlistBuddy -c "Print" "Payload/UAFPoc.app/Info.plist" 2>/dev/null || plutil -p "Payload/UAFPoc.app/Info.plist"
+          echo "=== Binary check ==="
+          file "Payload/UAFPoc.app/UAFPoc"
+          echo "=== Payload contents ==="
           ls -la Payload/
           ls -la Payload/UAFPoc.app/ 2>/dev/null || echo "UAFPoc.app not found in Payload"
           zip -r UAFPoc_iOS26.ipa Payload/
