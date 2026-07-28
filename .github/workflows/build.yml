@@ -43,8 +43,8 @@ jobs:
           [ -z "$APP" ] && { echo "FAIL: no .app"; find . -name "*.app" -type d 2>/dev/null; exit 1; }
           echo "App: $APP"
           rm -rf Payload
-          mkdir -p Payload/SwiftSword.app
-          cp -R "$APP"/. Payload/SwiftSword.app/
+          mkdir Payload
+          cp -R "$APP" Payload/SwiftSword.app
           zip -r SwiftSword_iOS26.ipa Payload/
           ls -lh SwiftSword_iOS26.ipa
 
