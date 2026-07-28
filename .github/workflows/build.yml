@@ -17,10 +17,26 @@ jobs:
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
             -sdk iphoneos -configuration Debug \
-            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
-            ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath DerivedData 2>&1 | grep -iE "error:|warning:|BUILD|FAILED|SUCCEEDED|Process" | head -30
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
+            -derivedDataPath DerivedData 2>&1 | grep -iE "error:|BUILD FAILED" | head -10
           echo "BUILD_EXIT=$?"
+
+      - name: Inject binary into app
+        run: |
+          APP=$(find base/UAFPoc/DerivedData -name "UAFPoc.app" -type d | head -1)
+          # Find the compiled binary (usually in Intermediates)
+          BIN=$(find base/UAFPoc/DerivedData -name "UAFPoc" -type f ! -path "*\.app/*" | head -1)
+          echo "Binary: $BIN"
+          echo "App: $APP"
+          if [ -n "$BIN" ] && [ -n "$APP" ]; then
+            cp "$BIN" "$APP/UAFPoc"
+            echo "Binary copied to app"
+            ls -la "$APP"
+          else
+            echo "Could not find binary or app"
+            find base/UAFPoc/DerivedData -name "UAFPoc" -type f 2>/dev/null | head -10
+          fi
 
       - name: Package
         run: |
