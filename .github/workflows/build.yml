@@ -23,11 +23,19 @@ jobs:
 
       - name: Package
         run: |
-          APP=$(find . -name "UAFPoc.app" -type d | head -1)
-          [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
+          echo "App: $APP"
+          echo "Contents:"
+          ls -la "$APP" | head -10
+          echo "Info.plist exists:"
+          [ -f "$APP/Info.plist" ] && echo "YES" || { echo "NO"; find "$APP" -name "Info.plist"; }
           mkdir Payload
           cp -R "$APP" Payload/
+          echo "Payload contents:"
+          ls -la Payload/
+          ls -la Payload/UAFPoc.app/ 2>/dev/null || echo "UAFPoc.app not found in Payload"
           zip -r UAFPoc_iOS26.ipa Payload/
           ls -lh UAFPoc_iOS26.ipa
 
