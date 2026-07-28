@@ -46,7 +46,6 @@ jobs:
           mkdir -p Payload/SwiftSword.app
           cp -R "$APP"/. Payload/SwiftSword.app/
           zip -r SwiftSword_iOS26.ipa Payload/
-          cp SwiftSword_iOS26.ipa "$GITHUB_WORKSPACE"/
           ls -lh SwiftSword_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
