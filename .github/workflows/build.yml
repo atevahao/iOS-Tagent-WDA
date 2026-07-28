@@ -63,7 +63,7 @@ jobs:
           echo "=== Payload contents ==="
           ls -la Payload/
           ls -la Payload/UAFPoc.app/ 2>/dev/null || echo "UAFPoc.app not found in Payload"
-          zip -r UAFPoc_iOS26.ipa Payload/
+          zip -r -X UAFPoc_iOS26.ipa Payload/
           ls -lh UAFPoc_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
