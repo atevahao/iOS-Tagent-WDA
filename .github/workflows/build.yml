@@ -17,14 +17,15 @@ jobs:
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
             -sdk iphoneos -configuration Debug \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | grep -iE "error:|warning:|BUILD|FAILED|SUCCEEDED|Process" | head -30
           echo "BUILD_EXIT=$?"
 
       - name: Package
         run: |
-          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           echo "App: $APP"
