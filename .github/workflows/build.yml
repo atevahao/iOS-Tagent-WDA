@@ -10,9 +10,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Clone Cyanide (base Xcode project)
-        run: |
-          git clone --depth=1 https://github.com/zeroxjf/cyanide.git base
-          echo "Cyanide cloned"
+        run: git clone --depth=1 https://github.com/zeroxjf/cyanide.git base
 
       - name: Verify Cyanide builds
         run: |
@@ -21,63 +19,76 @@ jobs:
             -sdk iphoneos -configuration Release \
             CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO -derivedDataPath build build 2>&1 | tail -5
-          echo "Cyanide base builds OK"
+          echo "Base builds OK"
 
-      - name: Replace with SwiftSword source
+      - name: Add exploit files + patch pbxproj
         run: |
-          # Remove Cyanide app source, keep kexploit framework
-          rm -f base/Cyanide/*.m base/Cyanide/*.h
-          rm -rf base/Cyanide/Assets.xcassets
-
-          # Copy our source files
-          cp SwiftSword/*.m base/Cyanide/
-          cp SwiftSword/*.h base/Cyanide/
-          cp SwiftSword/*.plist base/Cyanide/
-
-          # Copy exploit & payload modules
           mkdir -p base/Cyanide/Exploit base/Cyanide/Payload
-          cp SwiftSword/Exploit/*.m base/Cyanide/Exploit/
-          cp SwiftSword/Exploit/*.h base/Cyanide/Exploit/
-          cp SwiftSword/Payload/*.m base/Cyanide/Payload/
-          cp SwiftSword/Payload/*.h base/Cyanide/Payload/
+          cp SwiftSword/Exploit/* base/Cyanide/Exploit/
+          cp SwiftSword/Payload/* base/Cyanide/Payload/
 
-          echo "Source injected"
-          ls base/Cyanide/
+          PROJECT="base/Cyanide.xcodeproj/project.pbxproj"
+          python3 << 'PYEOF'
+import uuid, re
+with open(PROJECT,'r') as f: content = f.read()
+
+# Add IOHIDFamilyUAF.m, collector.m to build
+new_sources = {
+    'Exploit/IOHIDFamilyUAF.m': 'sourcecode.c.objc',
+    'Exploit/IOHIDFamilyUAF.h': 'sourcecode.c.h',
+    'Payload/collector.m': 'sourcecode.c.objc',
+    'Payload/collector.h': 'sourcecode.c.h',
+}
+
+fill_lines = []; build_lines = []; src_lines = []; ids = {}
+for name, ftype in new_sources.items():
+    fid = uuid.uuid4().hex[:24].upper()
+    bid = uuid.uuid4().hex[:24].upper()
+    ids[name] = (fid, bid)
+    fill_lines.append(f'\t\t{fid} /* {name} */ = {{isa = PBXFileReference; lastKnownFileType = {ftype}; path = {name}; sourceTree = "<group>"; }};')
+    if name.endswith('.m'):
+        build_lines.append(f'\t\t{bid} /* {name} in Sources */ = {{isa = PBXBuildFile; fileRef = {fid} /* {name} */; }};')
+        src_lines.append(f'\t\t\t\t{bid} /* {name} in Sources */,')
+
+content = content.replace('/* End PBXFileReference section */', '\n'.join(fill_lines) + '\n/* End PBXFileReference section */')
+content = content.replace('/* End PBXBuildFile section */', '\n'.join(build_lines) + '\n/* End PBXBuildFile section */')
+
+# Add children to the group containing ViewController.m
+for name in new_sources:
+    fid = ids[name][0]
+    ref = f'\t\t\t\t{fid} /* {name} */,'
+    if ref not in content:
+        content = content.replace('children = (', f'children = (\n{ref}')
+
+# Add to sources build phase
+content = content.replace('files = (', 'files = (\n' + '\n'.join(src_lines))
+
+with open(PROJECT,'w') as f: f.write(content)
+print(f'Added {len(new_sources)} files to pbxproj')
+PYEOF
+          echo "pbxproj patched"
 
       - name: Build
         run: |
           cd base
-          xcodebuild \
-            -project Cyanide.xcodeproj \
-            -scheme Cyanide \
-            -sdk iphoneos \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath DerivedData 2>&1 | tail -20
-          echo "BUILD_EXIT=$?"
-
-      - name: Debug - find app
-        run: |
-          echo "=== All .app bundles ==="
-          find . -name "*.app" -type d 2>/dev/null | head -10
-          echo "=== App contents ==="
-          APP=$(find . -name "*.app" -type d 2>/dev/null | head -1)
-          if [ -n "$APP" ]; then ls -la "$APP"; fi
+          xcodebuild -project Cyanide.xcodeproj -scheme Cyanide \
+            -sdk iphoneos -configuration Release \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
+            -derivedDataPath DerivedData 2>&1 | tail -15
 
       - name: Package IPA
         run: |
-          APP=$(find . -name "*.app" -type d | head -1)
-          if [ -z "$APP" ]; then echo "NO .app FOUND"; find . -name "*.app" -type d 2>/dev/null; exit 1; fi
-          echo "Using: $APP"
+          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -name "*.app" -type d | head -1)
+          [ -z "$APP" ] && { echo "No .app found"; find . -name "*.app" -type d; exit 1; }
+          echo "App: $APP"
           rm -rf Payload
           mkdir -p "Payload/SwiftSword.app"
           cp -R "$APP"/. "Payload/SwiftSword.app/"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleName SwiftSword" "Payload/SwiftSword.app/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName SwiftSword" "Payload/SwiftSword.app/Info.plist" || true
           zip -r SwiftSword_iOS26.ipa Payload/
-          ls -lh SwiftSword_iOS26.ipa
-          cp SwiftSword_iOS26.ipa "$GITHUB_WORKSPACE/"
+          cp SwiftSword_iOS26.ipa $GITHUB_WORKSPACE/
+          ls -lh $GITHUB_WORKSPACE/SwiftSword_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
         with:
