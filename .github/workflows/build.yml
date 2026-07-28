@@ -51,10 +51,7 @@ jobs:
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          # Ad-hoc sign the binary so Sideloadly can parse the IPA
-          codesign -s - -f "Payload/UAFPoc.app" 2>&1 || true
-          echo "=== Code sign check ==="
-          codesign -d -v "Payload/UAFPoc.app" 2>&1 || true
+          rm -rf "Payload/UAFPoc.app/_CodeSignature" 2>/dev/null || true
           zip -0 -r UAFPoc_iOS26.ipa Payload/
           ls -lh UAFPoc_iOS26.ipa
 
