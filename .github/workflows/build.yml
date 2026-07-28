@@ -73,7 +73,9 @@ jobs:
           fi
           echo "Found: $APP"
           mkdir Payload
-          cp -r "$APP" Payload/
+          cp -r "$APP" "Payload/SwiftSword.app"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName SwiftSword" "Payload/SwiftSword.app/Info.plist" 2>/dev/null
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName SwiftSword" "Payload/SwiftSword.app/Info.plist" 2>/dev/null
           zip -r "$GITHUB_WORKSPACE/SwiftSword_iOS26.ipa" Payload/
           ls -lh "$GITHUB_WORKSPACE/SwiftSword_iOS26.ipa"
 
