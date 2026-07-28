@@ -4,8 +4,6 @@ import sys, uuid
 
 PROJECT = sys.argv[1]
 SOURCES = {
-    'Exploit/IOHIDFamilyUAF.m': 'sourcecode.c.objc',
-    'Exploit/IOHIDFamilyUAF.h': 'sourcecode.c.h',
     'Payload/collector.m': 'sourcecode.c.objc',
     'Payload/collector.h': 'sourcecode.c.h',
 }
