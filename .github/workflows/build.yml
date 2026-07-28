@@ -19,8 +19,8 @@ jobs:
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath DerivedData 2>&1 | tail -30
-          echo "EXIT: $?"
+            -derivedDataPath DerivedData 2>&1 | grep -iE "error:|warning:|BUILD|FAILED|SUCCEEDED|Process" | head -30
+          echo "BUILD_EXIT=$?"
 
       - name: Package
         run: |
