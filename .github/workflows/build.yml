@@ -12,6 +12,11 @@ jobs:
       - name: Clone zeroxjf UAFPoc (proper iOS app)
         run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
 
+      - name: Patch SDK compatibility
+        run: |
+          sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
+          sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
+
       - name: Build
         run: |
           cd base/UAFPoc
