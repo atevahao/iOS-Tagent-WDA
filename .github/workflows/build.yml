@@ -44,48 +44,40 @@ jobs:
           echo "Source injected"
           ls base/Cyanide/
 
-      - name: Build and Package IPA
+      - name: Build
         run: |
           cd base
-          DERIVED="$(pwd)/DerivedData"
-          # Get exact build product path first
-          BUILT_DIR=$(xcodebuild -project Cyanide.xcodeproj -scheme Cyanide -sdk iphoneos \
-            -configuration Release -showBuildSettings 2>/dev/null \
-            | grep "BUILT_PRODUCTS_DIR" | head -1 | awk '{print $3}')
-          echo "Expected BUILT_PRODUCTS_DIR: $BUILT_DIR"
-
           xcodebuild \
             -project Cyanide.xcodeproj \
             -scheme Cyanide \
             -sdk iphoneos \
             -configuration Release \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath "$DERIVED" \
-            2>&1 | tail -15
-          echo "Build exit: $?"
+            -derivedDataPath DerivedData 2>&1 | tail -20
+          echo "BUILD_EXIT=$?"
 
-          # Find the .app in DerivedData (xcodebuild puts it there)
-          APP=$(find "$DERIVED" -name "*.app" -type d | head -1)
-          if [ -z "$APP" ]; then
-            APP=$(find . -name "*.app" -type d | head -1)
-          fi
-          echo "App found: $APP"
-          ls "$APP" | head -5
+      - name: Debug - find app
+        run: |
+          echo "=== All .app bundles ==="
+          find . -name "*.app" -type d 2>/dev/null | head -10
+          echo "=== App contents ==="
+          APP=$(find . -name "*.app" -type d 2>/dev/null | head -1)
+          if [ -n "$APP" ]; then ls -la "$APP"; fi
 
-          # Package with correct name
-          cd "$GITHUB_WORKSPACE"
-          APP_NAME="SwiftSword"
+      - name: Package IPA
+        run: |
+          APP=$(find . -name "*.app" -type d | head -1)
+          if [ -z "$APP" ]; then echo "NO .app FOUND"; find . -name "*.app" -type d 2>/dev/null; exit 1; fi
+          echo "Using: $APP"
           rm -rf Payload
-          mkdir "Payload/${APP_NAME}.app"
-          cp -R "$APP"/. "Payload/${APP_NAME}.app/"
-          # Ensure CFBundleName matches folder name
-          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${APP_NAME}" "Payload/${APP_NAME}.app/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${APP_NAME}" "Payload/${APP_NAME}.app/Info.plist" 2>/dev/null || true
+          mkdir -p "Payload/SwiftSword.app"
+          cp -R "$APP"/. "Payload/SwiftSword.app/"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName SwiftSword" "Payload/SwiftSword.app/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName SwiftSword" "Payload/SwiftSword.app/Info.plist" || true
           zip -r SwiftSword_iOS26.ipa Payload/
           ls -lh SwiftSword_iOS26.ipa
+          cp SwiftSword_iOS26.ipa "$GITHUB_WORKSPACE/"
 
       - uses: actions/upload-artifact@v4
         with:
