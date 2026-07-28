@@ -9,13 +9,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone UAFPoc
-        run: git clone --depth=1 https://github.com/clogan9019-dotcom/IOHIDFamily-PoC-Research.git base
+      - name: Clone zeroxjf UAFPoc (proper iOS app)
+        run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
 
       - name: Build
         run: |
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
             -sdk iphoneos -configuration Release \
             CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
