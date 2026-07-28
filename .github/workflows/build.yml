@@ -18,7 +18,7 @@ jobs:
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
             -sdk iphoneos -configuration Release \
             CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
+            ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | tail -20
 
       - name: Package
