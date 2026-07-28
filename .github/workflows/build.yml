@@ -22,8 +22,8 @@ jobs:
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
             -sdk iphoneos -configuration Release \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | grep -iE "error:|BUILD FAILED" | head -10
           echo "BUILD_EXIT=$?"
 
