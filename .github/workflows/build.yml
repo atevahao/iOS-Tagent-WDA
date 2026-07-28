@@ -1,31 +1,20 @@
-name: Build SwiftSword IPA
+name: Build UAFPoc Test IPA
 
 on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone IOHIDFamily PoC (working Xcode project)
-        run: |
-          git clone --depth=1 https://github.com/clogan9019-dotcom/IOHIDFamily-PoC-Research.git base
-          # Use UAFPoc — verified working
-          cp -r base/UAFPoc/UAFPoc.xcodeproj project/
-          cp -r base/UAFPoc/UAFPoc/* project/
-
-      - name: Add collector payload
-        run: |
-          mkdir -p project/Payload
-          cp SwiftSword/Payload/*.h project/Payload/
-          cp SwiftSword/Payload/*.m project/Payload/
-          python3 scripts/patch_pbxproj.py project/UAFPoc.xcodeproj/project.pbxproj
+      - name: Clone UAFPoc
+        run: git clone --depth=1 https://github.com/clogan9019-dotcom/IOHIDFamily-PoC-Research.git base
 
       - name: Build
         run: |
-          cd project
+          cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
             -sdk iphoneos -configuration Release \
             CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
@@ -34,15 +23,16 @@ jobs:
 
       - name: Package
         run: |
-          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
-          [ -z "$APP" ] && { echo "FAIL: no .app"; exit 1; }
-          rm -rf Payload && mkdir Payload
-          cp -R "$APP" Payload/SwiftSword.app
-          zip -r SwiftSword_iOS26.ipa Payload/
-          ls -lh SwiftSword_iOS26.ipa
+          APP=$(find . -name "UAFPoc.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && { echo "No .app"; exit 1; }
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -r UAFPoc_iOS26.ipa Payload/
+          ls -lh UAFPoc_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SwiftSword_iOS26
-          path: SwiftSword_iOS26.ipa
+          name: UAFPoc_iOS26
+          path: UAFPoc_iOS26.ipa
           retention-days: 7
