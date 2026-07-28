@@ -75,11 +75,15 @@ jobs:
           echo "App found: $APP"
           ls "$APP" | head -5
 
-          # Package
+          # Package with correct name
           cd "$GITHUB_WORKSPACE"
+          APP_NAME="SwiftSword"
           rm -rf Payload
-          mkdir Payload
-          cp -R "$APP" Payload/
+          mkdir "Payload/${APP_NAME}.app"
+          cp -R "$APP"/. "Payload/${APP_NAME}.app/"
+          # Ensure CFBundleName matches folder name
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${APP_NAME}" "Payload/${APP_NAME}.app/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${APP_NAME}" "Payload/${APP_NAME}.app/Info.plist" 2>/dev/null || true
           zip -r SwiftSword_iOS26.ipa Payload/
           ls -lh SwiftSword_iOS26.ipa
 
