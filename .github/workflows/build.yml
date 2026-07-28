@@ -55,7 +55,7 @@ jobs:
           codesign -s - -f "Payload/UAFPoc.app" 2>&1 || true
           echo "=== Code sign check ==="
           codesign -d -v "Payload/UAFPoc.app" 2>&1 || true
-          zip -r -X UAFPoc_iOS26.ipa Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload UAFPoc_iOS26.ipa
           ls -lh UAFPoc_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
