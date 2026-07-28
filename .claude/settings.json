@@ -13,7 +13,9 @@
       "Bash(curl -sL \"https://api.github.com/repos/atevahao/iOS-Tagent-WDA/actions/runs/30371319774/jobs\")",
       "Bash(git add *)",
       "Bash(git commit *)",
-      "Bash(git -c http.sslVerify=false push)"
+      "Bash(git -c http.sslVerify=false push)",
+      "Bash(GIT_CURL_VERBOSE=1 git -c http.sslVerify=false push)",
+      "Bash(GIT_SSL_NO_VERIFY=1 git push)"
     ]
   }
 }
