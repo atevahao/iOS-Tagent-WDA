@@ -6052,7 +6052,6 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                 aio_return(&e2);
             }
             close(e2kq);
-            }
         }
     }
 
