@@ -3564,15 +3564,23 @@ static const char kOpenPropertiesGarbage[] =
         sprayAvailableFlag = 1;
         int created = 0;
         for (int i = 0; i < kSpraySurfaceCount; i++) {
-            int w = 16, h = 16, bpe = 4;
-            CFNumberRef cfW = CFNumberCreate(NULL, kCFNumberIntType, &w);
-            CFNumberRef cfH = CFNumberCreate(NULL, kCFNumberIntType, &h);
-            CFNumberRef cfB = CFNumberCreate(NULL, kCFNumberIntType, &bpe);
-            const void *dictKeys[] = { CFSTR("Width"), CFSTR("Height"), CFSTR("BytesPerElement") };
-            const void *dictVals[] = { cfW, cfH, cfB };
-            CFDictionaryRef props = CFDictionaryCreate(NULL, dictKeys, dictVals, 3,
+            int32_t w = 16, h = 16, bpe = 4, allocSize = 256, pf = 0;
+            CFNumberRef cfW   = CFNumberCreate(NULL, kCFNumberSInt32Type, &w);
+            CFNumberRef cfH   = CFNumberCreate(NULL, kCFNumberSInt32Type, &h);
+            CFNumberRef cfBPE = CFNumberCreate(NULL, kCFNumberSInt32Type, &bpe);
+            CFNumberRef cfAS  = CFNumberCreate(NULL, kCFNumberSInt32Type, &allocSize);
+            CFNumberRef cfPF  = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf);
+            const void *dictKeys[] = {
+                CFSTR("IOSurfaceWidth"),
+                CFSTR("IOSurfaceHeight"),
+                CFSTR("IOSurfaceBytesPerElement"),
+                CFSTR("IOSurfaceAllocSize"),
+                CFSTR("IOSurfacePixelFormat")
+            };
+            const void *dictVals[] = { cfW, cfH, cfBPE, cfAS, cfPF };
+            CFDictionaryRef props = CFDictionaryCreate(NULL, dictKeys, dictVals, 5,
                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            CFRelease(cfW); CFRelease(cfH); CFRelease(cfB);
+            CFRelease(cfW); CFRelease(cfH); CFRelease(cfBPE); CFRelease(cfAS); CFRelease(cfPF);
             spraySurfaces[i] = sIOSurfaceCreate(props);
             CFRelease(props);
             if (!spraySurfaces[i]) break;
