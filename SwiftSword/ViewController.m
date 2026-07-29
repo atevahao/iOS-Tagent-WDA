@@ -5901,7 +5901,6 @@ static int _aioUafRunning = 0;
             }
         }
     }
-    }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
 
     // OOL payload with signature so we can recognize it in ext values
