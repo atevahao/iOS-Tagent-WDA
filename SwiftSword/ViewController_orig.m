@@ -3831,7 +3831,12 @@ static const char kOpenPropertiesGarbage[] =
                                                                            connIndex:i];
 
                         if (hitNum < 5 || leaks.count > 0) {
-                            // Log the first few changes, or any that contain kernel pointers
+                            // Dump full cross-client buffer to file for offline analysis
+                            static dispatch_once_t bdumpOnce;
+                            dispatch_once(&bdumpOnce, ^{
+                                NSString *binPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword/misdelivery.bin"];
+                                [[NSData dataWithBytes:current length:sampleLen] writeToFile:binPath atomically:YES];
+                            });
                             [self appendLog:[NSString stringWithFormat:
                                 @"  CROSS-CLIENT: aux conn[%d] buffer changed (eventSize=%u, kernPtrs=%lu) — possible data misdirection",
                                 i, evtSz, (unsigned long)leaks.count]];
