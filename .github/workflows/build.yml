@@ -21,8 +21,7 @@ jobs:
           # Increase stress window from 25s to 40s for deeper UAF race coverage
           sed -i '' 's/kStressDuration = 25\.0/kStressDuration = 40.0/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/kLifecycleCycles = 2000/kLifecycleCycles = 8000/' base/UAFPoc/UAFPoc/ViewController.m
-          # Reduce connections from 15 to 10 — less SPU traffic, avoid AOP overflow
-          sed -i '' 's/kDesiredConnections = 15/kDesiredConnections = 10/' base/UAFPoc/UAFPoc/ViewController.m
+          # Keep 15 connections — Zone corruption only observed at this count
 
       - name: Build
         run: |
