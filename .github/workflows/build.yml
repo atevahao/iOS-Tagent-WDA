@@ -27,7 +27,7 @@ jobs:
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath DerivedData 2>&1 | grep -E "error|BUILD" | head -10
+            -derivedDataPath DerivedData 2>&1 | tail -5
           echo "EXIT=$?"
 
       - name: Package
@@ -38,9 +38,12 @@ jobs:
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           echo "App: $APP"
           ls -la "$APP"
-          # Inject binary if missing
-          BIN="base/UAFPoc/DerivedData/Build/Intermediates.noindex/UAFPoc.build/Debug-iphoneos/UAFPoc.build/Objects-normal/arm64/UAFPoc"
-          [ -f "$BIN" ] && cp "$BIN" "$APP/UAFPoc" && chmod +x "$APP/UAFPoc" && echo "Injected: $(ls -la $APP/UAFPoc)"
+          # Find and inject binary
+          echo "=== Searching for binary ==="
+          find base/UAFPoc/DerivedData -name "UAFPoc" -type f 2>/dev/null | head -10
+          BIN=$(find base/UAFPoc/DerivedData -name "UAFPoc" -type f -not -path "*.app/*" 2>/dev/null | head -1)
+          echo "Selected: $BIN"
+          [ -n "$BIN" ] && [ -f "$BIN" ] && cp "$BIN" "$APP/UAFPoc" && chmod +x "$APP/UAFPoc" && echo "Injected: $(ls -la $APP/UAFPoc)"
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
           codesign -s - -f Payload/UAFPoc.app 2>&1 || true
