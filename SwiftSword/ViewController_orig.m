@@ -3992,7 +3992,7 @@ static const char kOpenPropertiesGarbage[] =
                     &s, 1, kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
                     NULL, NULL, NULL, NULL);
                 [self appendLog:[NSString stringWithFormat:@"    conn[%d] gate=0x%x%s", p, gkr,
-                    (gkr == KERN_SUCCESS) ? " (PASS)" : "")];
+                    (gkr == KERN_SUCCESS) ? " (PASS)" : "")]];
                 if (gkr != KERN_SUCCESS)
                     [self appendLog:@"    >>> provider may have dangling ptr"];
                 sIOServiceClose(pc);
