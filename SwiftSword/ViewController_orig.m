@@ -3602,7 +3602,7 @@ static const char kOpenPropertiesGarbage[] =
                 }
 
                 if ((localReaderIter & 0x3F) == 0) {
-                    usleep(500);
+                    sched_yield();
                 }
             }
             atomic_fetch_add(&readerIterations, (int)localReaderIter);
@@ -3688,7 +3688,7 @@ static const char kOpenPropertiesGarbage[] =
                 localChurnIter++;
 
                 if ((localChurnIter & 0x1F) == 0) {
-                    usleep(500);
+                    sched_yield();
                 }
             }
             atomic_fetch_add(&churnIterations, (int)localChurnIter);
