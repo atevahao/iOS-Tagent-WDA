@@ -3831,12 +3831,14 @@ static const char kOpenPropertiesGarbage[] =
                                                                            connIndex:i];
 
                         if (hitNum < 5 || leaks.count > 0) {
-                            // Dump full cross-client buffer to file for offline analysis
                             static dispatch_once_t bdumpOnce;
                             dispatch_once(&bdumpOnce, ^{
                                 NSString *binPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword/misdelivery.bin"];
                                 [[NSData dataWithBytes:current length:sampleLen] writeToFile:binPath atomically:YES];
                             });
+                            // EMERGENCY STOP: halt all SPU threads to prevent AOP overflow
+                            atomic_store(&stopFlag, 1);
+                            [self appendLog:@"*** UAF DETECTED — stopping all threads ***"];
                             [self appendLog:[NSString stringWithFormat:
                                 @"  CROSS-CLIENT: aux conn[%d] buffer changed (eventSize=%u, kernPtrs=%lu) — possible data misdirection",
                                 i, evtSz, (unsigned long)leaks.count]];
