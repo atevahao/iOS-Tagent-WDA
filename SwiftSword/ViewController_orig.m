@@ -3991,8 +3991,8 @@ static const char kOpenPropertiesGarbage[] =
                 kern_return_t gkr = sIOConnectCallMethod(pc, kSelectorOpen,
                     &s, 1, kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
                     NULL, NULL, NULL, NULL);
-                [self appendLog:[NSString stringWithFormat:@"  [%d] gate=0x%x%s", p, gkr,
-                    (gkr == KERN_SUCCESS) ? " (provider alive - no dangling ptr)" : "")];
+                NSString *status = (gkr == KERN_SUCCESS) ? @" (provider alive)" : @"";
+                [self appendLog:[NSString stringWithFormat:@"  [%d] gate=0x%x%@", p, gkr, status]];
                 if (gkr != KERN_SUCCESS)
                     [self appendLog:@"  >>> Dangling pointer may have caused fault - check crashlog"];
                 sIOServiceClose(pc);
