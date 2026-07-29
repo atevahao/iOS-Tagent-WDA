@@ -5667,7 +5667,7 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
         return;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v4 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
