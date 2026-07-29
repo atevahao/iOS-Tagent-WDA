@@ -74,10 +74,10 @@ static void *sSecurityHandle = NULL;
 static SecTaskCreateFromSelfFn sSecTaskCreateFromSelf = NULL;
 static SecTaskCopyValueForEntitlementFn sSecTaskCopyValueForEntitlement = NULL;
 
-// ---------- IOSurface types / function pointers ----------
+// ---------- IOSurface function pointers ----------
 // Used to spray persistent OSData objects into kalloc.80 to reclaim
 // the freed ClientObject slot during the UAF race window.
-typedef CFTypeRef IOSurfaceRef;
+// IOSurfaceRef is defined by the SDK (<IOSurface/IOSurfaceRef.h>).
 typedef IOSurfaceRef (*IOSurfaceCreateFn)(CFDictionaryRef properties);
 typedef kern_return_t (*IOSurfaceSetValueFn)(IOSurfaceRef surface, CFStringRef key, CFTypeRef value);
 typedef kern_return_t (*IOSurfaceRemoveValueFn)(IOSurfaceRef surface, CFStringRef key);
