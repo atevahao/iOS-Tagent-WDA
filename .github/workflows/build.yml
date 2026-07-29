@@ -14,10 +14,10 @@ jobs:
 
       - name: Fork + SDK
         run: |
-          cp SwiftSword/ViewController_orig.m base/UAFPoc/UAFPoc/ViewController.m
+          # cp SwiftSword/ViewController_orig.m base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
-          sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
+          echo "SDK only (no fork)"
 
       - name: Build
         run: |
@@ -26,7 +26,7 @@ jobs:
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath DerivedData 2>&1 | tail -10
+            -derivedDataPath DerivedData 2>&1 | grep -E "error|BUILD" | head -10
           echo "EXIT=$?"
 
       - name: Package
