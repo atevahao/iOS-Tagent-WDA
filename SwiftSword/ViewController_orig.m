@@ -3992,9 +3992,9 @@ static const char kOpenPropertiesGarbage[] =
                     &s, 1, kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
                     NULL, NULL, NULL, NULL);
                 [self appendLog:[NSString stringWithFormat:@"  [%d] gate=0x%x%s", p, gkr,
-                    (gkr == KERN_SUCCESS) ? " (provider alive — no dangling ptr)" : "")];
+                    (gkr == KERN_SUCCESS) ? " (provider alive - no dangling ptr)" : "")];
                 if (gkr != KERN_SUCCESS)
-                    [self appendLog:@"  >>> Dangling pointer may have caused fault"];
+                    [self appendLog:@"  >>> Dangling pointer may have caused fault - check crashlog"];
                 sIOServiceClose(pc);
             } else {
                 break; // All slots full or error
