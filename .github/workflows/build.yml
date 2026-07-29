@@ -12,38 +12,31 @@ jobs:
       - name: Clone
         run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
 
-      - name: Fork + SDK
+      - name: Fork
         run: |
           cp SwiftSword/ViewController_orig.m base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
           sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
-          echo "Forked"
 
       - name: Build
         run: |
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
-            -sdk iphoneos -configuration Debug \
+            -sdk iphoneos -configuration Release \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | tail -5
           echo "EXIT=$?"
 
       - name: Package
         run: |
-          APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
-          [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && APP=$(find . -name "UAFPoc.app" -type d | head -1)
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           echo "App: $APP"
           ls -la "$APP"
-          # Find and inject binary
-          echo "=== Searching for binary ==="
-          find base/UAFPoc/DerivedData -name "UAFPoc" -type f 2>/dev/null | head -10
-          BIN=$(find base/UAFPoc/DerivedData -name "UAFPoc" -type f -not -path "*.app/*" 2>/dev/null | head -1)
-          echo "Selected: $BIN"
-          [ -n "$BIN" ] && [ -f "$BIN" ] && cp "$BIN" "$APP/UAFPoc" && chmod +x "$APP/UAFPoc" && echo "Injected: $(ls -la $APP/UAFPoc)"
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
           codesign -s - -f Payload/UAFPoc.app 2>&1 || true
