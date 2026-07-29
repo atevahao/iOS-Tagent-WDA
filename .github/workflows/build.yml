@@ -14,7 +14,7 @@ jobs:
 
       - name: Patch (SDK + fork)
         run: |
-          cp SwiftSword/ViewController_orig.m base/UAFPoc/UAFPoc/ViewController.m
+          cp SwiftSword/ViewController.m base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
           sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
