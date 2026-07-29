@@ -1,27 +1,27 @@
-name: Build UAFPoc Test IPA
+name: Build SwiftSword
 
 on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone zeroxjf UAFPoc (proper iOS app)
+      - name: Clone base Xcode project
         run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
 
-      - name: Patch SDK compatibility + favor UAF over AOP Panic
+      - name: Replace with forked source
         run: |
+          # Replace ViewController with our modified version
+          cp SwiftSword/ViewController_orig.m base/UAFPoc/UAFPoc/ViewController.m
+          # Fix SDK compat
           sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
-          # SKIP Termination Race phase (causes AOP Panic) to favor UAF race
+          # Skip Termination Race (AOP Panic source)
           sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
-          # Increase stress window from 25s to 40s for deeper UAF race coverage
-          sed -i '' 's/kStressDuration = 25\.0/kStressDuration = 40.0/' base/UAFPoc/UAFPoc/ViewController.m
-          sed -i '' 's/kLifecycleCycles = 2000/kLifecycleCycles = 8000/' base/UAFPoc/UAFPoc/ViewController.m
-          # Keep 15 connections — Zone corruption only observed at this count
+          echo "Forked source injected"
 
       - name: Build
         run: |
@@ -31,7 +31,7 @@ jobs:
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath DerivedData 2>&1 | grep -iE "error:|BUILD FAILED" | head -10
-          echo "BUILD_EXIT=$?"
+          echo "EXIT=$?"
 
       - name: Package
         run: |
@@ -41,13 +41,12 @@ jobs:
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          codesign -s - -f "Payload/UAFPoc.app" 2>&1
-          echo "Sign check OK"
-          zip -0 -r UAFPoc_iOS26.ipa Payload/
-          ls -lh UAFPoc_iOS26.ipa
+          codesign -s - -f Payload/UAFPoc.app 2>&1 || true
+          zip -0 -r SwiftSword_iOS26.ipa Payload/
+          ls -lh SwiftSword_iOS26.ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: UAFPoc_iOS26
-          path: UAFPoc_iOS26.ipa
+          name: SwiftSword_iOS26
+          path: SwiftSword_iOS26.ipa
           retention-days: 7
