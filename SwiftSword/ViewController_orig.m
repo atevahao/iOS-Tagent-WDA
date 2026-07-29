@@ -5730,15 +5730,20 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         bool reclaimed = atomic_load(&rs.reclaim_done);
 
         if (freed == 0) {
+            // CRITICAL: close kq BEFORE aio_return — while entry is still valid.
+            // If we free first, the knote points to freed memory and close(kq)
+            // triggers filt_aiodetach → use-after-free → kernel panic.
+            close(kq);
             while (aio_error(&tcb) == EINPROGRESS) usleep(500);
             aio_return(&tcb);
-            close(kq);
             [self appendLog:@"  race lost, retrying"];
             continue;
         }
         if (!reclaimed) {
-            close(kq);
-            [self appendLog:@"  freed but no reclaim, retrying"];
+            // Entry already freed by racer. knote is dangling.
+            // close(kq) would trigger filt_aiodetach on freed memory → panic.
+            // Leak the kqueue — kernel cleans up on process exit.
+            [self appendLog:[NSString stringWithFormat:@"  freed but no reclaim, leaking kq=%d", kq]];
             continue;
         }
 
