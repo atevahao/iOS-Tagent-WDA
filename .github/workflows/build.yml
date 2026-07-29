@@ -21,7 +21,9 @@ jobs:
           # Increase stress window from 25s to 40s for deeper UAF race coverage
           sed -i '' 's/kStressDuration = 25\.0/kStressDuration = 40.0/' base/UAFPoc/UAFPoc/ViewController.m
           # Double lifecycle cycles from 2000 to 4000
-          sed -i '' 's/kLifecycleCycles = 2000/kLifecycleCycles = 4000/' base/UAFPoc/UAFPoc/ViewController.m
+          sed -i '' 's/kLifecycleCycles = 2000/kLifecycleCycles = 8000/' base/UAFPoc/UAFPoc/ViewController.m
+          # Use ALL auxiliary connections as readers (not churn): more copyEvent = wider UAF window
+          sed -i '' 's/readerEnd = (connCount > 4) ? (1 + (connCount - 1) \/ 2) : MIN(connCount, 2)/readerEnd = connCount/' base/UAFPoc/UAFPoc/ViewController.m
 
       - name: Build
         run: |
