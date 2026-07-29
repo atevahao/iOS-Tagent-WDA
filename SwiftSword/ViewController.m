@@ -5661,6 +5661,11 @@ static void *aio_free_and_reclaim_racer(void *arg) {
 - (void)aioUafTapped {
     [self appendLog:@"\n========== AIO Kevent Double-Free =========="];
 
+    // Run exploit on background thread so UI stays responsive.
+    // appendLog dispatches UI updates to main thread internally.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_uaf.bin"];
     int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
@@ -5950,6 +5955,8 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
     [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
+        }  // @autoreleasepool
+    });  // dispatch_async
 }
 
 @end
