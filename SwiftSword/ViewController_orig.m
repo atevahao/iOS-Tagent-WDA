@@ -3154,7 +3154,7 @@ static const char kOpenPropertiesGarbage[] =
             [self appendLog:[NSString stringWithFormat:@"  Remaining pool: %d connections", connCount]];
             [self appendLog:@"====== Method Table Probe Complete ======\n"];
         } else {
-            [self appendLog:@"  Method probe skipped — need >=3 conns (have %d)", connCount];
+            [self appendLog:[NSString stringWithFormat:@"  Method probe skipped — need >=3 conns (have %d)", connCount]];
         }
 
         // Map shared memory on the primary connection
