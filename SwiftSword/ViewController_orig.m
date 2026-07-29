@@ -1012,7 +1012,7 @@ static const char kOpenPropertiesGarbage[] =
     static dispatch_once_t once;
     static NSFileHandle *logFH;
     dispatch_once(&once, ^{
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword"]; [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
         NSString *path = [docs stringByAppendingPathComponent:@"sword.log"];
         [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
         logFH = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -3773,6 +3773,9 @@ static const char kOpenPropertiesGarbage[] =
                     self.proofKernelPointerOffset = [firstLeak[@"offset"] intValue];
                     self.proofKernelPointerSourceConn = 0;
                     self.proofKernelPointerHex = [self hexPreview:(uint8_t *)&leakValue length:sizeof(leakValue)];
+                    // Dump leaked pointer to file for post-reboot recovery
+                    NSString *kpPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"sword/kptr.txt"];
+                    [[NSString stringWithFormat:@"0x%016llx offset=%d\n", leakValue, self.proofKernelPointerOffset] writeToFile:kpPath atomically:YES];
                 }
             }
 
