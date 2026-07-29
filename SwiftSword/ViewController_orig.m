@@ -3643,6 +3643,7 @@ static const char kOpenPropertiesGarbage[] =
             }
 
             localCycles++;
+            usleep(500); // 0.5ms gap — throttle SPU, keep within 40s window
             if (cycle % 400 == 0) {
                 [self appendLog:[NSString stringWithFormat:@"  Lifecycle cycle %d/%d", cycle, kLifecycleCycles]];
             }
