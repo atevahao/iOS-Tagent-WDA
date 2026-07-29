@@ -3991,8 +3991,8 @@ static const char kOpenPropertiesGarbage[] =
                 kern_return_t gkr = sIOConnectCallMethod(pc, kSelectorOpen,
                     &s, 1, kOpenPropertiesXML, strlen(kOpenPropertiesXML) + 1,
                     NULL, NULL, NULL, NULL);
-                [self appendLog:[NSString stringWithFormat:@"    conn[%d] gate=0x%x%s", p, gkr,
-                    (gkr == KERN_SUCCESS) ? " (PASS)" : "")]];
+                NSString *gateMsg = (gkr == KERN_SUCCESS) ? @" (PASS)" : @"";
+                [self appendLog:[NSString stringWithFormat:@"    conn[%d] gate=0x%x%@", p, gkr, gateMsg]];
                 if (gkr != KERN_SUCCESS)
                     [self appendLog:@"    >>> provider may have dangling ptr"];
                 sIOServiceClose(pc);
