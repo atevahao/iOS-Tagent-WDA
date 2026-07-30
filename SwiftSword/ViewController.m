@@ -5810,9 +5810,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     }
     // v48: Use 2MB file so tcb(4KB@0) and rcb(8KB@1MB) hit different clusters.
     // rcb offset=1MB guarantees cold read → >100us worker latency → we always win.
-    char fdata[2 * 1024 * 1024];
-    memset(fdata, 'B', sizeof(fdata));
-    write(fd, fdata, sizeof(fdata));
+    // Write 2MB in 64KB chunks to stay within dispatch queue stack (512KB limit).
+    {
+        const size_t fsize = 2 * 1024 * 1024;
+        char chunk[65536];
+        memset(chunk, 'B', sizeof(chunk));
+        for (size_t written = 0; written < fsize; written += sizeof(chunk)) {
+            write(fd, chunk, sizeof(chunk));
+        }
+    }
     [self appendLog:[NSString stringWithFormat:@"fd=%d file=2MB pid=%d uid=%d", fd, getpid(), getuid()]];
 
     // v48: SINGLE-THREADED SYNCHRONOUS — one thread on CPU 42 does everything.
