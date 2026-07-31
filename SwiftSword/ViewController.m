@@ -22,6 +22,11 @@
 #include <sys/event.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/sysctl.h>
+#include <libproc.h>
 
 // ---------- IOKit type / function-pointer plumbing ----------
 
