@@ -6752,12 +6752,17 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
             qd->sin_addr.s_addr = htonl(0x08080800 + qi);  // 8.8.8.0..8.8.8.19
             int qo = sizeof(*qd);
 
-            qb[qo] = 32;       // sa_len = 32 (max safe for AF_INET)
+            qb[qo] = 28;       // sa_len = 28 (safe: 32-byte buffer, 28 < 32)
             qb[qo+1] = AF_INET;
-            int qpad = (32 + 3) & ~3;
+            // Fill with 0xAA pattern (invalid mask → early error return,
+            // preventing bounds-safety violation from processing all bytes)
+            for (int b = 2; b < 28 && b < 255; b++) {
+                qb[qo+b] = (unsigned char)(0xA0 + (b & 0x0F));
+            }
+            int qpad = (28 + 3) & ~3;
             qo += qpad;
 
-            memset(resp, 0x00, sizeof(resp));  // zero-fill, not 0xCC
+            memset(resp, 0, sizeof(resp));
             rlen = 0;
             err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, qb, qo,
                                    resp, sizeof(resp), &rlen);
