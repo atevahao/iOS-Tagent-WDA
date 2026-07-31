@@ -26,7 +26,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/sysctl.h>
-#include <libproc.h>
+
+// proc_pidinfo — not in iOS SDK headers, resolve via dlsym
+typedef int (*ProcPidinfoFn)(int pid, int flavor, uint64_t arg, void *buffer, uint32_t buffersize);
 
 // ---------- IOKit type / function-pointer plumbing ----------
 
@@ -6124,6 +6126,12 @@ static void *e2_free_and_ool_racer(void *arg) {
 
 // Sub-test B: proc_pidinfo — dump task/bsd info structs
 - (void)subtestProcPidinfo {
+    ProcPidinfoFn proc_pidinfo = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
+    if (!proc_pidinfo) {
+        [self appendLog:@"Phase0.B proc_pidinfo: symbol not available"];
+        return;
+    }
+
     [self appendLog:@"Phase0.B proc_pidinfo: querying self..."];
 
     int pid = getpid();
