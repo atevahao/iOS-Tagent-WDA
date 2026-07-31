@@ -6554,7 +6554,7 @@ cleanup:
     }
 
     [self appendLog:@"\n============================================================"];
-    [self appendLog:@"  CVE-2026-20698 v1 — PF_ROUTE Heap Overflow Probe"];
+    [self appendLog:@"  CVE-2026-20698 v3 — PF_ROUTE Leak Probe"];
     [self appendLog:@"  Target: iOS 26.2 (xnu-12377.62.10) | iPhone 13 (A15)"];
     [self appendLog:@"  ISOLATED from AIO UAF: separate socket, no shared state"];
     [self appendLog:@"============================================================"];
