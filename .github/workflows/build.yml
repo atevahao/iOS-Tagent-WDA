@@ -27,7 +27,7 @@ jobs:
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            OTHER_LDFLAGS="" \
+            OTHER_LDFLAGS=" -framework AppIntents" \
             -derivedDataPath DerivedData 2>&1 | tee build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           grep -iE "error|warning" build.log | head -40

