@@ -7344,6 +7344,8 @@ static void *iohid_threadCopyEvent(void *arg) {
     [log appendFormat:@"  containermanagerd: contents=%lu subpaths=%lu\n",
         (unsigned long)cmC.count, (unsigned long)cmS.count];
     probeFile(@"System/Library/CoreServices/SystemVersion.plist", log);
+    NSString *svPath = TRYFILE(@"System/Library/CoreServices/SystemVersion.plist");
+    NSDictionary *sv = [NSDictionary dictionaryWithContentsOfFile:svPath];
     if (sv) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
