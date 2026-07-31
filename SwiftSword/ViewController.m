@@ -7359,7 +7359,9 @@ static void *iohid_threadCopyEvent(void *arg) {
     NSArray *appsAll = appsEnum ? [appsEnum allObjects] : nil;
     [log appendFormat:@"  enumeratorAtPath: %lu items\n", (unsigned long)(appsAll ? appsAll.count : 0));
     if (appsAll.count > 0) {
-        [log appendFormat:@"  first: %@\n", [[appsAll subarrayWithRange:NSMakeRange(0, MIN(20, appsAll.count))] componentsJoinedByString:@", "]];
+        NSArray *firstFew = [appsAll subarrayWithRange:NSMakeRange(0, MIN(20, appsAll.count))];
+        NSString *joined = [firstFew componentsJoinedByString:@", "];
+        [log appendFormat:@"  first: %@\n", joined];
     }
 
     // Test 7: System version + read plist verification
