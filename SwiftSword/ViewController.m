@@ -7415,10 +7415,13 @@ static void *iohid_threadCopyEvent(void *arg) {
         }
     }
 
-    // If classes not pre-loaded, try dlopen (avoid NSBundle which triggers sandbox)
+    // If classes not pre-loaded, try dlopen
+    // FLUSH log first — if dlopen triggers sandbox SIGKILL we need the logs
     Class testClass = NSClassFromString(@"MCMAppContainer");
     if (!testClass) {
         [log appendString:@"  Classes not pre-loaded, trying dlopen...\n"];
+        [self appendLog:log];  // sync flush before risky dlopen
+        [log setString:@""];
         void *handle = dlopen(
             "/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
             RTLD_LAZY);
