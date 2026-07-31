@@ -7840,8 +7840,7 @@ static void *iohid_threadCopyEvent(void *arg) {
 }
 
 - (void)runScalerUAF {
-    if (!sIOServiceMatching || !sIOServiceGetMatchingService || !sIOServiceOpen
-        || !sIOServiceClose || !sIOObjectRelease || !sIOConnectCallMethod) {
+    if (![self loadIOKitSymbols]) {
         [self appendLog:@"[FATAL] IOKit symbols not loaded"];
         return;
     }
