@@ -28,6 +28,7 @@
 #include <arpa/inet.h>
 #include <sys/sysctl.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 // proc_pidinfo — not in iOS SDK headers, resolve via dlsym
 typedef int (*ProcPidinfoFn)(int pid, int flavor, uint64_t arg, void *buffer, uint32_t buffersize);
