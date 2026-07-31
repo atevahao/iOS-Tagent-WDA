@@ -731,13 +731,13 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
-    // App Intents-based directory enumeration button (v35, Swift bridge)
+    // App Intents-based directory enumeration button (v37, minimal Swift)
     self.appIntentButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.appIntentButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIButtonConfiguration *aiConf = [UIButtonConfiguration filledButtonConfiguration];
     aiConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.appIntentButton.configuration = aiConf;
-    [self.appIntentButton setTitle:@"App Intents Dir Enum v35" forState:UIControlStateNormal];
+    [self.appIntentButton setTitle:@"Swift Bridge v37" forState:UIControlStateNormal];
     [self.appIntentButton addTarget:self action:@selector(appIntentTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.appIntentButton];
 
