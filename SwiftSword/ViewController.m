@@ -6890,7 +6890,7 @@ static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
         [log appendFormat:@"  All-flags RTM_GET: write=%d, read=%zd\n", err, rlen];
         if (rlen > 0) {
             struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
-            [log appendFormat:@"  type=%u err=%d addrs=0x%x\n", r->rtm_type, r->rtm_errno, r->rtm_addrs);
+            [log appendFormat:@"  type=%u err=%d addrs=0x%x\n", r->rtm_type, r->rtm_errno, r->rtm_addrs];
             pf_scanForKernelPtr((uint8_t*)resp, rlen, "allFlags", log);
         }
     }
