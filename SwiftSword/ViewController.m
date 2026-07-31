@@ -7384,29 +7384,34 @@ static void *iohid_threadCopyEvent(void *arg) {
     BOOL loaded = [mcmBundle load];
     [log appendFormat:@"  Framework loaded: %@\n", loaded ? @"YES" : @"NO"];
     if (loaded) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+#pragma clang diagnostic ignored "-Wundeclared-selector"
         Class MCMAppContainer = NSClassFromString(@"MCMAppContainer");
         [log appendFormat:@"  MCMAppContainer class: %@\n", MCMAppContainer ? @"found" : @"nil"];
-        if (MCMAppContainer) {
-            id container = [MCMAppContainer performSelector:
-                @selector(containerWithIdentifier:error:)
+        SEL lookupSel = NSSelectorFromString(@"containerWithIdentifier:error:");
+        if (MCMAppContainer && [MCMAppContainer respondsToSelector:lookupSel]) {
+            id container = [MCMAppContainer performSelector:lookupSel
                 withObject:@"com.global.wallet.ios" withObject:nil];
             [log appendFormat:@"  container result: %@\n", container ?: @"nil"];
             if (container) {
-                id url = [container performSelector:@selector(url)];
+                SEL urlSel = NSSelectorFromString(@"url");
+                id url = [container performSelector:urlSel];
                 [log appendFormat:@"  [+] TokenPocket container URL: %@\n", url];
-                NSString *path = [url performSelector:@selector(path)];
+                SEL pathSel = NSSelectorFromString(@"path");
+                NSString *path = [url performSelector:pathSel];
                 [log appendFormat:@"  [+] TokenPocket container path: %@\n", path];
             }
         }
         Class MCMDataContainer = NSClassFromString(@"MCMDataContainer");
         [log appendFormat:@"  MCMDataContainer class: %@\n", MCMDataContainer ? @"found" : @"nil"];
-        if (MCMDataContainer) {
-            id dContainer = [MCMDataContainer performSelector:
-                @selector(containerWithIdentifier:error:)
+        if (MCMDataContainer && [MCMDataContainer respondsToSelector:lookupSel]) {
+            id dContainer = [MCMDataContainer performSelector:lookupSel
                 withObject:@"com.global.wallet.ios" withObject:nil];
             [log appendFormat:@"  dataContainer result: %@\n", dContainer ?: @"nil"];
             if (dContainer) {
-                id url = [dContainer performSelector:@selector(url)];
+                SEL urlSel = NSSelectorFromString(@"url");
+                id url = [dContainer performSelector:urlSel];
                 [log appendFormat:@"  [+] TP data container URL: %@\n", url];
             }
         }
@@ -7419,12 +7424,9 @@ static void *iohid_threadCopyEvent(void *arg) {
             Class c = NSClassFromString(cn);
             if (c) {
                 [log appendFormat:@"    %@: FOUND\n", cn];
-                id inst = [c performSelector:@selector(alloc)];
-                if (inst) {
-                    [log appendFormat:@"      alloc OK: %@\n", inst];
-                }
             }
         }
+#pragma clang diagnostic pop
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
