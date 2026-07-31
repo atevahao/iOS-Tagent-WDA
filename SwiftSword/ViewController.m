@@ -7,6 +7,7 @@
 
 #import "ViewController.h"
 #import <dlfcn.h>
+#import <IOKit/IOKitLib.h>
 #import <mach/mach.h>
 #import <mach/mach_error.h>
 #import <mach/vm_map.h>
