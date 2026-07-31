@@ -15,7 +15,7 @@ jobs:
       - name: Patch (SDK + fork)
         run: |
           cp SwiftSword/ViewController.m base/UAFPoc/UAFPoc/ViewController.m
-          cp -r SwiftSword/AppIntents/ base/UAFPoc/UAFPoc/
+          cp SwiftSword/AppIntents/SwordIntents.swift base/UAFPoc/UAFPoc/SwordIntents.swift
           sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
           sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
@@ -27,7 +27,8 @@ jobs:
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            OTHER_LDFLAGS=" -framework AppIntents" \
+            SWIFT_VERSION=5.0 \
+            OTHER_LDFLAGS="" \
             -derivedDataPath DerivedData 2>&1 | tee build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           grep -iE "error|warning" build.log | head -40

