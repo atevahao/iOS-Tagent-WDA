@@ -19,14 +19,16 @@ jobs:
           sed -i '' 's/\bobjectType\b/objectAddr/g' base/UAFPoc/UAFPoc/ViewController.m 2>/dev/null || true
           sed -i '' 's/if (raceService != MACH_PORT_NULL) {/if (0) {/' base/UAFPoc/UAFPoc/ViewController.m
 
-      - name: Build (show all errors)
+      - name: Build
         run: |
           cd base/UAFPoc
           xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-            ONLY_ACTIVE_ARCH=NO -derivedDataPath DerivedData 2>&1 | grep -iE "error|warning.*ViewController" | head -20
-          echo "BUILD_EXIT=$?"
+            ONLY_ACTIVE_ARCH=NO -derivedDataPath DerivedData 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          grep -iE "error|warning" build.log | head -40
+          if [ $BUILD_EXIT -ne 0 ]; then echo "BUILD FAILED (exit $BUILD_EXIT)"; exit $BUILD_EXIT; fi
 
       - name: Package
         run: |
