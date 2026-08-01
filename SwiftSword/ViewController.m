@@ -33,6 +33,7 @@
 #include <sys/wait.h>
 #include <spawn.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 // ---- Rie probe helpers: all iOS-private APIs resolved via dlsym ----
 // Public POSIX/Mach headers may not declare all needed functions on iOS.
