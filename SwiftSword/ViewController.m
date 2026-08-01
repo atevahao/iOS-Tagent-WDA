@@ -836,7 +836,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aksConf = [UIButtonConfiguration filledButtonConfiguration];
     aksConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aksProbeButton.configuration = aksConf;
-    [self.aksProbeButton setTitle:@"AppleKeyStore Probe (v91)" forState:UIControlStateNormal];
+    [self.aksProbeButton setTitle:@"AppleKeyStore Probe (v92)" forState:UIControlStateNormal];
     [self.aksProbeButton addTarget:self action:@selector(aksProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aksProbeButton];
 
@@ -8964,7 +8964,7 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
         // Open AppleKeyStore service using dlsym'd functions
         CFMutableDictionaryRef match = sIOServiceMatching("AppleKeyStore");
         if (!match) { [self appendLog:@"IOServiceMatching failed"]; return; }
-        io_service_t svc = sIOServiceGetMatchingService(kIOMainPortDefault, match);
+        io_service_t svc = sIOServiceGetMatchingService(MACH_PORT_NULL, match);
         if (!svc) {
             [self appendLog:@"AppleKeyStore service not found"];
             CFRelease(match);
