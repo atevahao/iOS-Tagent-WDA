@@ -222,6 +222,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *ipcKmsgButton;
 @property (nonatomic, strong) UIButton   *sysvSemButton;
 @property (nonatomic, strong) UIButton   *aksProbeButton;
+@property (nonatomic, strong) UIButton   *wasmUafButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -318,6 +319,7 @@ static const char kOpenPropertiesGarbage[] =
 - (void)ipcKmsgTapped;
 - (void)sysvSemTapped;
 - (void)aksProbeTapped;
+- (void)wasmUafTapped;
 @end
 
 // =======================================================================
@@ -840,6 +842,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.aksProbeButton addTarget:self action:@selector(aksProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aksProbeButton];
 
+    self.wasmUafButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.wasmUafButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *wasmConf = [UIButtonConfiguration filledButtonConfiguration];
+    wasmConf.baseBackgroundColor = [UIColor systemGreenColor];
+    self.wasmUafButton.configuration = wasmConf;
+    [self.wasmUafButton setTitle:@"Wasm UAF Exploit (v93)" forState:UIControlStateNormal];
+    [self.wasmUafButton addTarget:self action:@selector(wasmUafTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.wasmUafButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -886,7 +897,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.aksProbeButton.topAnchor constraintEqualToAnchor:self.sysvSemButton.bottomAnchor constant:12],
         [self.aksProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.aksProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.aksProbeButton.bottomAnchor constant:20],
+        [self.wasmUafButton.topAnchor constraintEqualToAnchor:self.aksProbeButton.bottomAnchor constant:12],
+        [self.wasmUafButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.wasmUafButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.wasmUafButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -9024,6 +9038,37 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
         sIOServiceClose(conn);
         [self appendLog:@"=== AKS Probe complete ==="];
     });
+}
+
+- (void)wasmUafTapped {
+    [self appendLog:@"\n=== Wasm UAF Exploit (Bug 306136) ==="];
+    [self appendLog:@"Opening in Safari — check console via Web Inspector"];
+
+    // Load exploit HTML in Safari via URL scheme
+    // The HTML file is bundled in the app, we serve it or open directly
+    NSString *htmlPath = [[NSBundle mainBundle] pathForResource:@"wasm_uaf_exploit" ofType:@"html"];
+    if (htmlPath) {
+        // Copy to temp and open
+        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wasm_uaf.html"];
+        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+        [[NSFileManager defaultManager] copyItemAtPath:htmlPath toPath:tmpPath error:nil];
+
+        NSURL *url = [NSURL fileURLWithPath:tmpPath];
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ok) {
+                    [self appendLog:@"Opened in Safari — check Web Inspector console"];
+                    [self appendLog:@"Plug into Mac, open Safari → Develop → iPhone → wasm_uaf.html"];
+                } else {
+                    [self appendLog:@"Failed to open Safari — use self-hosted server"];
+                }
+            });
+        }];
+    } else {
+        [self appendLog:@"wasm_uaf_exploit.html not in bundle"];
+        [self appendLog:@"Host it manually: python3 -m http.server 8080"];
+        [self appendLog:@"Then open http://<iphone-ip>:8080/wasm_uaf_exploit.html in Safari"];
+    }
 }
 
 @end
