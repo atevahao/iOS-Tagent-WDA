@@ -9497,8 +9497,8 @@ static uint64_t rie_find_exec_base(task_t task,
                 if (foundNonAuth < 0) {
                     [self appendLog:@"!! no non-auth slide carrier found in MWS"];
                 } else {
-                    [self appendLog:[NSString stringWithFormat:@"target non-auth carrier: MWS[%d] addr=0x%llx sz=0x%llx foff=0x%llx slide=0x%llx",
-                        foundNonAuth, naAddr, naSize, naFoff, naSlide]];
+                    [self appendLog:[NSString stringWithFormat:@"target non-auth carrier: MWS[%d] addr=0x%llx sz=0x%llx foff=0x%llx slide=0x%llx flags=0x%llx max=%x init=%x",
+                        foundNonAuth, naAddr, naSize, naFoff, naSlide, naFlags, naMax, naInit]];
 
                     // Step 3: try Cryptex paths to find the cache file
                     [self appendLog:@"\n-- cache file probe --"];
@@ -9511,7 +9511,6 @@ static uint64_t rie_find_exec_base(task_t task,
                         NULL,
                     };
                     int cacheFD = -1;
-                    const char *foundPath = NULL;
                     NSString *cacheResolved = nil;
                     for (int pi = 0; cachePaths[pi]; pi++) {
                         NSString *raw = [traversalPrefix stringByAppendingString:
@@ -9519,7 +9518,6 @@ static uint64_t rie_find_exec_base(task_t task,
                         NSString *resolved = [raw stringByExpandingTildeInPath];
                         cacheFD = open([resolved UTF8String], O_RDONLY);
                         if (cacheFD >= 0) {
-                            foundPath = cachePaths[pi];
                             cacheResolved = resolved;
                             [self appendLog:[NSString stringWithFormat:@"  FOUND: %@ (fd=%d)", resolved, cacheFD]];
                             break;
