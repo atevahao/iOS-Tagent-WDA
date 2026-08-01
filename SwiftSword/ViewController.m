@@ -859,7 +859,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v193)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v194)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9058,27 +9058,26 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self appendLog:@"\n=== Rie shared_region syscall probe ==="];
+
+        // SIGSYS guard
+        struct sigaction sa, old;
+        memset(&sa,0,sizeof(sa));
+        sa.sa_handler=sigsys_handler;
+        sigaction(SIGSYS,&sa,&old);
+        atomic_store(&g_sigsys_fired,false);
+
         [self appendLog:@"Testing syscall #294 (check_np) and #536 (map_and_slide)\n"];
 
-        // Test syscall 294 — shared_region_check_np
-        uint64_t addr = 0;
-        long r294 = syscall(294, &addr);
-        [self appendLog:[NSString stringWithFormat:
-            @"syscall(294): ret=%ld errno=%d addr=0x%llx",
-            r294, errno, addr]];
+        long r294=syscall(294,0);
+        if(atomic_load(&g_sigsys_fired)){[self appendLog:@"SIGSYS on 294 — not in syscall table"];sigaction(SIGSYS,&old,0);[self appendLog:@"=== Rie: iOS kernel lacks shared_region syscalls ==="];return;}
+        [self appendLog:[NSString stringWithFormat:@"syscall(294): ret=%ld errno=%d",r294,errno]];
 
-        // Test syscall 536 — shared_region_map_and_slide_2_np
-        long r536 = syscall(536, 0, NULL, 0, NULL);
-        [self appendLog:[NSString stringWithFormat:
-            @"syscall(536): ret=%ld errno=%d",
-            r536, errno]];
+        long r536=syscall(536,0,0,0,0);
+        if(atomic_load(&g_sigsys_fired)){[self appendLog:@"SIGSYS on 536"];sigaction(SIGSYS,&old,0);return;}
+        [self appendLog:[NSString stringWithFormat:@"syscall(536): ret=%ld errno=%d",r536,errno]];
 
-        if (r294 == -1 && errno == 78) {
-            [self appendLog:@"syscall exists (ENOSYS) — but compiled out on iOS"];
-        } else if (r294 != -1 || errno != 78) {
-            [self appendLog:@"syscall EXISTS and RESPONDED — Rie exploit VECTOR CONFIRMED!"];
-        }
-
+        sigaction(SIGSYS,&old,0);
+        if(errno!=78&&errno!=0){[self appendLog:@"syscalls EXIST — Rie VECTOR ON iOS!"];}
         [self appendLog:@"=== Rie probe done ==="];
     });
 }
