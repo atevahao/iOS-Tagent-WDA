@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <spawn.h>
 
 // ---- Rie probe helpers: all iOS-private APIs resolved via dlsym ----
 // Public POSIX/Mach headers may not declare all needed functions on iOS.
@@ -66,12 +67,7 @@ typedef kern_return_t (*Rie_TaskResumeFn)(task_t);
 typedef kern_return_t (*Rie_ThreadGetStateFn)(thread_act_t, int, thread_state_t, mach_msg_type_number_t *);
 typedef kern_return_t (*Rie_ThreadSetStateFn)(thread_act_t, int, thread_state_t, mach_msg_type_number_t);
 
-// posix_spawn may not declare posix_spawnattr_t in iOS SDK
-typedef int (*Rie_PosixSpawnFn)(pid_t *restrict, const char *restrict,
-    void *restrict, void *restrict, char *const *restrict, char *const *restrict);
-typedef int (*Rie_PosixSpawnAttrInitFn)(void **);
-typedef int (*Rie_PosixSpawnAttrSetFlagsFn)(void *, short);
-typedef int (*Rie_PosixSpawnAttrDestroyFn)(void **);
+// Mach remote-task APIs — resolved via dlsym (may not be in public iOS SDK)
 
 // _POSIX_SPAWN_RESLIDE (0x0800) — private XNU flag
 #if !defined(_POSIX_SPAWN_RESLIDE)
@@ -9142,13 +9138,11 @@ static uint64_t rie_find_exec_base(task_t task,
             }
         }
 
-        // ── Phase B: API availability scan (no header dependencies) ──
-        [self appendLog:@"\n── Phase B: dlsym API availability scan ──"];
+        // ── Phase B: API availability scan ──
+        [self appendLog:@"\n── Phase B: API availability scan ──"];
 
-        Rie_PosixSpawnFn           posix_spawn_fn  = dlsym(RTLD_DEFAULT, "posix_spawn");
-        Rie_PosixSpawnAttrInitFn   spawnattr_init  = dlsym(RTLD_DEFAULT, "posix_spawnattr_init");
-        Rie_PosixSpawnAttrSetFlagsFn spawnattr_set  = dlsym(RTLD_DEFAULT, "posix_spawnattr_setflags");
-        Rie_PosixSpawnAttrDestroyFn spawnattr_destr = dlsym(RTLD_DEFAULT, "posix_spawnattr_destroy");
+        // posix_spawn* uses real types from <spawn.h> (compile-time linked)
+        // Mach remote-task APIs resolved via dlsym (may not be in public SDK)
         Rie_TaskForPidFn           task_for_pid_fn  = dlsym(RTLD_DEFAULT, "task_for_pid");
         Rie_TaskThreadsFn          task_threads_fn  = dlsym(RTLD_DEFAULT, "task_threads");
         Rie_TaskResumeFn           task_resume_fn   = dlsym(RTLD_DEFAULT, "task_resume");
@@ -9158,8 +9152,8 @@ static uint64_t rie_find_exec_base(task_t task,
         Rie_ThreadSetStateFn       thread_set_fn    = dlsym(RTLD_DEFAULT, "thread_set_state");
 
         [self appendLog:[NSString stringWithFormat:
-            @"posix_spawn=%p task_for_pid=%p task_threads=%p task_resume=%p",
-            posix_spawn_fn, task_for_pid_fn, task_threads_fn, task_resume_fn]];
+            @"posix_spawn (direct) task_for_pid=%p task_threads=%p task_resume=%p",
+            task_for_pid_fn, task_threads_fn, task_resume_fn]];
         [self appendLog:[NSString stringWithFormat:
             @"vm_region_recurse=%p vm_read_overwrite=%p thread_get_state=%p thread_set_state=%p",
             vm_region_rec, vm_read_over, thread_get_fn, thread_set_fn]];
@@ -9167,14 +9161,8 @@ static uint64_t rie_find_exec_base(task_t task,
         // Count available APIs
         int avail = 0, missing = 0;
         NSMutableString *rpt = [NSMutableString stringWithString:@"Available: "];
-        if (posix_spawn_fn)  { [rpt appendString:@"posix_spawn "]; avail++; }
-        else { [rpt appendString:@"[miss:posix_spawn] "]; missing++; }
-        if (spawnattr_init)  { [rpt appendString:@"spawnattr_init "]; avail++; }
-        else { [rpt appendString:@"[miss:spawnattr_init] "]; missing++; }
-        if (spawnattr_set)   { [rpt appendString:@"spawnattr_set "]; avail++; }
-        else { [rpt appendString:@"[miss:spawnattr_set] "]; missing++; }
-        if (spawnattr_destr) { [rpt appendString:@"spawnattr_destr "]; avail++; }
-        else { [rpt appendString:@"[miss:spawnattr_destr] "]; missing++; }
+        [rpt appendString:@"posix_spawn (direct) "]; avail++;
+        [rpt appendString:@"spawnattr (direct) "]; avail++;
         if (task_for_pid_fn) { [rpt appendString:@"TFP "]; avail++; }
         else { [rpt appendString:@"[miss:TFP] "]; missing++; }
         if (task_threads_fn) { [rpt appendString:@"TT "]; avail++; }
@@ -9192,19 +9180,12 @@ static uint64_t rie_find_exec_base(task_t task,
         [self appendLog:rpt];
         [self appendLog:[NSString stringWithFormat:@"Total: %d available, %d missing", avail, missing]];
 
-        // Phase B requires posix_spawn + all 7 Mach APIs
-        BOOL canSpawn = (posix_spawn_fn && spawnattr_init && spawnattr_set && spawnattr_destr);
+        // All 7 Mach remote-task APIs required for hijack
         BOOL canHijack = (task_for_pid_fn && task_threads_fn && task_resume_fn &&
                           vm_region_rec && vm_read_over && thread_get_fn && thread_set_fn);
 
-        if (!canSpawn) {
-            [self appendLog:@"!! posix_spawn APIs missing — cannot spawn child on this iOS version"];
-        }
         if (!canHijack) {
             [self appendLog:@"!! Mach remote-task APIs missing — cannot hijack child thread"];
-        }
-
-        if (!canSpawn || !canHijack) {
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
@@ -9233,17 +9214,17 @@ static uint64_t rie_find_exec_base(task_t task,
         int rc = 0, attempt = 0;
         for (; attempt < 2; attempt++) {
             short flags = flags_attempts[attempt];
-            void *spattr = NULL;
-            if (spawnattr_init(&spattr) != 0) {
+            posix_spawnattr_t spattr;
+            if (posix_spawnattr_init(&spattr) != 0) {
                 [self appendLog:@"!! spawnattr_init failed"];
                 [self appendLog:@"=== Rie probe done ==="];
                 return;
             }
-            spawnattr_set(spattr, flags);
+            posix_spawnattr_setflags(&spattr, flags);
             [self appendLog:[NSString stringWithFormat:@"attempt %d: flags=0x%04x", attempt, flags]];
 
-            rc = posix_spawn_fn(&pid, cpath, NULL, spattr, cargs, NULL);
-            spawnattr_destr(&spattr);
+            rc = posix_spawn(&pid, cpath, NULL, &spattr, cargs, NULL);
+            posix_spawnattr_destroy(&spattr);
 
             if (rc == 0) break;
 
