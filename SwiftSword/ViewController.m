@@ -9200,11 +9200,12 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
-        // Copy child to /tmp — iOS may not exec from app bundle
-        NSString *tmpChild = [@"/tmp/rie_child" stringByStandardizingPath];
+        // Copy child to app tmp dir — iOS sandbox prevents /tmp access
+        NSString *tmpChild = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rie_child"];
         [[NSFileManager defaultManager] removeItemAtPath:tmpChild error:nil];
-        if (![[NSFileManager defaultManager] copyItemAtPath:childPath toPath:tmpChild error:nil]) {
-            [self appendLog:@"!! cannot copy child to /tmp"];
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] copyItemAtPath:childPath toPath:tmpChild error:&err]) {
+            [self appendLog:[NSString stringWithFormat:@"!! cannot copy child: %@", err.localizedDescription]];
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
