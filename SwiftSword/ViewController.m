@@ -80,6 +80,7 @@ typedef kern_return_t (*Rie_ThreadSetStateFn)(thread_act_t, int, thread_state_t,
 #endif
 
 // ── Rie: shared-region config structs (shared with child) ──
+#if 0
 #define SR_CFG_MAGIC 0x53524347u       // 'SRCG'
 #ifndef F_ADDFILESIGS_RETURN
 #define F_ADDFILESIGS_RETURN 97
@@ -123,6 +124,7 @@ typedef struct {
     void   *fs_blob_start;
     size_t  fs_blob_size;
 } rie_fsignatures_t;
+#endif
 
 // RIE_PROBE_OFFSET — replaced at build time by CI
 #ifndef RIE_PROBE_OFFSET
