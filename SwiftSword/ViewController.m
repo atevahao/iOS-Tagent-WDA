@@ -42,8 +42,8 @@
 #else
 #define ARM_THREAD_STATE64 6
 typedef struct {
-    uint64_t x[29]; uint64_t fp; uint64_t lr;
-    uint64_t sp; uint64_t pc; uint32_t cpsr; uint32_t flags;
+    uint64_t __x[29]; uint64_t __fp; uint64_t __lr;
+    uint64_t __sp; uint64_t __pc; uint32_t __cpsr; uint32_t __flags;
 } arm_thread_state64_t;
 #endif
 #define ARM_THREAD_STATE64_COUNT \
@@ -9295,8 +9295,8 @@ static uint64_t rie_find_exec_base(task_t task,
             return;
         }
 
-        st.pc = probeAddr;
-        st.sp &= ~0xFULL;
+        st.__pc = probeAddr;
+        st.__sp &= ~0xFULL;
         kr = thread_set_fn(th, ARM_THREAD_STATE64, (thread_state_t)&st, scnt);
         if (kr != KERN_SUCCESS) {
             [self appendLog:[NSString stringWithFormat:@"!! thread_set_state: %s", mach_error_string(kr)]];
