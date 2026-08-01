@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <spawn.h>
+#include <fcntl.h>
 
 // ---- Rie probe helpers: all iOS-private APIs resolved via dlsym ----
 // Public POSIX/Mach headers may not declare all needed functions on iOS.
@@ -89,12 +90,6 @@ typedef kern_return_t (*Rie_ThreadSetStateFn)(thread_act_t, int, thread_state_t,
 #define VM_PROT_NOAUTH 0x40
 #endif
 
-// fsignatures_t — may not be in iOS SDK
-typedef struct {
-    off_t   fs_file_start;
-    void    *fs_blob_start;
-    size_t  fs_blob_size;
-} fsignatures_t;
 
 struct sr_file_np {                    // == kernel's shared_file_np (12 bytes)
     int      sf_fd;
@@ -120,6 +115,13 @@ struct sr_cfg {
     uint64_t fault_addr;
     uint64_t blob_size;
 };
+
+// Private fsignatures struct (not in public iOS SDK)
+typedef struct {
+    off_t   fs_file_start;
+    void   *fs_blob_start;
+    size_t  fs_blob_size;
+} rie_fsignatures_t;
 
 // RIE_PROBE_OFFSET — replaced at build time by CI
 #ifndef RIE_PROBE_OFFSET
@@ -9453,19 +9455,19 @@ static uint64_t rie_find_exec_base(task_t task,
                 [self appendLog:@"!! not a dyld_v1 header at 0x180000000"];
             } else {
                 // Parse key header fields (all LE; offsets from dyld_cache_header)
-                #define R32(off) (*(uint32_t*)(sr_base + (off)))
-                #define R64(off) (*(uint64_t*)(sr_base + (off)))
-                uint32_t mws_off  = R32(0x138);
-                uint32_t mws_cnt  = R32(0x13c);
-                uint32_t img_cnt  = R32(0x170); // images count (approximate offset)
-                uint64_t cs_off   = R64(0x028);
-                uint64_t cs_sz    = R64(0x030);
-                uint64_t sc_offset= R64(0x040); // shared region base
+                #define RIE_RD32(off) (*(uint32_t*)(sr_base + (off)))
+                #define RIE_RD64(off) (*(uint64_t*)(sr_base + (off)))
+                uint32_t mws_off  = RIE_RD32(0x138);
+                uint32_t mws_cnt  = RIE_RD32(0x13c);
+                uint32_t img_cnt  = RIE_RD32(0x170);
+                uint64_t cs_off   = RIE_RD64(0x028);
+                uint64_t cs_sz    = RIE_RD64(0x030);
+                uint64_t sc_offset= RIE_RD64(0x040);
                 [self appendLog:[NSString stringWithFormat:@"mappingWithSlide: off=0x%x cnt=%u", mws_off, mws_cnt]];
                 [self appendLog:[NSString stringWithFormat:@"images=%u codeSig=0x%llx+0x%llx sharedRegion=0x%llx",
                     img_cnt, cs_off, cs_sz, sc_offset]];
-                #undef R32
-                #undef R64
+                #undef RIE_RD32
+                #undef RIE_RD64
 
                 // Step 2: walk MWS entries, find non-auth DATA slide carrier
                 #define MWS_SIZE 56
@@ -9509,7 +9511,7 @@ static uint64_t rie_find_exec_base(task_t task,
                     };
                     int cacheFD = -1;
                     const char *foundPath = NULL;
-                    __block NSString *cacheResolved = nil;
+                    NSString *cacheResolved = nil;
                     for (int pi = 0; cachePaths[pi]; pi++) {
                         NSString *raw = [traversalPrefix stringByAppendingString:
                             [NSString stringWithUTF8String:cachePaths[pi]]];
@@ -9557,7 +9559,7 @@ static uint64_t rie_find_exec_base(task_t task,
                         [self appendLog:@"!! no cache file open — cannot register code sig"];
                     } else {
                         // Try F_ADDFILESIGS_RETURN to register code signature
-                        fsignatures_t fs;
+                        rie_fsignatures_t fs;
                         memset(&fs, 0, sizeof(fs));
                         fs.fs_file_start = 0;
                         fs.fs_blob_start = (void *)(uintptr_t)cs_off;
