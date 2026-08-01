@@ -23,6 +23,7 @@ public struct SwordRieIntent: AppIntent {
         var log = "[SwordRieIntent perform()]\nAppIntents context active — testing posix_spawn...\n"
         log += bridge.testPosixSpawnContext()
         print(log)
+        SwordAppIntentBridge.lastResult = log
         return .result()
     }
 }
@@ -33,10 +34,8 @@ public struct SwordRieIntent: AppIntent {
     @objc public func invokeIntent(_ callback: @escaping (String) -> Void) {
         Task { @MainActor in
             let intent = SwordRieIntent()
-            // perform() prints to stdout; also capture the IntentResult
             _ = try? await intent.perform()
-            // Signal completion — actual log is in stdout/console
-            callback("AppIntent perform() completed — check device syslog for output")
+            callback(SwordAppIntentBridge.lastResult)
         }
     }
 }
@@ -44,6 +43,8 @@ public struct SwordRieIntent: AppIntent {
 // MARK: - ObjC Bridge
 
 @objc public class SwordAppIntentBridge: NSObject {
+
+    @objc public static var lastResult: String = "(not run)"
 
     // MARK: existing API (unchanged)
 
