@@ -15,7 +15,9 @@ jobs:
       - name: Build Rie child
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "iOS SDK: $SDK"
           clang -arch arm64 -O0 -g -isysroot $SDK \
+            -miphoneos-version-min=15.0 \
             -fno-stack-protector \
             -o SwiftSword/rie_child SwiftSword/rie_child.c
           codesign -s - --force --entitlements SwiftSword/rie_child.entitlements SwiftSword/rie_child

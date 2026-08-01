@@ -32,29 +32,52 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
-#include <mach/mach_vm.h>
 #include <mach-o/loader.h>
 
-// _POSIX_SPAWN_RESLIDE (0x0800) — private XNU flag, may not be in iOS SDK
-#if !defined(_POSIX_SPAWN_RESLIDE)
-#define _POSIX_SPAWN_RESLIDE 0x0800
+// ---- Mach VM / thread headers: use SDK if available, else define manually ----
+
+#if __has_include(<mach/mach_vm.h>)
+#include <mach/mach_vm.h>
+#else
+// Fallback types when mach/mach_vm.h is not in iOS SDK
+typedef uint64_t              mach_vm_address_t;
+typedef uint64_t              mach_vm_size_t;
+// vm_region_submap_info_64: use a buffer large enough (48+ bytes on arm64)
+typedef natural_t             vm_region_submap_info_data_64_t[20];
+typedef natural_t            *vm_region_submap_info_t;
+typedef void                 *vm_region_recurse_info_t;
+#define VM_REGION_SUBMAP_INFO_COUNT_64 ((mach_msg_type_number_t)20)
 #endif
 
-// arm_thread_state64_t — try SDK header, else define manually
 #if __has_include(<mach/arm/thread_state.h>)
 #include <mach/arm/thread_state.h>
 #else
 #define ARM_THREAD_STATE64 6
-#define ARM_THREAD_STATE64_COUNT ((mach_msg_type_number_t)(sizeof(arm_thread_state64_t)/sizeof(unsigned int)))
 typedef struct {
-    uint64_t x[29];
-    uint64_t fp;
-    uint64_t lr;
-    uint64_t sp;
-    uint64_t pc;
-    uint32_t cpsr;
-    uint32_t flags;
+    uint64_t x[29]; uint64_t fp; uint64_t lr;
+    uint64_t sp; uint64_t pc; uint32_t cpsr; uint32_t flags;
 } arm_thread_state64_t;
+#endif
+#ifndef ARM_THREAD_STATE64_COUNT
+#define ARM_THREAD_STATE64_COUNT \
+    ((mach_msg_type_number_t)(sizeof(arm_thread_state64_t)/sizeof(unsigned int)))
+#endif
+
+// ---- Function pointer typedefs for dlsym-resolved Mach APIs ----
+
+typedef kern_return_t (*MachVMRegionRecurseFn)(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
+    natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *);
+typedef kern_return_t (*MachVMReadOverwriteFn)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
+    mach_vm_address_t, mach_vm_size_t *);
+typedef kern_return_t (*TaskForPidFn)(task_t, int, task_t *);
+typedef kern_return_t (*TaskThreadsFn)(task_t, thread_act_array_t *, mach_msg_type_number_t *);
+typedef kern_return_t (*TaskResumeFn)(task_t);
+typedef kern_return_t (*ThreadGetStateFn)(thread_act_t, int, thread_state_t, mach_msg_type_number_t *);
+typedef kern_return_t (*ThreadSetStateFn)(thread_act_t, int, thread_state_t, mach_msg_type_number_t);
+
+// _POSIX_SPAWN_RESLIDE (0x0800) — private XNU flag, may not be in iOS SDK
+#if !defined(_POSIX_SPAWN_RESLIDE)
+#define _POSIX_SPAWN_RESLIDE 0x0800
 #endif
 
 // RIE_PROBE_OFFSET — replaced at build time by CI (nm child | grep child_probe)
@@ -9072,29 +9095,29 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 }
 
 // ---- Rie child spawn + hijack helpers (v206) ----
+// All remote-task Mach APIs resolved via dlsym — not all are in the public iOS SDK.
 
-// Find MH_EXECUTE load base in target task via mach_vm_region_recurse
-static uint64_t rie_find_exec_base(task_t task) {
+// Find MH_EXECUTE load base in target task
+static uint64_t rie_find_exec_base(task_t task,
+    MachVMRegionRecurseFn vmRegionRecurse, MachVMReadOverwriteFn vmReadOverwrite)
+{
     mach_vm_address_t addr = 0;
     mach_vm_size_t size = 0;
     natural_t depth = 0;
     for (int i = 0; i < 500; i++) {
         vm_region_submap_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(task, &addr, &size, &depth,
-            (vm_region_recurse_info_t)&info, &cnt);
-        if (kr != KERN_SUCCESS) break;
+        if (vmRegionRecurse(task, &addr, &size, &depth,
+                (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS) break;
         uint32_t hdr[4] = {0};
         mach_vm_size_t got = 0;
-        if (mach_vm_read_overwrite(task, addr, sizeof(hdr),
+        if (vmReadOverwrite(task, addr, sizeof(hdr),
                 (mach_vm_address_t)hdr, &got) == KERN_SUCCESS &&
-            got == sizeof(hdr) &&
-            hdr[0] == MH_MAGIC_64 &&
-            hdr[3] == MH_EXECUTE) {
+            got == sizeof(hdr) && hdr[0] == MH_MAGIC_64 && hdr[3] == MH_EXECUTE) {
             return (uint64_t)addr;
         }
         addr += size;
-        if (addr > 0x200000000ULL) break; // sanity: 8GB
+        if (addr > 0x200000000ULL) break;
     }
     return 0;
 }
@@ -9123,6 +9146,38 @@ static uint64_t rie_find_exec_base(task_t task) {
         // ── Phase B: child spawn + thread hijack probe ──
         [self appendLog:@"\n── Phase B: child RESLIDE spawn + hijack ──"];
 
+        // Resolve all remote-task Mach APIs via dlsym (may be private on iOS)
+        TaskForPidFn            taskForPid = dlsym(RTLD_DEFAULT, "task_for_pid");
+        TaskThreadsFn           taskThreads = dlsym(RTLD_DEFAULT, "task_threads");
+        TaskResumeFn            taskResume  = dlsym(RTLD_DEFAULT, "task_resume");
+        MachVMRegionRecurseFn   vmRegionRecurse = dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+        MachVMReadOverwriteFn   vmReadOverwrite = dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        ThreadGetStateFn        threadGetState  = dlsym(RTLD_DEFAULT, "thread_get_state");
+        ThreadSetStateFn        threadSetState  = dlsym(RTLD_DEFAULT, "thread_set_state");
+
+        [self appendLog:[NSString stringWithFormat:
+            @"dlsym: TFP=%p TT=%p TR=%p VR=%p VRO=%pTGS=%pTSS=%p",
+            taskForPid, taskThreads, taskResume, vmRegionRecurse, vmReadOverwrite,
+            threadGetState, threadSetState]];
+
+        // Check minimum required APIs
+        if (!taskForPid || !taskThreads || !taskResume ||
+            !vmRegionRecurse || !vmReadOverwrite ||
+            !threadGetState || !threadSetState) {
+            [self appendLog:@"!! One or more Mach APIs unavailable — Phase B blocked on iOS SDK"];
+            NSMutableString *miss = [NSMutableString string];
+            if (!taskForPid) [miss appendString:@"task_for_pid "];
+            if (!taskThreads) [miss appendString:@"task_threads "];
+            if (!taskResume) [miss appendString:@"task_resume "];
+            if (!vmRegionRecurse) [miss appendString:@"mach_vm_region_recurse "];
+            if (!vmReadOverwrite) [miss appendString:@"mach_vm_read_overwrite "];
+            if (!threadGetState) [miss appendString:@"thread_get_state "];
+            if (!threadSetState) [miss appendString:@"thread_set_state "];
+            [self appendLog:[NSString stringWithFormat:@"  missing: %@", miss]];
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+
         // Find child binary in app bundle
         NSString *childPath = [[[NSBundle mainBundle] bundlePath]
             stringByAppendingPathComponent:@"rie_child"];
@@ -9133,10 +9188,6 @@ static uint64_t rie_find_exec_base(task_t task) {
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
-
-        // Resolve task_for_pid via dlsym (may not be in public iOS SDK)
-        kern_return_t (*tfp)(task_t, int, task_t *) = dlsym(RTLD_DEFAULT, "task_for_pid");
-        [self appendLog:[NSString stringWithFormat:@"task_for_pid=%p", tfp]];
 
         posix_spawnattr_t attr;
         posix_spawnattr_init(&attr);
@@ -9164,20 +9215,13 @@ static uint64_t rie_find_exec_base(task_t task) {
         }
         [self appendLog:[NSString stringWithFormat:@"child spawned: pid=%d (suspended,reslide)", pid]];
 
-        if (!tfp) {
-            [self appendLog:@"!! task_for_pid unavailable — cannot hijack child"];
-            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-            [self appendLog:@"=== Rie probe done ==="];
-            return;
-        }
-
         task_t ctask = TASK_NULL;
-        kern_return_t kr = tfp(mach_task_self(), pid, &ctask);
+        kern_return_t kr = taskForPid(mach_task_self(), pid, &ctask);
         if (kr != KERN_SUCCESS) {
             [self appendLog:[NSString stringWithFormat:@"!! task_for_pid failed: %s (0x%x)",
                 mach_error_string(kr), kr]];
             if (kr == 5) {
-                [self appendLog:@"  → KERN_FAILURE (5): needs get-task-allow on child OR task_for_pid-allow entitlement"];
+                [self appendLog:@"  → KERN_FAILURE (5): needs get-task-allow on child OR task_for_pid-allow"];
             }
             kill(pid, SIGKILL); waitpid(pid, NULL, 0);
             [self appendLog:@"=== Rie probe done ==="];
@@ -9188,7 +9232,7 @@ static uint64_t rie_find_exec_base(task_t task) {
         // Get child's main thread
         thread_act_array_t threads = NULL;
         mach_msg_type_number_t nthreads = 0;
-        kr = task_threads(ctask, &threads, &nthreads);
+        kr = taskThreads(ctask, &threads, &nthreads);
         if (kr != KERN_SUCCESS || nthreads < 1) {
             [self appendLog:[NSString stringWithFormat:@"!! task_threads failed: %s (0x%x) n=%u",
                 mach_error_string(kr), kr, nthreads]];
@@ -9200,7 +9244,7 @@ static uint64_t rie_find_exec_base(task_t task) {
         [self appendLog:[NSString stringWithFormat:@"main thread: %u", th]];
 
         // Find child's exec base
-        uint64_t base = rie_find_exec_base(ctask);
+        uint64_t base = rie_find_exec_base(ctask, vmRegionRecurse, vmReadOverwrite);
         if (base == 0) {
             [self appendLog:@"!! could not locate child exec base in remote task"];
             kill(pid, SIGKILL); waitpid(pid, NULL, 0);
@@ -9214,7 +9258,7 @@ static uint64_t rie_find_exec_base(task_t task) {
         // Hijack thread: set PC = child_probe
         arm_thread_state64_t st;
         mach_msg_type_number_t scount = ARM_THREAD_STATE64_COUNT;
-        kr = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &scount);
+        kr = threadGetState(th, ARM_THREAD_STATE64, (thread_state_t)&st, &scount);
         if (kr != KERN_SUCCESS) {
             [self appendLog:[NSString stringWithFormat:@"!! thread_get_state failed: %s (0x%x)",
                 mach_error_string(kr), kr]];
@@ -9226,9 +9270,9 @@ static uint64_t rie_find_exec_base(task_t task) {
             (unsigned long long)st.pc, (unsigned long long)st.sp]];
 
         st.pc = (uint64_t)probeAddr;
-        st.sp &= ~0xFULL;  // align to 16 bytes
+        st.sp &= ~0xFULL;
 
-        kr = thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, scount);
+        kr = threadSetState(th, ARM_THREAD_STATE64, (thread_state_t)&st, scount);
         if (kr != KERN_SUCCESS) {
             [self appendLog:[NSString stringWithFormat:@"!! thread_set_state failed: %s (0x%x)",
                 mach_error_string(kr), kr]];
@@ -9242,8 +9286,8 @@ static uint64_t rie_find_exec_base(task_t task) {
         vm_deallocate(mach_task_self(), (vm_address_t)threads,
             nthreads * sizeof(thread_act_t));
 
-        // Resume child — it will execute child_probe and exit
-        kr = task_resume(ctask);
+        // Resume child
+        kr = taskResume(ctask);
         if (kr != KERN_SUCCESS) {
             [self appendLog:[NSString stringWithFormat:@"!! task_resume failed: %s (0x%x)",
                 mach_error_string(kr), kr]];
