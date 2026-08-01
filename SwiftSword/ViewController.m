@@ -847,7 +847,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v202)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v203)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9043,19 +9043,29 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self appendLog:@"\n=== Rie shared_region syscall probe ===\n"];
-        [self appendLog:@"syscall() not directly available on iOS — testing alternatives..."];
 
-        // Test if we can reach syscall via dlsym
+        // SIGSYS guard
+        struct sigaction sa, old;
+        memset(&sa,0,sizeof(sa));
+        sa.sa_handler=sigsys_handler;
+        sigaction(SIGSYS,&sa,&old);
+        atomic_store(&g_sigsys_fired,false);
+
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
-        if (sc) {
-            [self appendLog:@"dlsym(syscall) FOUND!"];
-            // Test syscall 294
-            long r = sc(294, 0);
-            [self appendLog:[NSString stringWithFormat:@"syscall(294): ret=%ld errno=%d", r, errno]];
-        } else {
-            [self appendLog:@"dlsym(syscall) NOT FOUND — syscall not available on iOS"];
+        [self appendLog:[NSString stringWithFormat:@"dlsym(syscall)=%p", sc]];
+
+        if(sc){
+            long r=sc(294,0);
+            if(atomic_load(&g_sigsys_fired)){
+                [self appendLog:@"SIGSYS — syscall 294 not in iOS table"];
+            }else{
+                [self appendLog:[NSString stringWithFormat:@"syscall(294): ret=%ld errno=%d",r,errno]];
+            }
+        }else{
+            [self appendLog:@"dlsym failed — syscall not available"];
         }
 
+        sigaction(SIGSYS,&old,0);
         [self appendLog:@"=== Rie probe done ==="];
     });
 }
