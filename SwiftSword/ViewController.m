@@ -9388,6 +9388,7 @@ static uint64_t rie_find_exec_base(task_t task,
             }
 
             // Phase D: syscall 536 probe — find shared cache via VM regions
+#if 0
             [self appendLog:@"\n-- Phase D: syscall 536 probe --"];
 
             // Resolve mach_vm_region_recurse now for VM region scan
@@ -9443,6 +9444,7 @@ static uint64_t rie_find_exec_base(task_t task,
             // Test syscall 536 with NULL args
             long rNull = sc(536, NULL, NULL, NULL, NULL);
             [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
+#endif
 
             // ── Phase E: Direct syscall 536 — parse cache from SR memory, build blob ──
 #if 0
