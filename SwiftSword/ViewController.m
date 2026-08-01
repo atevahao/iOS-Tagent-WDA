@@ -222,6 +222,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *ipcKmsgButton;
 @property (nonatomic, strong) UIButton   *sysvSemButton;
 @property (nonatomic, strong) UIButton   *aksProbeButton;
+@property (nonatomic, strong) UIButton   *rieProbeButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -318,6 +319,7 @@ static const char kOpenPropertiesGarbage[] =
 - (void)ipcKmsgTapped;
 - (void)sysvSemTapped;
 - (void)aksProbeTapped;
+- (void)rieProbeTapped;
 @end
 
 // =======================================================================
@@ -840,6 +842,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.aksProbeButton addTarget:self action:@selector(aksProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aksProbeButton];
 
+    self.rieProbeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.rieProbeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
+    rieConf.baseBackgroundColor = [UIColor systemPinkColor];
+    self.rieProbeButton.configuration = rieConf;
+    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v202)" forState:UIControlStateNormal];
+    [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.rieProbeButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -886,7 +897,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.aksProbeButton.topAnchor constraintEqualToAnchor:self.sysvSemButton.bottomAnchor constant:12],
         [self.aksProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.aksProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.aksProbeButton.bottomAnchor constant:20],
+        [self.rieProbeButton.topAnchor constraintEqualToAnchor:self.aksProbeButton.bottomAnchor constant:12],
+        [self.rieProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.rieProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.rieProbeButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -9023,6 +9037,26 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 
         sIOServiceClose(conn);
         [self appendLog:@"=== AKS Probe complete ==="];
+    });
+}
+
+- (void)rieProbeTapped {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self appendLog:@"\n=== Rie shared_region syscall probe ===\n"];
+        [self appendLog:@"syscall() not directly available on iOS — testing alternatives..."];
+
+        // Test if we can reach syscall via dlsym
+        long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
+        if (sc) {
+            [self appendLog:@"dlsym(syscall) FOUND!"];
+            // Test syscall 294
+            long r = sc(294, 0);
+            [self appendLog:[NSString stringWithFormat:@"syscall(294): ret=%ld errno=%d", r, errno]];
+        } else {
+            [self appendLog:@"dlsym(syscall) NOT FOUND — syscall not available on iOS"];
+        }
+
+        [self appendLog:@"=== Rie probe done ==="];
     });
 }
 
