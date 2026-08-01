@@ -9221,32 +9221,44 @@ static uint64_t rie_find_exec_base(task_t task,
         }
         [self appendLog:[NSString stringWithFormat:@"child: %@", childPath]];
 
-        // Allocate and init spawn attributes
-        void *spattr = NULL;
-        if (spawnattr_init(&spattr) != 0) {
-            [self appendLog:@"!! spawnattr_init failed"];
-            [self appendLog:@"=== Rie probe done ==="];
-            return;
-        }
-        short flags = (short)(POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_RESLIDE);
-        spawnattr_set(spattr, flags);
-        [self appendLog:[NSString stringWithFormat:@"flags=0x%04x set on attr=%p", flags, spattr]];
-
         char *cpath = (char *)[childPath UTF8String];
         char *cargs[] = { cpath, NULL };
+
+        // Try RESLIDE first, fall back to START_SUSPENDED-only on EPERM
+        short flags_attempts[] = {
+            (short)(POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_RESLIDE),  // try 0
+            (short)(POSIX_SPAWN_START_SUSPENDED),                         // fallback 1
+        };
         pid_t pid = -1;
-        int rc = posix_spawn_fn(&pid, cpath, NULL, spattr, cargs, NULL);
-        spawnattr_destr(&spattr);
+        int rc = 0, attempt = 0;
+        for (; attempt < 2; attempt++) {
+            short flags = flags_attempts[attempt];
+            void *spattr = NULL;
+            if (spawnattr_init(&spattr) != 0) {
+                [self appendLog:@"!! spawnattr_init failed"];
+                [self appendLog:@"=== Rie probe done ==="];
+                return;
+            }
+            spawnattr_set(spattr, flags);
+            [self appendLog:[NSString stringWithFormat:@"attempt %d: flags=0x%04x", attempt, flags]];
+
+            rc = posix_spawn_fn(&pid, cpath, NULL, spattr, cargs, NULL);
+            spawnattr_destr(&spattr);
+
+            if (rc == 0) break;
+
+            [self appendLog:[NSString stringWithFormat:@"!! attempt %d failed: errno=%d", attempt, rc]];
+            if (rc == 78) [self appendLog:@"  → ENOEXEC: code-signing issue"];
+            else if (rc == 1) [self appendLog:[attempt == 0 ? @"  → EPERM: RESLIDE not allowed, retrying without RESLIDE..." : @"  → EPERM: even START_SUSPENDED denied"]];
+            else if (rc == 22) [self appendLog:@"  → EINVAL: flag not recognized"];
+        }
 
         if (rc != 0) {
-            [self appendLog:[NSString stringWithFormat:@"!! posix_spawn failed: errno=%d", rc]];
-            if (rc == 78) [self appendLog:@"  → ENOEXEC: code-signing issue"];
-            else if (rc == 1) [self appendLog:@"  → EPERM: RESLIDE not allowed?"];
-            else if (rc == 22) [self appendLog:@"  → EINVAL: RESLIDE not recognized on iOS"];
+            [self appendLog:@"all spawn attempts failed"];
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
-        [self appendLog:[NSString stringWithFormat:@"spawned: pid=%d", pid]];
+        [self appendLog:[NSString stringWithFormat:@"spawned: pid=%d (attempt %d)", pid, attempt]];
 
         task_t ctask = TASK_NULL;
         kern_return_t kr = task_for_pid_fn(mach_task_self(), pid, &ctask);
