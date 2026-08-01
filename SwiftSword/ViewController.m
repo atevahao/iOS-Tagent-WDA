@@ -9200,19 +9200,30 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
-        [self appendLog:[NSString stringWithFormat:@"child: %@", childPath]];
+        // Copy child to /tmp — iOS may not exec from app bundle
+        NSString *tmpChild = [@"/tmp/rie_child" stringByStandardizingPath];
+        [[NSFileManager defaultManager] removeItemAtPath:tmpChild error:nil];
+        if (![[NSFileManager defaultManager] copyItemAtPath:childPath toPath:tmpChild error:nil]) {
+            [self appendLog:@"!! cannot copy child to /tmp"];
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        chmod([tmpChild UTF8String], 0755);
+        [self appendLog:[NSString stringWithFormat:@"child: %@", tmpChild]];
 
-        char *cpath = (char *)[childPath UTF8String];
+        char *cpath = (char *)[tmpChild UTF8String];
         char *cargs[] = { cpath, NULL };
 
-        // Try RESLIDE first, fall back to START_SUSPENDED-only on EPERM
+        // Attempt cascade: RESLIDE -> START_SUSPENDED -> plain spawn (no flags)
+        static const char *labels[] = {"RESLIDE", "START_SUSPENDED", "plain (flags=0)"};
         short flags_attempts[] = {
-            (short)(POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_RESLIDE),  // try 0
-            (short)(POSIX_SPAWN_START_SUSPENDED),                         // fallback 1
+            (short)(POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_RESLIDE),
+            (short)(POSIX_SPAWN_START_SUSPENDED),
+            0,
         };
         pid_t pid = -1;
         int rc = 0, attempt = 0;
-        for (; attempt < 2; attempt++) {
+        for (; attempt < 3; attempt++) {
             short flags = flags_attempts[attempt];
             posix_spawnattr_t spattr;
             if (posix_spawnattr_init(&spattr) != 0) {
@@ -9221,7 +9232,7 @@ static uint64_t rie_find_exec_base(task_t task,
                 return;
             }
             posix_spawnattr_setflags(&spattr, flags);
-            [self appendLog:[NSString stringWithFormat:@"attempt %d: flags=0x%04x", attempt, flags]];
+            [self appendLog:[NSString stringWithFormat:@"attempt %d (%s): flags=0x%04x", attempt, labels[attempt], flags]];
 
             rc = posix_spawn(&pid, cpath, NULL, &spattr, cargs, NULL);
             posix_spawnattr_destroy(&spattr);
@@ -9231,10 +9242,10 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:[NSString stringWithFormat:@"!! attempt %d failed: errno=%d", attempt, rc]];
             if (rc == 78) [self appendLog:@"  -> ENOEXEC: code-signing issue"];
             else if (rc == 1) {
-                if (attempt == 0)
-                    [self appendLog:@"  -> EPERM: RESLIDE not allowed, retrying without RESLIDE..."];
+                if (attempt < 2)
+                    [self appendLog:[NSString stringWithFormat:@"  -> EPERM: %s not allowed", labels[attempt]]];
                 else
-                    [self appendLog:@"  -> EPERM: even START_SUSPENDED denied"];
+                    [self appendLog:@"  -> EPERM: even plain spawn denied — iOS sandbox blocks posix_spawn entirely"];
             }
             else if (rc == 22) [self appendLog:@"  -> EINVAL: flag not recognized"];
         }
@@ -9244,7 +9255,7 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:@"=== Rie probe done ==="];
             return;
         }
-        [self appendLog:[NSString stringWithFormat:@"spawned: pid=%d (attempt %d)", pid, attempt]];
+        [self appendLog:[NSString stringWithFormat:@"spawned: pid=%d (attempt %d: %s)", pid, attempt, labels[attempt]]];
 
         task_t ctask = TASK_NULL;
         kern_return_t kr = task_for_pid_fn(mach_task_self(), pid, &ctask);
