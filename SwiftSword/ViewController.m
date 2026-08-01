@@ -77,6 +77,49 @@ typedef kern_return_t (*Rie_ThreadSetStateFn)(thread_act_t, int, thread_state_t,
 #define POSIX_SPAWN_START_SUSPENDED 0x0100
 #endif
 
+// ── Rie: shared-region config structs (shared with child) ──
+#define RIE_SR_CFG_MAGIC 0x53524347u       // 'SRCG'
+#ifndef F_ADDFILESIGS_RETURN
+#define F_ADDFILESIGS_RETURN 97
+#endif
+#ifndef VM_PROT_SLIDE
+#define VM_PROT_SLIDE  0x20
+#endif
+#ifndef VM_PROT_NOAUTH
+#define VM_PROT_NOAUTH 0x40
+#endif
+
+struct rie_sr_file {
+    int      sf_fd;
+    uint32_t sf_mappings_count;
+    uint32_t sf_slide;
+};
+struct rie_sr_mapping {
+    uint64_t sms_address;
+    uint64_t sms_size;
+    uint64_t sms_file_offset;
+    uint64_t sms_slide_size;
+    uint64_t sms_slide_start;
+    uint32_t sms_max_prot;
+    uint32_t sms_init_prot;
+};
+struct rie_sr_cfg {
+    uint32_t magic;
+    uint32_t blob_off;
+    char     main_path[512];
+    char     sub_path[512];
+    struct   rie_sr_file files[3];
+    struct   rie_sr_mapping mappings[3];
+    uint64_t fault_addr;
+    uint64_t blob_size;
+};
+
+typedef struct {
+    off_t   fs_file_start;
+    void   *fs_blob_start;
+    size_t  fs_blob_size;
+} rie_fsignatures_t;
+
 // RIE_PROBE_OFFSET — replaced at build time by CI
 #ifndef RIE_PROBE_OFFSET
 #define RIE_PROBE_OFFSET RIE_PROBE_OFFSET_PLACEHOLDER
