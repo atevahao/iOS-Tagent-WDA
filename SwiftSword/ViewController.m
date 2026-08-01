@@ -9181,33 +9181,77 @@ static uint64_t rie_find_exec_base(task_t task,
 
             // Phase D: syscall 536 probe in current process (no child needed)
             [self appendLog:@"\n-- Phase D: syscall 536 probe (current process) --"];
-            // Try to open shared cache — is it readable from sandbox?
-            int cacheFd = open("/System/Library/dyld/dyld_shared_cache_arm64e", O_RDONLY);
-            [self appendLog:[NSString stringWithFormat:@"open(shared_cache): fd=%d errno=%d", cacheFd, errno]];
-            if (cacheFd >= 0) {
-                // syscall 536 with just cache fd, no custom slide info
-                long r536b = sc(536, cacheFd, 0, 0, 0);
-                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, 0,0,0): ret=%ld errno=%d", r536b, errno]];
-                // syscall 536 with more args (cache fd + size hint + pointer)
-                struct stat st;
-                if (fstat(cacheFd, &st) == 0) {
-                    long r536c = sc(536, cacheFd, (void *)(uintptr_t)st.st_size, 0, 0);
-                    [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, size, 0,0): ret=%ld errno=%d", r536c, errno]];
+
+            // Scan for shared cache — try multiple candidate paths
+            const char *cachePaths[] = {
+                "/System/Library/dyld/dyld_shared_cache_arm64e",
+                "/System/Library/dyld/dyld_shared_cache_arm64",
+                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
+                "/private/var/db/dyld/dyld_shared_cache_arm64e",
+                "/private/var/db/dyld/dyld_shared_cache_arm64",
+                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache",
+            };
+            int cacheFd = -1;
+            const char *foundPath = NULL;
+            for (int pi = 0; pi < sizeof(cachePaths)/sizeof(cachePaths[0]); pi++) {
+                int fd = open(cachePaths[pi], O_RDONLY);
+                if (fd >= 0) {
+                    foundPath = cachePaths[pi];
+                    cacheFd = fd;
+                    [self appendLog:[NSString stringWithFormat:@"FOUND shared cache: %s (fd=%d)", foundPath, fd]];
+                    break;
                 }
-                close(cacheFd);
+                [self appendLog:[NSString stringWithFormat:@"  not found: %s", cachePaths[pi]]];
             }
 
-            // Try syscall 536 path variants
-            const char *paths[] = {
-                "/System/Library/dyld/dyld_shared_cache_arm64e",
-                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
-                "dyld_shared_cache_arm64e",
-            };
-            for (int pi = 0; pi < 3; pi++) {
-                long r536p = sc(536, (void *)(uintptr_t)paths[pi], 0, 0, 0);
-                [self appendLog:[NSString stringWithFormat:@"syscall(536, \"%s\", 0,0,0): ret=%ld errno=%d",
-                    paths[pi], r536p, errno]];
+            if (cacheFd >= 0) {
+                struct stat st;
+                fstat(cacheFd, &st);
+                [self appendLog:[NSString stringWithFormat:@"cache size: %lld MB", (long long)(st.st_size / 1024 / 1024)]];
+
+                // Test 536 with fd only
+                long r1 = sc(536, cacheFd, 0, 0, 0);
+                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, 0,0,0): ret=%ld errno=%d", r1, errno]];
+
+                // Test 536 with fd + size
+                long r2 = sc(536, cacheFd, (void *)(uintptr_t)st.st_size, 0, 0);
+                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, size, 0,0): ret=%ld errno=%d", r2, errno]];
+
+                // Test 536 with fd + size + addr hint
+                long r3 = sc(536, cacheFd, (void *)(uintptr_t)st.st_size, (void *)0x1956b8000ULL, 0);
+                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, size, 0x1956b8000, 0): ret=%ld errno=%d", r3, errno]];
+
+                close(cacheFd);
+            } else {
+                [self appendLog:@"!! shared cache not found at any path"];
+                // List /System/Library/dyld/ contents via directory enumeration
+                DIR *d = opendir("/System/Library/dyld");
+                if (d) {
+                    [self appendLog:@"/System/Library/dyld contents:"];
+                    struct dirent *de;
+                    while ((de = readdir(d))) {
+                        [self appendLog:[NSString stringWithFormat:@"  %s", de->d_name]];
+                    }
+                    closedir(d);
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"opendir(/System/Library/dyld) failed: errno=%d", errno]];
+                }
+                // Also try /private/var/db/dyld/
+                d = opendir("/private/var/db/dyld");
+                if (d) {
+                    [self appendLog:@"/private/var/db/dyld contents:"];
+                    struct dirent *de;
+                    while ((de = readdir(d))) {
+                        [self appendLog:[NSString stringWithFormat:@"  %s", de->d_name]];
+                    }
+                    closedir(d);
+                }
             }
+
+            // Also try syscall 536 with NULL args to see if ret changes in this context
+            long rNull = sc(536, NULL, NULL, NULL, NULL);
+            [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
         }
 
         // ── Phase B: API availability scan ──
