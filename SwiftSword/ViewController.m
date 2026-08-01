@@ -813,7 +813,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *ipcConf = [UIButtonConfiguration filledButtonConfiguration];
     ipcConf.baseBackgroundColor = [UIColor systemTealColor];
     self.ipcKmsgButton.configuration = ipcConf;
-    [self.ipcKmsgButton setTitle:@"IPC KMSG Leak Probe (v1)" forState:UIControlStateNormal];
+    [self.ipcKmsgButton setTitle:@"IPC KMSG Leak Probe (v84)" forState:UIControlStateNormal];
     [self.ipcKmsgButton addTarget:self action:@selector(ipcKmsgTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.ipcKmsgButton];
 
@@ -8555,20 +8555,22 @@ static void *iohid_threadCopyEvent(void *arg) {
                 @"simple send: %s (0x%x)", mach_error_string(kr), kr]];
 
             if (kr == KERN_SUCCESS) {
-                mach_msg_header_t recvTest;
-                memset(&recvTest, 0, sizeof(recvTest));
-                recvTest.msgh_local_port = recvPort;
-                recvTest.msgh_size       = sizeof(recvTest);
-                kr = mach_msg(&recvTest,
+                // Buffer must be large enough for header + trailer
+                uint8_t recvBuf[256];
+                mach_msg_header_t *recvHdr = (mach_msg_header_t *)recvBuf;
+                memset(recvBuf, 0, sizeof(recvBuf));
+                recvHdr->msgh_local_port = recvPort;
+                recvHdr->msgh_size       = sizeof(recvBuf);
+                kr = mach_msg(recvHdr,
                               MACH_RCV_MSG,
                               0,
-                              sizeof(recvTest),
+                              sizeof(recvBuf),
                               recvPort,
                               MACH_MSG_TIMEOUT_NONE,
                               MACH_PORT_NULL);
                 [self appendLog:[NSString stringWithFormat:
-                    @"simple recv: %s (0x%x) id=0x%x",
-                    mach_error_string(kr), kr, recvTest.msgh_id]];
+                    @"simple recv: %s (0x%x) id=0x%x size=%d",
+                    mach_error_string(kr), kr, recvHdr->msgh_id, recvHdr->msgh_size]];
             }
         }
 
