@@ -9164,7 +9164,8 @@ static uint64_t rie_find_exec_base(task_t task,
                         ];
                         for (NSString *k in keys) {
                             CFTypeRef v = copyEnt(task, (__bridge CFStringRef)k, NULL);
-                            [self appendLog:[NSString stringWithFormat:@"  %@ = %@", k, v ?: @"(null)"]];
+                            [self appendLog:[NSString stringWithFormat:@"  %@ = %@", k,
+                                v ? (__bridge id)v : @"(null)"]];
                             if (v) CFRelease(v);
                         }
                         CFRelease(task);
