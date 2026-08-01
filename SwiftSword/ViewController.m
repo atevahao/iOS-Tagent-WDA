@@ -9248,9 +9248,14 @@ static uint64_t rie_find_exec_base(task_t task,
             if (rc == 0) break;
 
             [self appendLog:[NSString stringWithFormat:@"!! attempt %d failed: errno=%d", attempt, rc]];
-            if (rc == 78) [self appendLog:@"  → ENOEXEC: code-signing issue"];
-            else if (rc == 1) [self appendLog:[attempt == 0 ? @"  → EPERM: RESLIDE not allowed, retrying without RESLIDE..." : @"  → EPERM: even START_SUSPENDED denied"]];
-            else if (rc == 22) [self appendLog:@"  → EINVAL: flag not recognized"];
+            if (rc == 78) [self appendLog:@"  -> ENOEXEC: code-signing issue"];
+            else if (rc == 1) {
+                if (attempt == 0)
+                    [self appendLog:@"  -> EPERM: RESLIDE not allowed, retrying without RESLIDE..."];
+                else
+                    [self appendLog:@"  -> EPERM: even START_SUSPENDED denied"];
+            }
+            else if (rc == 22) [self appendLog:@"  -> EINVAL: flag not recognized"];
         }
 
         if (rc != 0) {
