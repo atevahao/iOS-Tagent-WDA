@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sys/syscall.h>
 
 #if __has_include("UAFPoc-Swift.h")
 #import "UAFPoc-Swift.h"
