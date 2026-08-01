@@ -32,8 +32,8 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <spawn.h>
-#include <fcntl.h>
-#include <sys/mman.h>
+// #include <fcntl.h> — needed for Phase E (disabled)
+// #include <sys/mman.h> — needed for Phase E (disabled)
 
 // ---- Rie probe helpers: all iOS-private APIs resolved via dlsym ----
 // Public POSIX/Mach headers may not declare all needed functions on iOS.
