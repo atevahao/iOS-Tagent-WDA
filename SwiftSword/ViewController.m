@@ -813,7 +813,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *ipcConf = [UIButtonConfiguration filledButtonConfiguration];
     ipcConf.baseBackgroundColor = [UIColor systemTealColor];
     self.ipcKmsgButton.configuration = ipcConf;
-    [self.ipcKmsgButton setTitle:@"IPC KMSG Leak Probe (v84)" forState:UIControlStateNormal];
+    [self.ipcKmsgButton setTitle:@"IPC KMSG Leak Probe (v85)" forState:UIControlStateNormal];
     [self.ipcKmsgButton addTarget:self action:@selector(ipcKmsgTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.ipcKmsgButton];
 
