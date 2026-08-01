@@ -9179,77 +9179,60 @@ static uint64_t rie_find_exec_base(task_t task,
                 [self appendLog:@"  SecTaskCopyValueForEntitlement not found"];
             }
 
-            // Phase D: syscall 536 probe in current process (no child needed)
-            [self appendLog:@"\n-- Phase D: syscall 536 probe (current process) --"];
+            // Phase D: syscall 536 probe — find shared cache via VM regions
+            [self appendLog:@"\n-- Phase D: syscall 536 probe --"];
 
-            // Scan for shared cache — try multiple candidate paths
-            const char *cachePaths[] = {
-                "/System/Library/dyld/dyld_shared_cache_arm64e",
-                "/System/Library/dyld/dyld_shared_cache_arm64",
-                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
-                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
-                "/private/var/db/dyld/dyld_shared_cache_arm64e",
-                "/private/var/db/dyld/dyld_shared_cache_arm64",
-                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache",
-            };
-            int cacheFd = -1;
-            const char *foundPath = NULL;
-            for (int pi = 0; pi < sizeof(cachePaths)/sizeof(cachePaths[0]); pi++) {
-                int fd = open(cachePaths[pi], O_RDONLY);
-                if (fd >= 0) {
-                    foundPath = cachePaths[pi];
-                    cacheFd = fd;
-                    [self appendLog:[NSString stringWithFormat:@"FOUND shared cache: %s (fd=%d)", foundPath, fd]];
-                    break;
+            // Resolve mach_vm_region_recurse now for VM region scan
+            void *vmr = dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+            Rie_VMRegionRecurseFn vmRecurse = (Rie_VMRegionRecurseFn)vmr;
+            if (vmRecurse) {
+                // Walk VM regions around shared region addr (0x1956b8000)
+                rie_mach_vm_address_t addr = 0;
+                rie_mach_vm_size_t size = 0;
+                natural_t depth = 0;
+                char pathBuf[1024];
+                BOOL foundSR = NO;
+
+                for (int i = 0; i < 200; i++) {
+                    rie_vm_region_info_t info;
+                    memset(info, 0, sizeof(info));
+                    mach_msg_type_number_t cnt = sizeof(info) / sizeof(natural_t);
+                    // Try to get extended info with path
+                    pathBuf[0] = 0;
+                    if (vmRecurse(mach_task_self(), &addr, &size, &depth,
+                            (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
+
+                    uint64_t base = (uint64_t)addr;
+                    // Check if this region overlaps with shared region
+                    if (base <= 0x1956b8000ULL && 0x1956b8000ULL < base + size) {
+                        foundSR = YES;
+                        [self appendLog:[NSString stringWithFormat:
+                            @"shared region VM: base=0x%llx size=0x%llx depth=%d",
+                            (unsigned long long)base, (unsigned long long)size, depth]];
+                        // Try to read any path/name info from the region
+                        // vm_region_recurse_info_t may contain path at specific offset
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  info[0]=%u info[1]=%u info[2]=%u info[3]=%u",
+                            info[0], info[1], info[2], info[3]]];
+                        // Dump more info words
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  info[4..23]: %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+                            info[4], info[5], info[6], info[7], info[8], info[9],
+                            info[10], info[11], info[12], info[13], info[14], info[15],
+                            info[16], info[17], info[18], info[19], info[20], info[21], info[22], info[23]]];
+                        break;
+                    }
+                    addr += size;
+                    if (addr > 0x200000000ULL) break;
                 }
-                [self appendLog:[NSString stringWithFormat:@"  not found: %s", cachePaths[pi]]];
-            }
-
-            if (cacheFd >= 0) {
-                struct stat st;
-                fstat(cacheFd, &st);
-                [self appendLog:[NSString stringWithFormat:@"cache size: %lld MB", (long long)(st.st_size / 1024 / 1024)]];
-
-                // Test 536 with fd only
-                long r1 = sc(536, cacheFd, 0, 0, 0);
-                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, 0,0,0): ret=%ld errno=%d", r1, errno]];
-
-                // Test 536 with fd + size
-                long r2 = sc(536, cacheFd, (void *)(uintptr_t)st.st_size, 0, 0);
-                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, size, 0,0): ret=%ld errno=%d", r2, errno]];
-
-                // Test 536 with fd + size + addr hint
-                long r3 = sc(536, cacheFd, (void *)(uintptr_t)st.st_size, (void *)0x1956b8000ULL, 0);
-                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, size, 0x1956b8000, 0): ret=%ld errno=%d", r3, errno]];
-
-                close(cacheFd);
+                if (!foundSR) {
+                    [self appendLog:@"!! shared region not found in VM walk"];
+                }
             } else {
-                [self appendLog:@"!! shared cache not found at any path"];
-                // List /System/Library/dyld/ contents via directory enumeration
-                DIR *d = opendir("/System/Library/dyld");
-                if (d) {
-                    [self appendLog:@"/System/Library/dyld contents:"];
-                    struct dirent *de;
-                    while ((de = readdir(d))) {
-                        [self appendLog:[NSString stringWithFormat:@"  %s", de->d_name]];
-                    }
-                    closedir(d);
-                } else {
-                    [self appendLog:[NSString stringWithFormat:@"opendir(/System/Library/dyld) failed: errno=%d", errno]];
-                }
-                // Also try /private/var/db/dyld/
-                d = opendir("/private/var/db/dyld");
-                if (d) {
-                    [self appendLog:@"/private/var/db/dyld contents:"];
-                    struct dirent *de;
-                    while ((de = readdir(d))) {
-                        [self appendLog:[NSString stringWithFormat:@"  %s", de->d_name]];
-                    }
-                    closedir(d);
-                }
+                [self appendLog:@"!! mach_vm_region_recurse not available for VM walk"];
             }
 
-            // Also try syscall 536 with NULL args to see if ret changes in this context
+            // Test syscall 536 with NULL args
             long rNull = sc(536, NULL, NULL, NULL, NULL);
             [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
         }
