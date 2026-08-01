@@ -859,7 +859,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v196)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v197)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9066,17 +9066,13 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
         sigaction(SIGSYS,&sa,&old);
         atomic_store(&g_sigsys_fired,false);
 
-        [self appendLog:@"Testing syscall #294 (check_np) via asm\n"];
+        // syscall() — declare manually (iOS hides it)
+        extern long syscall(int number, ...);
 
-        // Arm64 inline syscall: x16=number, x0-x5=args, ret in x0
-        long r294;
-        register long x0 asm("x0")=0;
-        asm volatile("mov x16,%1\nsvc #0x80\nmov %0,x0"
-            :"=r"(r294):"r"((long)294),"r"(x0):"x16","x0","memory");
-        if(atomic_load(&g_sigsys_fired)){[self appendLog:@"SIGSYS on 294"];sigaction(SIGSYS,&old,0);[self appendLog:@"=== shared_region not in iOS syscall table ==="];return;}
-        [self appendLog:[NSString stringWithFormat:@"syscall(294): ret=%ld",r294]];
-
-        if(r294==-1){[self appendLog:@"errno=%d (ENOSYS=78, EINVAL=22)",errno];}
+        [self appendLog:@"Testing syscall #294 (check_np)\n"];
+        long r294=syscall(294,0);
+        if(atomic_load(&g_sigsys_fired)){[self appendLog:@"SIGSYS — not in iOS"];sigaction(SIGSYS,&old,0);return;}
+        [self appendLog:[NSString stringWithFormat:@"syscall(294): ret=%ld errno=%d",r294,errno]];
         sigaction(SIGSYS,&old,0);
         [self appendLog:@"=== Rie probe done ==="];
     });
