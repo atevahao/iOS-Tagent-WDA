@@ -824,7 +824,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *semConf = [UIButtonConfiguration filledButtonConfiguration];
     semConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.sysvSemButton.configuration = semConf;
-    [self.sysvSemButton setTitle:@"SysV Sem Leak Probe (v87)" forState:UIControlStateNormal];
+    [self.sysvSemButton setTitle:@"SysV Sem Leak Probe (v88)" forState:UIControlStateNormal];
     [self.sysvSemButton addTarget:self action:@selector(sysvSemTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sysvSemButton];
 
@@ -8823,8 +8823,8 @@ static void *iohid_threadCopyEvent(void *arg) {
 
         // Use syscall() directly — iOS SDK lacks <sys/sem.h>
         // SysV sem syscall numbers on arm64 XNU:
-        #define SYSV_SYS_semget  226
-        #define SYSV_SYS_semctl  227
+        #define SYSV_SYS_semget  255
+        #define SYSV_SYS_semctl  254
         #define SYSV_IPC_PRIVATE 0
         #define SYSV_IPC_CREAT   01000
         #define SYSV_IPC_STAT    2
