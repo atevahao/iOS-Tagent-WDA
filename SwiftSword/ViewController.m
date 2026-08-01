@@ -30,17 +30,22 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 // ---- Rie probe helpers: all iOS-private APIs resolved via dlsym ----
 // Public POSIX/Mach headers may not declare all needed functions on iOS.
 // We use dlsym for everything potentially restricted, and define types manually.
 
-// arm_thread_state64_t — exact kernel ABI layout (xnu/osfmk/mach/arm/thread_state.h)
+// arm_thread_state64_t — use SDK definition if available, else exact kernel ABI layout
+#if __has_include(<mach/arm/thread_state.h>)
+#include <mach/arm/thread_state.h>
+#else
 #define ARM_THREAD_STATE64 6
 typedef struct {
     uint64_t x[29]; uint64_t fp; uint64_t lr;
     uint64_t sp; uint64_t pc; uint32_t cpsr; uint32_t flags;
 } arm_thread_state64_t;
+#endif
 #define ARM_THREAD_STATE64_COUNT \
     ((mach_msg_type_number_t)(sizeof(arm_thread_state64_t)/sizeof(unsigned int)))
 
