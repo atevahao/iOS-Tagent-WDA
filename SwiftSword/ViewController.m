@@ -9445,6 +9445,7 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
 
             // ── Phase E: Direct syscall 536 — parse cache from SR memory, build blob ──
+#if 0
             [self appendLog:@"\n── Phase E: direct syscall 536 (no child, fd=-1 inject) ──"];
 
             // Step 1: read dyld cache header from shared region memory @ 0x180000000
@@ -9654,6 +9655,7 @@ static uint64_t rie_find_exec_base(task_t task,
                 #undef MWS_SIZE
             }
         }
+#endif
 
         // ── Phase B: API availability scan ──
         [self appendLog:@"\n── Phase B: API availability scan ──"];
