@@ -56,7 +56,8 @@ jobs:
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
             SWIFT_VERSION=5.0 \
-            OTHER_LDFLAGS="-framework IOSurface" \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            OTHER_LDFLAGS="-framework IOSurface -weak_framework AppIntents" \
             -derivedDataPath DerivedData 2>&1 | tee build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           grep -iE "error|warning" build.log | head -40

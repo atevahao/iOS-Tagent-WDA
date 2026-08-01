@@ -9211,6 +9211,25 @@ static uint64_t rie_find_exec_base(task_t task,
             }
         }
 
+        // ── Phase S-2: invoke AppIntent perform() for posix_spawn context ──
+        [self appendLog:@"── Phase S-2: AppIntent posix_spawn test ──"];
+
+        // First test: bridge called directly from regular app context
+        SwordAppIntentBridge *bridge = [[SwordAppIntentBridge alloc] init];
+        NSString *bridgeResult = [bridge testPosixSpawnContext];
+        [self appendLog:[NSString stringWithFormat:@"Bridge (regular context):\n%@", bridgeResult]];
+
+        // Second test: invoke AppIntent perform() via runner (AppIntents context)
+        SwordAppIntentRunner *runner = [[SwordAppIntentRunner alloc] init];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSString *appIntentLog = nil;
+        [runner invokeIntent:^(NSString *msg) {
+            appIntentLog = msg;
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+        [self appendLog:[NSString stringWithFormat:@"AppIntent runner:\n%@", appIntentLog ?: @"(timeout)"]];
+
         // ── Phase A: direct syscall probe (v205) ──
         [self appendLog:@"── Phase A: direct syscall probe ──"];
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
