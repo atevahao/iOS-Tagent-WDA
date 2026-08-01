@@ -9134,7 +9134,78 @@ static uint64_t rie_find_exec_base(task_t task,
             long r536 = sc(536, 0, 0, 0, 0);
             [self appendLog:[NSString stringWithFormat:@"syscall(536,0,0,0,0): ret=%ld errno=%d", r536, errno]];
             if (r536 == -1 && errno == 22) {
-                [self appendLog:@"→ EINVAL — syscall 536 EXISTS on iOS!"];
+                [self appendLog:@"-> EINVAL — syscall 536 EXISTS on iOS!"];
+            } else if (r536 == 0) {
+                [self appendLog:@"-> ret=0 — syscall 536 ACCEPTED zero args!"];
+            }
+
+            // Entitlement dump — what permissions does this app have?
+            [self appendLog:@"\n-- entitlements --"];
+            void *SecTaskCopyValueForEntitlementFn = dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+            if (SecTaskCopyValueForEntitlementFn) {
+                CFTypeRef (*copyEnt)(void *, CFStringRef, void *) =
+                    (CFTypeRef (*)(void *, CFStringRef, void *))SecTaskCopyValueForEntitlementFn;
+                void *SecTaskCreateFromSelfFn = dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+                if (SecTaskCreateFromSelfFn) {
+                    void *(*createSelf)(void *) = (void *(*)(void *))SecTaskCreateFromSelfFn;
+                    void *task = createSelf(NULL);
+                    if (task) {
+                        NSArray *keys = @[
+                            @"com.apple.security.get-task-allow",
+                            @"com.apple.security.task_for_pid-allow",
+                            @"com.apple.private.security.no-sandbox",
+                            @"task_for_pid-allow",
+                            @"get-task-allow",
+                            @"com.apple.private.skip-library-validation",
+                            @"com.apple.private.cs.debugger",
+                            @"com.apple.security.application-groups",
+                            @"platform-application",
+                            @"application-identifier",
+                        ];
+                        for (NSString *k in keys) {
+                            CFTypeRef v = copyEnt(task, (__bridge CFStringRef)k, NULL);
+                            [self appendLog:[NSString stringWithFormat:@"  %@ = %@", k, v ?: @"(null)"]];
+                            if (v) CFRelease(v);
+                        }
+                        CFRelease(task);
+                    } else {
+                        [self appendLog:@"  SecTaskCreateFromSelf returned NULL"];
+                    }
+                } else {
+                    [self appendLog:@"  SecTaskCreateFromSelf not found"];
+                }
+            } else {
+                [self appendLog:@"  SecTaskCopyValueForEntitlement not found"];
+            }
+
+            // Phase D: syscall 536 probe in current process (no child needed)
+            [self appendLog:@"\n-- Phase D: syscall 536 probe (current process) --"];
+            // Try to open shared cache — is it readable from sandbox?
+            int cacheFd = open("/System/Library/dyld/dyld_shared_cache_arm64e", O_RDONLY);
+            [self appendLog:[NSString stringWithFormat:@"open(shared_cache): fd=%d errno=%d", cacheFd, errno]];
+            if (cacheFd >= 0) {
+                // syscall 536 with just cache fd, no custom slide info
+                long r536b = sc(536, cacheFd, 0, 0, 0);
+                [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, 0,0,0): ret=%ld errno=%d", r536b, errno]];
+                // syscall 536 with more args (cache fd + size hint + pointer)
+                struct stat st;
+                if (fstat(cacheFd, &st) == 0) {
+                    long r536c = sc(536, cacheFd, (void *)(uintptr_t)st.st_size, 0, 0);
+                    [self appendLog:[NSString stringWithFormat:@"syscall(536, fd, size, 0,0): ret=%ld errno=%d", r536c, errno]];
+                }
+                close(cacheFd);
+            }
+
+            // Try syscall 536 path variants
+            const char *paths[] = {
+                "/System/Library/dyld/dyld_shared_cache_arm64e",
+                "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+                "dyld_shared_cache_arm64e",
+            };
+            for (int pi = 0; pi < 3; pi++) {
+                long r536p = sc(536, (void *)(uintptr_t)paths[pi], 0, 0, 0);
+                [self appendLog:[NSString stringWithFormat:@"syscall(536, \"%s\", 0,0,0): ret=%ld errno=%d",
+                    paths[pi], r536p, errno]];
             }
         }
 
