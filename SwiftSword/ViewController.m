@@ -847,7 +847,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v204)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie Kernel Probe (v205)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9041,18 +9041,22 @@ static void sigsys_handler(int sig) { atomic_store(&g_sigsys_fired, true); }
 }
 
 - (void)rieProbeTapped {
-    [self appendLog:@"\n=== Rie shared_region syscall probe ===\n"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self appendLog:@"\n=== Rie shared_region syscall probe ===\n"];
 
-    // Only check dlsym — don't call the function yet
-    void *sc = dlsym(RTLD_DEFAULT, "syscall");
-    [self appendLog:[NSString stringWithFormat:@"dlsym(syscall)=%p", sc]];
-    [self appendLog:sc?@"syscall FOUND in libSystem":@"syscall NOT FOUND"];
+        long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
+        [self appendLog:[NSString stringWithFormat:@"dlsym(syscall)=%p", sc]];
 
-    // Also check if shared_region_check_np is directly available
-    void *srcnp = dlsym(RTLD_DEFAULT, "shared_region_check_np");
-    [self appendLog:[NSString stringWithFormat:@"dlsym(shared_region_check_np)=%p", srcnp]];
+        if (sc) {
+            // syscall 294 = shared_region_check_np(uint64_t *start)
+            // Pass a valid pointer — not NULL!
+            uint64_t addr = 0;
+            long r = sc(294, &addr);
+            [self appendLog:[NSString stringWithFormat:@"syscall(294,&addr): ret=%ld errno=%d addr=0x%llx", r, errno, addr]];
+        }
 
-    [self appendLog:@"=== Rie probe done ==="];
+        [self appendLog:@"=== Rie probe done ==="];
+    });
 }
 
 @end
