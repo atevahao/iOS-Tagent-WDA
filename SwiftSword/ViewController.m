@@ -898,7 +898,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie + Sandbox Escape (v213)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie Direct 536 (v216)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9121,7 +9121,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v213: syscall + API + sandbox escape + AppIntent ===\n"];
+        [self appendLog:@"\n=== Rie v216: syscall + Phase E (no child, fd=-1 inject) ===\n"];
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
         [self appendLog:@"── Phase S: sandbox escape probe ──"];
