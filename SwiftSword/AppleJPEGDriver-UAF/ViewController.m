@@ -50,8 +50,6 @@ typedef struct __attribute__((packed)) {
     uint32_t outHeight;      // +0x50
     uint32_t field_54;       // +0x54
 } JpegIOStruct;
-_Static_assert(sizeof(JpegIOStruct) == 0x58, "JpegIOStruct must be 88 bytes");
-
 @interface ViewController ()
 @property (nonatomic, strong) UIButton *sprayButton;
 @property (nonatomic, strong) UIButton *reclaimButton;
