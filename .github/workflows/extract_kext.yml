@@ -6,88 +6,55 @@ on:
 jobs:
   extract:
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Install ipsw
         run: HOMEBREW_NO_REQUIRE_TAP_TRUST=1 brew install blacktop/tap/ipsw
 
-      - name: Download kernelcache
+      - name: Get IPSW URL
+        id: url
         run: |
           set -e
-          python3 SwiftSword/scripts/download_ipsw.py \
-            --device iPhone14,5 --build 23C55 --kernelcache-only --output .
-          echo "=== Downloaded files ==="
-          ls -lh kernelcache.* 2>/dev/null || { echo "FATAL: No kernelcache file downloaded"; exit 1; }
+          URL=$(curl -s "https://api.ipsw.me/v4/device/iPhone14,5?type=ipsw" \
+            -H "User-Agent: Mozilla/5.0" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print([f['url'] for f in d['firmwares'] if f['buildid']=='23C55'][0])")
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "IPSW URL: $URL"
 
-      - name: Decrypt kernelcache
+      - name: Extract kernelcache (remote)
         run: |
           set -e
-          KC=$(find . -maxdepth 1 -name "kernelcache.*" -type f | head -1)
-          echo "=== Input: $KC ($(wc -c < "$KC") bytes) ==="
-          xxd -l 64 "$KC"
+          echo "=== Trying ipsw extract --kernel -r ==="
+          ipsw extract --kernel -r "${{ steps.url.outputs.url }}" 2>&1
           echo ""
+          echo "=== Output ==="
+          ls -lhR *kernel* *__* 2>&1 || true
+          find . -maxdepth 1 -type d 2>&1
 
-          # Step 1: Extract IM4P payload
-          # The downloaded file is an IM4P file (not IMG4 container).
-          # Try img4 extract first, fall back to im4p extract.
-          echo "=== Step 1: Extract IM4P payload ==="
-          if ipsw img4 extract "$KC" --im4p -o kc_im4p 2>&1; then
-            echo "img4 extract succeeded"
-          else
-            echo "img4 extract failed, trying im4p extract..."
-            ipsw img4 im4p extract "$KC" -o kc_im4p 2>&1
-          fi
-          echo ""
+          # Find the kernelcache Mach-O (ipsw creates a build__device directory)
+          KC_MACHO=""
+          for dir in *__*; do
+            if [ -d "$dir" ]; then
+              KC_MACHO=$(find "$dir" -name "kernelcache*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
+              if [ -n "$KC_MACHO" ]; then break; fi
+            fi
+          done
 
-          echo "=== IM4P output ==="
-          ls -lh kc_im4p* 2>&1
-          echo ""
-
-          # Find the IM4P payload file
-          if [ -f kc_im4p ]; then
-            KC_PAYLOAD=kc_im4p
-          else
-            KC_PAYLOAD=$(find . -maxdepth 1 -name "kc_im4p*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
-          fi
-
-          if [ -z "$KC_PAYLOAD" ]; then
-            echo "FATAL: IM4P extract produced no output"
-            exit 1
-          fi
-
-          echo "=== Payload: $KC_PAYLOAD ($(wc -c < "$KC_PAYLOAD") bytes) ==="
-          file "$KC_PAYLOAD" 2>&1 || true
-          xxd -l 32 "$KC_PAYLOAD"
-          echo ""
-
-          # Step 2: Decompress bvx2 → raw kernelcache Mach-O
-          echo "=== Step 2: ipsw kernel dec ==="
-          ipsw kernel dec "$KC_PAYLOAD" -o kc_decrypted 2>&1
-          echo ""
-
-          echo "=== Decrypted output ==="
-          ls -lhR kc_decrypted* 2>&1 || true
-          echo ""
-
-          # Find the actual Mach-O
-          if [ -f kc_decrypted ]; then
-            KC_MACHO=kc_decrypted
-          elif [ -d kc_decrypted ]; then
-            KC_MACHO=$(find kc_decrypted -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
-          else
-            KC_MACHO=$(find . -maxdepth 1 -name "kc_decrypted*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
+          if [ -z "$KC_MACHO" ]; then
+            # Try to find it elsewhere
+            KC_MACHO=$(find . -name "kernelcache.release*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
           fi
 
           if [ -z "$KC_MACHO" ]; then
-            echo "FATAL: No decrypted kernelcache found"
+            echo "FATAL: No kernelcache found after remote extract"
             echo "=== All files ==="
             find . -type f 2>&1 | head -50
             exit 1
           fi
 
-          echo "=== Mach-O: $KC_MACHO ==="
+          echo "=== Kernelcache: $KC_MACHO ==="
           file "$KC_MACHO"
           ls -lh "$KC_MACHO"
           echo "kc_macho=$KC_MACHO" >> $GITHUB_ENV
@@ -138,5 +105,6 @@ jobs:
           name: AppleJPEGDriver-kext
           path: |
             kexts/
-            kc_decrypted*
+            *kernelcache*
+            *__*/
           retention-days: 7
