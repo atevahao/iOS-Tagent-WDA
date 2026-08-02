@@ -7,7 +7,6 @@
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_error.h>
-#import <mach/vm_map.h>
 #import <IOKit/IOKitLib.h>
 #import <sys/sysctl.h>
 #import <unistd.h>

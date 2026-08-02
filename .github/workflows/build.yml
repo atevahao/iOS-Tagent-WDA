@@ -1,4 +1,4 @@
-name: Build SwiftSword
+name: Build SwiftSword + ThreeProbes
 
 on:
   workflow_dispatch:
@@ -6,40 +6,34 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  swiftsword:
     runs-on: macos-15
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone
+      - name: Clone base
         run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
 
       - name: Build Rie child
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "iOS SDK: $SDK"
           clang -arch arm64 -O0 -g -isysroot $SDK \
             -miphoneos-version-min=15.0 \
             -fno-stack-protector \
             -o SwiftSword/rie_child SwiftSword/rie_child.c
           codesign -s - --force --entitlements SwiftSword/rie_child.entitlements SwiftSword/rie_child
-          echo "=== rie_child build done ==="
-          file SwiftSword/rie_child
-          # Compute child_probe offset from __TEXT base
           PROBE_ADDR=$(nm SwiftSword/rie_child | awk '/_child_probe$/ {print $1}')
           TEXT_VMADDR=$(otool -l SwiftSword/rie_child | awk '/segname __TEXT/{f=1} f&&/vmaddr/{print $2; exit}')
           if [ -z "$PROBE_ADDR" ] || [ -z "$TEXT_VMADDR" ]; then
-            echo "!! Failed to resolve child_probe / __TEXT vmaddr — using 0 placeholder"
+            echo "!! Failed to resolve child_probe / __TEXT vmaddr"
             OFF="0x0"
           else
             OFF=$(printf '0x%x' $((0x$PROBE_ADDR - $TEXT_VMADDR)))
-            echo "child_probe@0x$PROBE_ADDR __TEXT@$TEXT_VMADDR => PROBE_OFFSET=$OFF"
           fi
-          # Inject PROBE_OFFSET into ViewController.m
           sed -i '' "s/RIE_PROBE_OFFSET_PLACEHOLDER/$OFF/" SwiftSword/ViewController.m
 
-      - name: Patch (SDK + fork)
+      - name: Patch + Copy
         run: |
           cp SwiftSword/ViewController.m base/UAFPoc/UAFPoc/ViewController.m
           cp SwiftSword/AppIntents/SwordIntents.swift base/UAFPoc/UAFPoc/SwordIntents.swift
@@ -61,17 +55,14 @@ jobs:
             -derivedDataPath DerivedData 2>&1 | tee build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           grep -iE "error|warning" build.log | head -40
-          if [ $BUILD_EXIT -ne 0 ]; then echo "BUILD FAILED (exit $BUILD_EXIT)"; exit $BUILD_EXIT; fi
+          if [ $BUILD_EXIT -ne 0 ]; then echo "BUILD FAILED"; exit $BUILD_EXIT; fi
 
       - name: Package
         run: |
           APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
-          ls -la "$APP"
-          # Copy rie_child into .app bundle
           cp SwiftSword/rie_child "$APP/"
-          ls -la "$APP"/rie_child
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
           codesign -s - -f Payload/UAFPoc.app 2>&1 || true
@@ -82,4 +73,59 @@ jobs:
         with:
           name: SwiftSword_iOS26
           path: SwiftSword_iOS26.ipa
+          retention-days: 7
+
+  threeprobes:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone base
+        run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
+
+      - name: Copy ThreeProbes files
+        run: |
+          cp SwiftSword/ThreeProbes/ViewController.m base/UAFPoc/UAFPoc/ViewController.m
+          cp SwiftSword/ThreeProbes/ViewController.h base/UAFPoc/UAFPoc/ViewController.h
+          cp SwiftSword/ThreeProbes/AppDelegate.m    base/UAFPoc/UAFPoc/AppDelegate.m
+          cp SwiftSword/ThreeProbes/AppDelegate.h    base/UAFPoc/UAFPoc/AppDelegate.h
+          cp SwiftSword/ThreeProbes/SceneDelegate.m  base/UAFPoc/UAFPoc/SceneDelegate.m
+          cp SwiftSword/ThreeProbes/SceneDelegate.h  base/UAFPoc/UAFPoc/SceneDelegate.h
+          cp SwiftSword/ThreeProbes/Info.plist       base/UAFPoc/UAFPoc/Info.plist
+          # Remove AppIntents swift file (ThreeProbes doesn't use it)
+          rm -f base/UAFPoc/UAFPoc/SwordIntents.swift
+          # Apply SDK compat patch
+          sed -i '' 's/#import <mach\/mach.h>/#import <mach\/mach.h>\ntypedef unsigned int ipc_info_object_type_t;/' base/UAFPoc/UAFPoc/ViewController.m
+
+      - name: Build
+        run: |
+          cd base/UAFPoc
+          xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
+            -sdk iphoneos -configuration Debug \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            SWIFT_VERSION=5.0 \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            OTHER_LDFLAGS="" \
+            -derivedDataPath DerivedData 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          grep -iE "error|warning" build.log | head -40
+          if [ $BUILD_EXIT -ne 0 ]; then echo "BUILD FAILED"; exit $BUILD_EXIT; fi
+
+      - name: Package
+        run: |
+          APP=$(find . -path "*/Debug-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && APP=$(find . -path "*/Release-iphoneos/*.app" -type d | head -1)
+          [ -z "$APP" ] && { echo "No .app"; exit 1; }
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          codesign -s - -f Payload/UAFPoc.app 2>&1 || true
+          zip -0 -r ThreeProbes_iOS26.ipa Payload/
+          ls -lh ThreeProbes_iOS26.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ThreeProbes_iOS26
+          path: ThreeProbes_iOS26.ipa
           retention-days: 7
