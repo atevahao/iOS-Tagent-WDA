@@ -6,40 +6,235 @@ on:
 jobs:
   extract:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Install ipsw
         run: HOMEBREW_NO_REQUIRE_TAP_TRUST=1 brew install blacktop/tap/ipsw
 
-      - name: Download kernelcache
+      - name: Download kernelcache (partial IPSW)
         run: |
-          ipsw download kernelcache --device iPhone14,5 --build 23C55 \
-            --output kernelcache.release 2>&1
+          python3 - "$@" <<'PYEOF'
+          import urllib.request, struct, io, zipfile, os, sys
 
-      - name: Extract AppleJPEGDriver
-        run: |
-          ipsw kernel dec -i kernelcache.release -o kc_decrypted 2>&1
-          ipsw macho dump-kext AppleJPEGDriver -i kc_decrypted \
-            -o AppleJPEGDriver.kext 2>&1 || true
-          # Alternative: extract all kexts and find AppleJPEGDriver
-          ipsw kernel extract --kexts -i kernelcache.release -o kexts/ 2>&1 || true
-          find . -name "*AppleJPEG*" -o -name "*jpeg*" 2>&1 || true
-          ls -la kexts/ 2>&1 | head -20 || true
+          DEVICE = "iPhone14,5"
+          BUILD = "23C55"
+          OUTFILE = "kernelcache.release"
 
-      - name: Dump disassembly
+          # Get IPSW URL
+          print(f"[*] Getting IPSW URL for {DEVICE} build {BUILD}...")
+          req = urllib.request.Request(
+              f"https://api.ipsw.me/v4/device/{DEVICE}?type=ipsw",
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+          import json
+          data = json.loads(urllib.request.urlopen(req).read())
+          ipsw_url = None
+          for fw in data["firmwares"]:
+              if fw["buildid"] == BUILD:
+                  ipsw_url = fw["url"]
+                  break
+          if not ipsw_url:
+              print(f"ERROR: Build {BUILD} not found")
+              sys.exit(1)
+          print(f"[*] IPSW: {ipsw_url}")
+
+          # Get IPSW file size
+          req = urllib.request.Request(ipsw_url, method="HEAD",
+              headers={"User-Agent": "Mozilla/5.0"})
+          resp = urllib.request.urlopen(req)
+          ipsw_size = int(resp.headers["Content-Length"])
+          print(f"[*] IPSW size: {ipsw_size / 1024 / 1024:.0f} MB")
+
+          # Download ZIP EOCD (last 64KB enough for central directory)
+          eocd_size = min(65536, ipsw_size)
+          print(f"[*] Downloading ZIP central directory (last {eocd_size}B)...")
+          req = urllib.request.Request(ipsw_url, method="GET",
+              headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Range": f"bytes={ipsw_size - eocd_size}-{ipsw_size - 1}"
+              })
+          tail = urllib.request.urlopen(req).read()
+
+          # Find the ZIP EOCD signature (0x06054b50), search backward
+          eocd_off = None
+          for i in range(len(tail) - 4, -1, -1):
+              if tail[i:i+4] == b'PK\x05\x06':
+                  eocd_off = i
+                  break
+          if eocd_off is None:
+              print("ERROR: Cannot find ZIP EOCD")
+              sys.exit(1)
+
+          eocd = tail[eocd_off:]
+          cd_size = struct.unpack("<I", eocd[12:16])[0]
+          cd_offset = struct.unpack("<I", eocd[16:20])[0]
+
+          print(f"[*] Central directory at offset {cd_offset}, size {cd_size}")
+
+          # Download the central directory
+          cd_end = cd_offset + cd_size
+          need_start = cd_offset
+          need_end = cd_end
+          tail_start_in_file = ipsw_size - eocd_size
+
+          chunks = []
+          if need_start < tail_start_in_file:
+              # Need to download more preceding data
+              print(f"[*] Downloading central directory from {need_start}...")
+              req = urllib.request.Request(ipsw_url, method="GET",
+                  headers={
+                      "User-Agent": "Mozilla/5.0",
+                      "Range": f"bytes={need_start}-{need_end - 1}"
+                  })
+              cd_data = urllib.request.urlopen(req).read()
+          else:
+              # CD is within the tail we already downloaded
+              off_in_tail = need_start - tail_start_in_file
+              cd_data = tail[off_in_tail:off_in_tail + cd_size]
+
+          print(f"[*] Central directory: {len(cd_data)} bytes")
+
+          # Parse central directory to find kernelcache
+          kc_entry = None
+          pos = 0
+          while pos < len(cd_data) - 4:
+              if cd_data[pos:pos+4] == b'PK\x01\x02':
+                  if pos + 46 > len(cd_data):
+                      break
+                  comp_size = struct.unpack("<I", cd_data[pos+20:pos+24])[0]
+                  uncomp_size = struct.unpack("<I", cd_data[pos+24:pos+28])[0]
+                  name_len = struct.unpack("<H", cd_data[pos+28:pos+30])[0]
+                  extra_len = struct.unpack("<H", cd_data[pos+30:pos+32])[0]
+                  comment_len = struct.unpack("<H", cd_data[pos+32:pos+34])[0]
+                  local_off = struct.unpack("<I", cd_data[pos+42:pos+46])[0]
+
+                  name = cd_data[pos+46:pos+46+name_len].decode('utf-8', errors='replace')
+                  if 'kernelcache' in name.lower() and 'release' in name.lower():
+                      kc_entry = {
+                          "name": name,
+                          "comp_size": comp_size,
+                          "uncomp_size": uncomp_size,
+                          "local_off": local_off,
+                      }
+                      print(f"[*] Found: {name}")
+                      print(f"     compressed={comp_size} uncompressed={uncomp_size}")
+                      # Don't break — keep looking for the best match (no .development, .kernel, etc.)
+                  pos += 46 + name_len + extra_len + comment_len
+              else:
+                  pos += 1
+
+          if not kc_entry:
+              print("ERROR: No kernelcache found in IPSW")
+              sys.exit(1)
+
+          # Download the kernelcache file (need local header + data)
+          # Local header is 30 bytes + name length + extra length. Just read generously.
+          header_est = 30 + len(kc_entry["name"]) + 256
+          start = kc_entry["local_off"]
+          end = kc_entry["local_off"] + header_est + kc_entry["comp_size"]
+
+          print(f"[*] Downloading kernelcache ({kc_entry['comp_size']/1024/1024:.1f} MB compressed)...")
+          req = urllib.request.Request(ipsw_url, method="GET",
+              headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Range": f"bytes={start}-{end}"
+              })
+          raw = urllib.request.urlopen(req).read()
+
+          # Parse local file header to skip to data
+          # Local header: 4B sig + 26B + name_len + extra_len
+          name_len = struct.unpack("<H", raw[26:28])[0]
+          extra_len = struct.unpack("<H", raw[28:30])[0]
+          data_start = 30 + name_len + extra_len
+          kc_data = raw[data_start:data_start + kc_entry["comp_size"]]
+
+          print(f"[*] Writing {len(kc_data)} bytes to {OUTFILE}")
+          with open(OUTFILE, "wb") as f:
+              f.write(kc_data)
+          print("[*] Done!")
+          PYEOF
+
+      - name: Decompress kernelcache
         run: |
-          find . -name "*AppleJPEG*" -type f 2>&1
-          for f in $(find . -name "*AppleJPEG*" -type f); do
-            otool -tV "$f" 2>&1 | head -500 || true
-            nm "$f" 2>&1 | grep -iE "finish|speed|queue|startDecoder|gated" || true
-          done
+          echo "=== Kernelcache info ==="
+          file kernelcache.release
+          ls -lh kernelcache.release
+          # Try to decompress (usually LZFSE or zlib compressed IMG4)
+          echo "=== Trying ipsw kernel dec ==="
+          ipsw kernel dec -i kernelcache.release -o kc_decrypted 2>&1 || true
+          # ipsw might handle decompression + decryption
+          echo "=== Files after decryption ==="
+          find . -name "kc_*" -type f -exec ls -lh {} \;
+          # If ipsw dec created a directory with the macho, find it
+          find . -name "kernelcache" -type f 2>&1 | head -5
+
+      - name: Extract AppleJPEGDriver kext
+        run: |
+          KC=$(find . -name "kc_decrypted" -type f 2>/dev/null | head -1)
+          if [ -z "$KC" ]; then
+            # Try finding the kernelcache MachO directly
+            KC=$(find . -path "*/kernelcache" -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$KC" ]; then
+            echo "ERROR: No decrypted kernelcache found"
+            find . -type f 2>&1 | head -30
+            exit 1
+          fi
+          echo "=== Using kernelcache: $KC ==="
+          ls -lh "$KC"
+          file "$KC"
+
+          echo "=== Extracting kexts ==="
+          mkdir -p kexts
+          ipsw kernel extract --kexts -i "$KC" -o kexts/ 2>&1 || true
+          echo "=== Looking for AppleJPEGDriver ==="
+          find kexts/ -iname "*jpeg*" -o -iname "*applejpeg*" 2>&1 || true
+          ls kexts/ 2>&1 | head -30 || true
+
+      - name: Disassemble AppleJPEGDriver
+        run: |
+          echo "=== Finding AppleJPEGDriver binary ==="
+          JPEG_KEXT=$(find kexts/ -iname "*AppleJPEG*" -type f 2>/dev/null | head -1)
+          if [ -z "$JPEG_KEXT" ]; then
+            JPEG_KEXT=$(find kexts/ -iname "*jpeg*" -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$JPEG_KEXT" ]; then
+            echo "No JPEG kext found in extracted kexts"
+            echo "Trying to dump directly from kernelcache..."
+            KC=$(find . -name "kc_decrypted" -type f 2>/dev/null | head -1)
+            ipsw macho dump-kext AppleJPEGDriver -i "$KC" -o AppleJPEGDriver.kext 2>&1 || true
+            ipsw macho dump-kext "com.apple.AppleJPEGDriver" -i "$KC" -o AppleJPEGDriver.kext 2>&1 || true
+            find . -name "AppleJPEGDriver*" 2>&1
+            JPEG_KEXT=$(find . -name "AppleJPEGDriver*" -type f 2>/dev/null | head -1)
+          fi
+
+          if [ -n "$JPEG_KEXT" ]; then
+            echo "=== AppleJPEGDriver: $JPEG_KEXT ==="
+            ls -lh "$JPEG_KEXT"
+            file "$JPEG_KEXT"
+
+            echo ""
+            echo "=== Key symbols ==="
+            nm "$JPEG_KEXT" 2>&1 | grep -iE "finish|speed|queue|startDecoder|gated|fullSpeed|interrupt" | head -40 || true
+
+            echo ""
+            echo "=== Disassembly: finish_io_gated ==="
+            otool -tV "$JPEG_KEXT" 2>&1 | grep -A 80 "finish_io_gated:" | head -100 || true
+
+            echo ""
+            echo "=== Disassembly: fullSpeedRequestExist ==="
+            otool -tV "$JPEG_KEXT" 2>&1 | grep -A 80 "fullSpeedRequestExist:" | head -100 || true
+          else
+            echo "Could not extract AppleJPEGDriver"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: AppleJPEGDriver-kext
           path: |
-            AppleJPEGDriver.kext
             kexts/
+            AppleJPEGDriver.kext
+            kc_decrypted
           retention-days: 7
