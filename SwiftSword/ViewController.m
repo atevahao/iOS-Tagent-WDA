@@ -9716,32 +9716,26 @@ static uint64_t rie_find_exec_base(task_t task,
         [self appendLog:@"\n── Phase D-5: unmap SR (294,0) + remap (536) raw SVC ──"];
         [self appendLog:@"  !! HIGH RISK: process may crash if remap fails !!"];
         {
-            // Fixed SVC macro: explicit mov into x0-x5,x16 guarantees correct
-            // registers regardless of compiler choices. v239 used "+r" with
-            // register asm hints which Clang doesn't always honor.
+            // SVC macro: uses register variables + matching constraint
+            // pattern (Linux kernel standard for arm64 syscalls).
+            // v239 used "+r" which was wrong for x1-x5 (they're input-only).
+            // This fixes: x0 is "=r" output + "0" matching input; x1-x5 are
+            // "r" inputs only; x16 is "r" input for syscall number.
             #define RIE_RAW_SVC(nr, a0,a1,a2,a3,a4,a5) ({ \
-                long _rie_ret; \
+                register long _x16 asm("x16") = (long)(nr); \
+                register long _x0 asm("x0") = (long)(a0); \
+                register long _x1 asm("x1") = (long)(a1); \
+                register long _x2 asm("x2") = (long)(a2); \
+                register long _x3 asm("x3") = (long)(a3); \
+                register long _x4 asm("x4") = (long)(a4); \
+                register long _x5 asm("x5") = (long)(a5); \
                 __asm__ volatile( \
-                    "mov x16, %[nr]\n\t" \
-                    "mov x0, %[a0]\n\t" \
-                    "mov x1, %[a1]\n\t" \
-                    "mov x2, %[a2]\n\t" \
-                    "mov x3, %[a3]\n\t" \
-                    "mov x4, %[a4]\n\t" \
-                    "mov x5, %[a5]\n\t" \
                     "svc #0x80\n\t" \
-                    "mov %[ret], x0\n\t" \
-                    : [ret] "=r"(_rie_ret) \
-                    : [nr] "r"((long)(nr)), \
-                      [a0] "r"((long)(a0)), \
-                      [a1] "r"((long)(a1)), \
-                      [a2] "r"((long)(a2)), \
-                      [a3] "r"((long)(a3)), \
-                      [a4] "r"((long)(a4)), \
-                      [a5] "r"((long)(a5)) \
-                    : "x0","x1","x2","x3","x4","x5","x16","cc","memory" \
+                    : "=r"(_x0) \
+                    : "0"(_x0), "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x4), "r"(_x5), "r"(_x16) \
+                    : "cc", "memory" \
                 ); \
-                _rie_ret; \
+                _x0; \
             })
 
             // -- Pre-verification: test raw SVC with safe syscall 294 --
