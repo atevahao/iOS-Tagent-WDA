@@ -25,6 +25,7 @@
 #import <sys/wait.h>
 #import <spawn.h>
 #import <mach-o/loader.h>
+#import <crt_externs.h>
 
 // ── Rie types (same as reference exploit sr_cfg.h) ──
 #ifndef _POSIX_SPAWN_RESLIDE
@@ -378,30 +379,39 @@ typedef struct {
     NSString *ownPath = [[NSBundle mainBundle] executablePath];
     const char *bin = [ownPath UTF8String];
 
-    // Build custom envp
-    extern char **environ;
+    // Build custom envp using _NSGetEnviron (iOS-safe)
+    char **env = *_NSGetEnviron();
     int envCount = 0;
-    while (environ[envCount]) envCount++;
+    if (env) {
+        while (env[envCount]) envCount++;
+    }
 
     char **newEnv = (char **)malloc((envCount + 2) * sizeof(char *));
     for (int i = 0; i < envCount; i++) {
-        newEnv[i] = environ[i];
+        newEnv[i] = env[i];
     }
     newEnv[envCount] = "DYLD_SHARED_REGION=private";
     newEnv[envCount + 1] = NULL;
 
     char *argv[] = { (char *)bin, "--rie-reexec", NULL };
 
-    // Flush flag so relaunch works
+    // Flush before potentially replacing process
     fflush(stdout); fflush(stderr);
     usleep(50000);
 
-    [self log:@"  Calling execve() — if this works, you won't see this log..."];
-    execve(bin, argv, newEnv);
+    // execve may not be in iOS SDK — use dlsym
+    int (*execve_fn)(const char *, char *const *, char *const *) = dlsym(RTLD_DEFAULT, "execve");
+    if (!execve_fn) {
+        [self log:@"  execve not available in SDK (dlsym returned NULL)"];
+        free(newEnv);
+        return;
+    }
+
+    [self log:@"  Calling execve() via dlsym — if this works, you won't see this log..."];
+    execve_fn(bin, argv, newEnv);
 
     int saved = errno;
     [self log:[NSString stringWithFormat:@"  execve failed: %s (errno=%d)", strerror(saved), saved]];
-    [self log:[NSString stringWithFormat:@"  Sandbox=%d, EPERM=%d", (saved == EPERM), EPERM]];
     free(newEnv);
 }
 
