@@ -66,6 +66,8 @@ typedef kern_return_t (*Rie_VMReadOverwriteFn)(vm_map_t, rie_mach_vm_address_t,
 typedef kern_return_t (*Rie_TaskForPidFn)(task_t, int, task_t *);
 typedef kern_return_t (*Rie_TaskThreadsFn)(task_t, thread_act_array_t *, mach_msg_type_number_t *);
 typedef kern_return_t (*Rie_TaskResumeFn)(task_t);
+typedef kern_return_t (*Rie_ThreadSuspendFn)(thread_act_t);
+typedef kern_return_t (*Rie_ThreadResumeFn)(thread_act_t);
 typedef kern_return_t (*Rie_ThreadGetStateFn)(thread_act_t, int, thread_state_t, mach_msg_type_number_t *);
 typedef kern_return_t (*Rie_ThreadSetStateFn)(thread_act_t, int, thread_state_t, mach_msg_type_number_t);
 
@@ -9784,18 +9786,26 @@ static uint64_t rie_find_exec_base(task_t task,
                 // -- Suspend all other threads --
                 // After SR unmap, any thread calling libsystem will crash
                 // and take down the whole process. Freeze them first.
+                // Use dlsym — thread_suspend/resume are deprecated in iOS SDK.
+                Rie_TaskThreadsFn    task_threads_fn  = dlsym(RTLD_DEFAULT, "task_threads");
+                Rie_ThreadSuspendFn  thread_suspend_fn = dlsym(RTLD_DEFAULT, "thread_suspend");
+                Rie_ThreadResumeFn   thread_resume_fn  = dlsym(RTLD_DEFAULT, "thread_resume");
+
                 thread_t me = mach_thread_self();
                 thread_act_array_t ths = NULL;
                 mach_msg_type_number_t nth = 0;
-                kern_return_t krt = task_threads(mach_task_self(), &ths, &nth);
+                kern_return_t krt = KERN_FAILURE;
+                if (task_threads_fn) {
+                    krt = task_threads_fn(mach_task_self(), &ths, &nth);
+                }
                 [self appendLog:[NSString stringWithFormat:
-                    @"  threads: %u total, kr=%d", nth, krt]];
+                    @"  threads: %u total, kr=%d (fn=%p)", nth, krt, task_threads_fn]];
 
                 int suspended = 0;
-                if (krt == KERN_SUCCESS && ths && nth > 0) {
+                if (krt == KERN_SUCCESS && ths && nth > 0 && thread_suspend_fn) {
                     for (mach_msg_type_number_t i = 0; i < nth; i++) {
                         if (ths[i] != me) {
-                            kern_return_t kr_s = thread_suspend(ths[i]);
+                            kern_return_t kr_s = thread_suspend_fn(ths[i]);
                             if (kr_s == KERN_SUCCESS) suspended++;
                         }
                     }
@@ -9809,10 +9819,10 @@ static uint64_t rie_find_exec_base(task_t task,
                 long r2 = RIE_RAW_SVC(536, 1, (long)&tf5, 1, (long)&tm5, 0, 0);
 
                 // -- Resume all suspended threads --
-                if (krt == KERN_SUCCESS && ths && nth > 0) {
+                if (krt == KERN_SUCCESS && ths && nth > 0 && thread_resume_fn) {
                     for (mach_msg_type_number_t i = 0; i < nth; i++) {
                         if (ths[i] != me) {
-                            thread_resume(ths[i]);
+                            thread_resume_fn(ths[i]);
                         }
                     }
                     vm_deallocate(mach_task_self(), (vm_address_t)ths,
