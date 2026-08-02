@@ -9768,7 +9768,7 @@ static uint64_t rie_find_exec_base(task_t task,
                     }
                 }
             } else {
-                [self appendLog:[NSString stringWithFormat:@"  dealloc=%p vrr=%p", vm_dealloc, vrr5]];
+                [self appendLog:[NSString stringWithFormat:@"  dealloc=%p (not found)", vm_dealloc]];
             }
         }
 
