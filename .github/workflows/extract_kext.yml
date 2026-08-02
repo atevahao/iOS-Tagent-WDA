@@ -15,13 +15,16 @@ jobs:
 
       - name: Download IPSW
         run: |
-          ipsw download ipsw --device iPhone14,5 --build 23C55 --output ipsw.ipsw
+          python3 SwiftSword/scripts/download_ipsw.py \
+            --device iPhone14,5 --build 23C55 --output .
 
       - name: Extract kernelcache
         run: |
-          mkdir -p extracted
+          IPSW=$(find . -maxdepth 1 -name "iPhone14*Restore.ipsw" | head -1)
+          echo "IPSW: $IPSW"
+          rm -rf extracted && mkdir -p extracted
           cd extracted
-          unzip -o ../ipsw.ipsw "kernelcache.release*" 2>&1
+          unzip -o "../$IPSW" "kernelcache.release*" 2>&1
           ls -lh kernelcache*
           cd ..
           KC=$(find extracted -name "kernelcache.release*" -not -name "*.development*" | head -1)
@@ -41,7 +44,6 @@ jobs:
           ipsw kernel extract --kexts -i "$KC" -o kexts/ 2>&1
           echo "=== JPEG kexts ==="
           find kexts/ -iname "*jpeg*" -o -iname "*AppleJPEG*" 2>&1
-          ls kexts/ 2>&1
 
       - name: Disassemble
         run: |
