@@ -27,6 +27,10 @@ void        *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
 size_t       IOSurfaceGetAllocSize(IOSurfaceRef surface);
 
 // ── IOKit declarations (not in public iOS headers) ──
+typedef mach_port_t io_object_t;
+typedef io_object_t io_service_t;
+typedef io_object_t io_connect_t;
+typedef io_object_t io_iterator_t;
 extern const mach_port_t kIOMainPortDefault;
 CFMutableDictionaryRef IOServiceMatching(const char *name);
 kern_return_t IOServiceGetMatchingServices(mach_port_t, CFDictionaryRef, io_iterator_t *);
