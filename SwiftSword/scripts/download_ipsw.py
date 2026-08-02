@@ -109,16 +109,53 @@ def download_kernelcache(url, out_dir):
     print(f"Parsing {len(cd_data)} bytes of file listings...")
 
     # Parse central directory
+    def parse_zip64_extra(extra_data, comp_is_64, uncomp_is_64, off_is_64):
+        """Extract ZIP64 8-byte values from the extra field."""
+        result = {}
+        p = 0
+        while p < len(extra_data) - 4:
+            tag = struct.unpack("<H", extra_data[p:p+2])[0]
+            size = struct.unpack("<H", extra_data[p+2:p+4])[0]
+            if tag == 0x0001:
+                data = extra_data[p+4:p+4+size]
+                dp = 0
+                if uncomp_is_64 and dp + 8 <= len(data):
+                    result["uncomp_size"] = struct.unpack("<Q", data[dp:dp+8])[0]
+                    dp += 8
+                if comp_is_64 and dp + 8 <= len(data):
+                    result["comp_size"] = struct.unpack("<Q", data[dp:dp+8])[0]
+                    dp += 8
+                if off_is_64 and dp + 8 <= len(data):
+                    result["local_off"] = struct.unpack("<Q", data[dp:dp+8])[0]
+                    dp += 8
+                break
+            p += 4 + size
+        return result
+
     best_kc = None
     pos = 0
     while pos < len(cd_data) - 46:
         if cd_data[pos:pos+4] == b'PK\x01\x02':
             comp_size = struct.unpack("<I", cd_data[pos+20:pos+24])[0]
+            uncomp_size = struct.unpack("<I", cd_data[pos+24:pos+28])[0]
             name_len = struct.unpack("<H", cd_data[pos+28:pos+30])[0]
             extra_len = struct.unpack("<H", cd_data[pos+30:pos+32])[0]
             comment_len = struct.unpack("<H", cd_data[pos+32:pos+34])[0]
             local_off = struct.unpack("<I", cd_data[pos+42:pos+46])[0]
             name = cd_data[pos+46:pos+46+name_len].decode('utf-8', errors='replace')
+
+            # ZIP64: resolve 64-bit values from extra field when 32-bit overflowed
+            comp_is_64 = (comp_size == 0xFFFFFFFF)
+            uncomp_is_64 = (uncomp_size == 0xFFFFFFFF)
+            off_is_64 = (local_off == 0xFFFFFFFF)
+            if comp_is_64 or off_is_64:
+                extra_start = pos + 46 + name_len
+                extra_data = cd_data[extra_start:extra_start + extra_len]
+                zip64 = parse_zip64_extra(extra_data, comp_is_64, uncomp_is_64, off_is_64)
+                if "comp_size" in zip64:
+                    comp_size = zip64["comp_size"]
+                if "local_off" in zip64:
+                    local_off = zip64["local_off"]
 
             if 'kernelcache' in name.lower():
                 print(f"  Found: {name} ({comp_size/1024/1024:.1f} MB)")
