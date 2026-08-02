@@ -25,7 +25,6 @@
 #import <sys/wait.h>
 #import <spawn.h>
 #import <mach-o/loader.h>
-#import <crt_externs.h>
 
 // ── Rie types (same as reference exploit sr_cfg.h) ──
 #ifndef _POSIX_SPAWN_RESLIDE
@@ -147,18 +146,6 @@ typedef struct {
 
     [self log:@"=== Rie DirtySlide v9 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
-
-    // Check if we were re-exec'd with custom env
-    BOOL isReexec = NO;
-    NSArray *progArgs = [[NSProcessInfo processInfo] arguments];
-    for (NSString *a in progArgs) {
-        if ([a containsString:@"--rie-reexec"]) { isReexec = YES; break; }
-    }
-    if (isReexec) {
-        [self log:@"!! RE-EXEC DETECTED — execve works on iOS!"];
-        const char *dsr = getenv("DYLD_SHARED_REGION");
-        [self log:[NSString stringWithFormat:@"DYLD_SHARED_REGION=%s", dsr ?: "(null)"]];
-    }
     [self log:@""];
 
     // Auto-detect: if relaunched, show info immediately
@@ -329,11 +316,11 @@ typedef struct {
     [self probeDyldPrivate];
 }
 
-// ── Probe: DYLD_SHARED_REGION=private + re-exec ──
+// ── Probe: DYLD_SHARED_REGION=private ──
 - (void)probeDyldPrivate {
     [self log:@"\n── probeDyldPrivate: DYLD_SHARED_REGION? ──"];
 
-    // 1. Check known DYLD_* env vars
+    // 1. Check known DYLD_* env vars via getenv
     const char *dyldVars[] = {
         "DYLD_SHARED_REGION", "DYLD_SHARED_CACHE_DIR",
         "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
@@ -352,67 +339,68 @@ typedef struct {
         }
     }
     if (!foundAny) {
-        [self log:@"  No DYLD_* env vars set."];
+        [self log:@"  No DYLD_* env vars set via getenv."];
     }
 
-    // Also try NSProcessInfo for full env
+    // 2. Also check via NSProcessInfo (may show different set)
     NSDictionary *env = [[NSProcessInfo processInfo] processEnvironment];
     [self log:[NSString stringWithFormat:@"  NSProcessInfo env count: %lu", (unsigned long)env.count]];
-    NSArray *dyldKeys = [[env allKeys] filteredArrayUsingPredicate:
-        [NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'DYLD'"]];
-    for (NSString *k in [dyldKeys sortedArrayUsingSelector:@selector(compare:)]) {
-        [self log:[NSString stringWithFormat:@"  ENV[%@]=%@", k, env[k]]];
+    for (NSString *k in [[env allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+        if ([k hasPrefix:@"DYLD"] || [k hasPrefix:@"dyld"]) {
+            [self log:[NSString stringWithFormat:@"  ENV[%@]=%@", k, env[k]]];
+        }
+    }
+    // Also check NSProcessInfo for DYLD_SHARED_REGION specifically
+    NSString *dsr = env[@"DYLD_SHARED_REGION"];
+    if (dsr) {
+        [self log:[NSString stringWithFormat:@"  NSProcessInfo DYLD_SHARED_REGION=%@", dsr]];
     }
 
-    // 2. Try setenv + getenv (process-local test)
+    // 3. Try setenv + getenv (process-local, does not survive relaunch)
     int sr = setenv("DYLD_SHARED_REGION", "private", 1);
     const char *check = getenv("DYLD_SHARED_REGION");
-    [self log:[NSString stringWithFormat:@"setenv(DYLD_SHARED_REGION=private): rc=%d getenv=%s", sr, check ?: "(null)"]];
+    [self log:[NSString stringWithFormat:@"setenv(DYLD_SHARED_REGION=private): rc=%d getenv=%s",
+        sr, check ?: "(null)"]];
 
-    // 3. Try execve to re-launch ourselves with this env var
-    [self probeReexec];
+    // 4. Check if execve exists (dlsym lookup only, don't call)
+    void *execvePtr = dlsym(RTLD_DEFAULT, "execve");
+    [self log:[NSString stringWithFormat:@"dlsym(execve): %@", execvePtr ? @"FOUND" : @"NULL (not available)"]];
+
+    // 5. Check if posix_spawn without RESLIDE works (just START_SUSPENDED)
+    [self probeSpawnSuspendOnly];
 }
 
-- (void)probeReexec {
-    [self log:@"\n── probeReexec: execve self with DYLD_SHARED_REGION=private? ──"];
+// ── Probe: try posix_spawn with ONLY START_SUSPENDED (no RESLIDE) ──
+- (void)probeSpawnSuspendOnly {
+    [self log:@"\n── probeSpawnSuspendOnly: posix_spawn(START_SUSPENDED only)? ──"];
 
     NSString *ownPath = [[NSBundle mainBundle] executablePath];
-    const char *bin = [ownPath UTF8String];
-
-    // Build custom envp using _NSGetEnviron (iOS-safe)
-    char **env = *_NSGetEnviron();
-    int envCount = 0;
-    if (env) {
-        while (env[envCount]) envCount++;
-    }
-
-    char **newEnv = (char **)malloc((envCount + 2) * sizeof(char *));
-    for (int i = 0; i < envCount; i++) {
-        newEnv[i] = env[i];
-    }
-    newEnv[envCount] = "DYLD_SHARED_REGION=private";
-    newEnv[envCount + 1] = NULL;
-
-    char *argv[] = { (char *)bin, "--rie-reexec", NULL };
-
-    // Flush before potentially replacing process
-    fflush(stdout); fflush(stderr);
-    usleep(50000);
-
-    // execve may not be in iOS SDK — use dlsym
-    int (*execve_fn)(const char *, char *const *, char *const *) = dlsym(RTLD_DEFAULT, "execve");
-    if (!execve_fn) {
-        [self log:@"  execve not available in SDK (dlsym returned NULL)"];
-        free(newEnv);
+    pid_t pid = -1;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    short flags = POSIX_SPAWN_START_SUSPENDED;
+    int rc = posix_spawnattr_setflags(&attr, flags);
+    [self log:[NSString stringWithFormat:@"posix_spawnattr_setflags(0x%x): rc=%d", flags, rc]];
+    if (rc != 0) {
+        [self log:@"!! START_SUSPENDED not supported"];
+        posix_spawnattr_destroy(&attr);
         return;
     }
 
-    [self log:@"  Calling execve() via dlsym — if this works, you won't see this log..."];
-    execve_fn(bin, argv, newEnv);
+    char *args[] = { (char *)[ownPath UTF8String], "--rie-child-suspend", NULL };
+    rc = posix_spawn(&pid, [ownPath UTF8String], NULL, &attr, args, NULL);
+    posix_spawnattr_destroy(&attr);
 
-    int saved = errno;
-    [self log:[NSString stringWithFormat:@"  execve failed: %s (errno=%d)", strerror(saved), saved]];
-    free(newEnv);
+    if (rc != 0) {
+        [self log:[NSString stringWithFormat:@"!! posix_spawn(START_SUSPENDED only) failed: %s (errno=%d)", strerror(rc), rc]];
+        return;
+    }
+
+    [self log:[NSString stringWithFormat:@"SUCCESS: pid=%d spawned SUSPENDED (no RESLIDE)", pid]];
+    // Clean up
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    [self log:@"child cleaned up."];
 }
 
 // ── Probe: test posix_spawn(RESLIDE+SUSPENDED) + task_for_pid viability ──
