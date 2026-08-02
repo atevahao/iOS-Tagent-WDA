@@ -23,8 +23,16 @@ jobs:
           KC=$(find . -maxdepth 1 -name "kernelcache.*" -type f | head -1)
           echo "Kernelcache: $KC"
           ls -lh "$KC"
-          ipsw kernel dec "$KC" -o kc_decrypted 2>&1
-          ls -lh kc_decrypted*
+          echo "=== First 256 bytes (hex) ==="
+          xxd -l 256 "$KC"
+          echo "=== IMG4 info ==="
+          ipsw img4 info "$KC" 2>&1 || true
+          echo "=== Trying img4 extract ==="
+          ipsw img4 extract "$KC" -o kc_raw 2>&1 || true
+          ls -lh kc_raw* 2>&1 || true
+          echo "=== Trying kernel dec directly ==="
+          ipsw kernel dec "$KC" -o kc_decrypted 2>&1 || true
+          ls -lh kc_decrypted* 2>&1 || true
 
       - name: Extract AppleJPEGDriver
         run: |
