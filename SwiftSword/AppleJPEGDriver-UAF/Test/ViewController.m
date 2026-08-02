@@ -438,100 +438,71 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             [self log:@"  [64] %016llx %016llx", qws[8], qws[9]];
             [self log:@"  [80] %016llx", qws[10]];
 
-            // Probe sel 0 (getTarget) with SCALAR output — may return kernel ptr
+            // Try IOConnectCallMethod (full) on sel 1 — request
+            // scalar output IN ADDITION to struct output
             {
-                uint64_t scalOut[8] = {0};
-                uint32_t scCnt = 8;
-                kr = IOConnectCallScalarMethod(wconn, 0,
-                    NULL, 0, scalOut, &scCnt);
-                [self log:@"Sel 0 scalar: kr=0x%x cnt=%u", kr, scCnt];
-                for (uint32_t si = 0; si < scCnt && si < 8; si++) {
-                    uint64_t v = scalOut[si];
-                    if (v) {
-                        uint64_t hi = v >> 40;
-                        [self log:@"  sc[%u] 0x%016llx %s", si, v,
-                            (hi == 0xfffffe || hi == 0xffffff) ? "*** KP" : ""];
-                    }
+                uint64_t sOut[8] = {0};
+                uint32_t sCnt = 8;
+                size_t structSz = sizeof(output);
+                kr = IOConnectCallMethod(wconn, 1,
+                    NULL, 0, &input, sizeof(input),
+                    sOut, &sCnt, &output, &structSz);
+                [self log:@"Sel 1 full: kr=0x%x scCnt=%u stSz=%zu", kr, sCnt, structSz];
+                for (uint32_t si = 0; si < sCnt && si < 8; si++) {
+                    if (sOut[si])
+                        [self log:@"  sc[%u] 0x%016llx", si, sOut[si]];
                 }
             }
 
-            // Probe sel 2 (query) with SCALAR output too
+            // Sel 3 (encode) — never tested before
             {
-                uint64_t scalOut[8] = {0};
-                uint32_t scCnt = 8;
-                kr = IOConnectCallScalarMethod(wconn, 2,
-                    NULL, 0, scalOut, &scCnt);
-                [self log:@"Sel 2 scalar: kr=0x%x cnt=%u", kr, scCnt];
-                for (uint32_t si = 0; si < scCnt && si < 8; si++) {
-                    uint64_t v = scalOut[si];
-                    if (v) {
-                        uint64_t hi = v >> 40;
-                        [self log:@"  sc[%u] 0x%016llx %s", si, v,
-                            (hi == 0xfffffe || hi == 0xffffff) ? "*** KP" : ""];
-                    }
+                AppleJPEGDriverIOStruct encOut = {0};
+                size_t os = sizeof(encOut);
+                kr = IOConnectCallStructMethod(wconn, 3,
+                    &input, sizeof(input), &encOut, &os);
+                [self log:@"Sel 3 encode: kr=0x%x outSize=%zu", kr, os];
+                if (kr == KERN_SUCCESS) {
+                    uint64_t *qws = (uint64_t *)&encOut;
+                    [self log:@"  [00] %016llx %016llx", qws[0], qws[1]];
+                    [self log:@"  [16] %016llx %016llx", qws[2], qws[3]];
                 }
             }
 
-            // Now probe sel 4/5 while driver has recent activity
-            uint8_t *in4k = calloc(0x1000, 1);
-            if (in4k) {
-                // Mark the input with distinct pattern in case kernel echoes
-                memset(in4k, 0xCC, 0x1000);
+            // Sel 6 (async decode) output struct
+            {
+                AppleJPEGDriverIOStruct asyncIn = input;
+                asyncIn.asyncToken = 0xDEADBEEF;
+                AppleJPEGDriverIOStruct asyncOut = {0};
+                size_t os = sizeof(asyncOut);
+                kr = IOConnectCallStructMethod(wconn, 6,
+                    &asyncIn, sizeof(asyncIn), &asyncOut, &os);
+                [self log:@"Sel 6 async: kr=0x%x outSize=%zu", kr, os];
+                if (kr == KERN_SUCCESS || os > 0) {
+                    uint64_t *qws = (uint64_t *)&asyncOut;
+                    [self log:@"  [00] %016llx %016llx", qws[0], qws[1]];
+                    [self log:@"  [16] %016llx %016llx", qws[2], qws[3]];
+                }
+            }
+
+            // Sel 4/5 with all-zero input (different from 0xCC pattern)
+            {
+                uint8_t *inZ = calloc(0x1000, 1);
                 for (int sel = 4; sel <= 5; sel++) {
                     uint8_t *outBuf = calloc(0x1000, 1);
-                    if (!outBuf) continue;
                     size_t os = 0x1000;
                     kr = IOConnectCallStructMethod(wconn, (uint32_t)sel,
-                        in4k, 0x1000, outBuf, &os);
-                    [self log:@"Sel %d (warm): kr=0x%x outSize=%zu", sel, kr, os];
-
+                        inZ, 0x1000, outBuf, &os);
+                    [self log:@"Sel %d (zero in): kr=0x%x outSize=%zu", sel, kr, os];
                     if (kr == KERN_SUCCESS && os > 0) {
-                        int kp = 0;
-                        for (size_t off = 0; off + 8 <= os && off < 512; off += 8) {
+                        for (size_t off = 0; off + 8 <= os && off < 128; off += 8) {
                             uint64_t v = *(uint64_t *)(outBuf + off);
-                            if (v == 0 || v == 0xCCCCCCCCCCCCCCCCULL) continue;
-                            uint64_t hi = v >> 40;
-                            if (hi == 0xfffffe || hi == 0xffffff) {
-                                if (kp < 12)
-                                    [self log:@"  [+0x%03zx] 0x%016llx *** KERNEL PTR", off, v];
-                                kp++;
-                            }
-                        }
-                        if (kp) [self log:@"  TOTAL: %d kernel pointers", kp];
-                        else {
-                            // Dump non-zero non-CC values
-                            for (size_t off = 0; off + 8 <= os && off < 256; off += 8) {
-                                uint64_t v = *(uint64_t *)(outBuf + off);
-                                if (v != 0 && v != 0xCCCCCCCCCCCCCCCCULL)
-                                    [self log:@"  [+0x%03zx] 0x%016llx", off, v];
-                            }
+                            if (v)
+                                [self log:@"  [+0x%03zx] 0x%016llx", off, v];
                         }
                     }
                     free(outBuf);
                 }
-                free(in4k);
-            }
-
-            // Also probe sel 4/5 with SMALL input sizes to find minimum
-            for (int sel = 4; sel <= 5; sel++) {
-                for (size_t inSz = 0; inSz <= 0x40; inSz += 0x10) {
-                    uint8_t *inBuf = calloc(inSz > 0 ? inSz : 1, 1);
-                    uint8_t *outBuf = calloc(0x1000, 1);
-                    size_t os = 0x1000;
-                    kr = IOConnectCallStructMethod(wconn, (uint32_t)sel,
-                        inBuf, inSz, outBuf, &os);
-                    if (kr == KERN_SUCCESS) {
-                        [self log:@"Sel %d: in=%zu SUCCESS! outSize=%zu", sel, inSz, os];
-                        // Dump first few qwords
-                        for (size_t off = 0; off + 8 <= os && off < 64; off += 8) {
-                            uint64_t v = *(uint64_t *)(outBuf + off);
-                            if (v) [self log:@"  [+0x%03zx] 0x%016llx", off, v];
-                        }
-                    }
-                    free(inBuf);
-                    free(outBuf);
-                    if (kr != KERN_SUCCESS) break;
-                }
+                free(inZ);
             }
 
             IOServiceClose(wconn);
