@@ -6,34 +6,23 @@ on:
 jobs:
   extract:
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install ipsw
         run: HOMEBREW_NO_REQUIRE_TAP_TRUST=1 brew install blacktop/tap/ipsw
 
-      - name: Download IPSW
+      - name: Download kernelcache
         run: |
           python3 SwiftSword/scripts/download_ipsw.py \
-            --device iPhone14,5 --build 23C55 --output .
-
-      - name: Extract kernelcache
-        run: |
-          IPSW=$(find . -maxdepth 1 -name "iPhone14*Restore.ipsw" | head -1)
-          echo "IPSW: $IPSW"
-          rm -rf extracted && mkdir -p extracted
-          cd extracted
-          unzip -o "../$IPSW" "kernelcache.release*" 2>&1
-          ls -lh kernelcache*
-          cd ..
-          KC=$(find extracted -name "kernelcache.release*" -not -name "*.development*" | head -1)
-          echo "Kernelcache: $KC"
-          ls -lh "$KC"
+            --device iPhone14,5 --build 23C55 --kernelcache-only --output .
 
       - name: Decrypt kernelcache
         run: |
-          KC=$(find extracted -name "kernelcache.release*" -not -name "*.development*" | head -1)
+          KC=$(find . -maxdepth 1 -name "kernelcache.*" -type f | head -1)
+          echo "Kernelcache: $KC"
+          ls -lh "$KC"
           ipsw kernel dec -i "$KC" -o kc_decrypted 2>&1
           ls -lh kc_decrypted*
 
