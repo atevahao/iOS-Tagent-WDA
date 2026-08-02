@@ -312,95 +312,12 @@ typedef struct {
     // Test child spawn viability
     [self probeChildSpawn];
 
-    // Test DYLD_SHARED_REGION=private
-    [self probeDyldPrivate];
-}
-
-// ── Probe: DYLD_SHARED_REGION=private ──
-- (void)probeDyldPrivate {
-    [self log:@"\n── probeDyldPrivate: DYLD_SHARED_REGION? ──"];
-
-    // 1. Check known DYLD_* env vars via getenv
-    const char *dyldVars[] = {
-        "DYLD_SHARED_REGION", "DYLD_SHARED_CACHE_DIR",
-        "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
-        "DYLD_INSERT_LIBRARIES", "DYLD_PRINT_ENV",
-        "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX",
-        "DYLD_FORCE_FLAT_NAMESPACE", "DYLD_PRINT_LIBRARIES",
-        "DYLD_SHARED_CACHE_DONT_VALIDATE",
-    };
-    int nVars = sizeof(dyldVars)/sizeof(dyldVars[0]);
-    int foundAny = 0;
-    for (int i = 0; i < nVars; i++) {
-        const char *val = getenv(dyldVars[i]);
-        if (val) {
-            [self log:[NSString stringWithFormat:@"  getenv(%s)=%s", dyldVars[i], val]];
-            foundAny++;
-        }
-    }
-    if (!foundAny) {
-        [self log:@"  No DYLD_* env vars set via getenv."];
-    }
-
-    // 2. Also check via NSProcessInfo (may show different set)
-    NSDictionary *env = [[NSProcessInfo processInfo] processEnvironment];
-    [self log:[NSString stringWithFormat:@"  NSProcessInfo env count: %lu", (unsigned long)env.count]];
-    for (NSString *k in [[env allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-        if ([k hasPrefix:@"DYLD"] || [k hasPrefix:@"dyld"]) {
-            [self log:[NSString stringWithFormat:@"  ENV[%@]=%@", k, env[k]]];
-        }
-    }
-    // Also check NSProcessInfo for DYLD_SHARED_REGION specifically
-    NSString *dsr = env[@"DYLD_SHARED_REGION"];
-    if (dsr) {
-        [self log:[NSString stringWithFormat:@"  NSProcessInfo DYLD_SHARED_REGION=%@", dsr]];
-    }
-
-    // 3. Try setenv + getenv (process-local, does not survive relaunch)
-    int sr = setenv("DYLD_SHARED_REGION", "private", 1);
-    const char *check = getenv("DYLD_SHARED_REGION");
-    [self log:[NSString stringWithFormat:@"setenv(DYLD_SHARED_REGION=private): rc=%d getenv=%s",
-        sr, check ?: "(null)"]];
-
-    // 4. Check if execve exists (dlsym lookup only, don't call)
-    void *execvePtr = dlsym(RTLD_DEFAULT, "execve");
-    [self log:[NSString stringWithFormat:@"dlsym(execve): %@", execvePtr ? @"FOUND" : @"NULL (not available)"]];
-
-    // 5. Check if posix_spawn without RESLIDE works (just START_SUSPENDED)
-    [self probeSpawnSuspendOnly];
-}
-
-// ── Probe: try posix_spawn with ONLY START_SUSPENDED (no RESLIDE) ──
-- (void)probeSpawnSuspendOnly {
-    [self log:@"\n── probeSpawnSuspendOnly: posix_spawn(START_SUSPENDED only)? ──"];
-
-    NSString *ownPath = [[NSBundle mainBundle] executablePath];
-    pid_t pid = -1;
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    short flags = POSIX_SPAWN_START_SUSPENDED;
-    int rc = posix_spawnattr_setflags(&attr, flags);
-    [self log:[NSString stringWithFormat:@"posix_spawnattr_setflags(0x%x): rc=%d", flags, rc]];
-    if (rc != 0) {
-        [self log:@"!! START_SUSPENDED not supported"];
-        posix_spawnattr_destroy(&attr);
-        return;
-    }
-
-    char *args[] = { (char *)[ownPath UTF8String], "--rie-child-suspend", NULL };
-    rc = posix_spawn(&pid, [ownPath UTF8String], NULL, &attr, args, NULL);
-    posix_spawnattr_destroy(&attr);
-
-    if (rc != 0) {
-        [self log:[NSString stringWithFormat:@"!! posix_spawn(START_SUSPENDED only) failed: %s (errno=%d)", strerror(rc), rc]];
-        return;
-    }
-
-    [self log:[NSString stringWithFormat:@"SUCCESS: pid=%d spawned SUSPENDED (no RESLIDE)", pid]];
-    // Clean up
-    kill(pid, SIGKILL);
-    waitpid(pid, NULL, 0);
-    [self log:@"child cleaned up."];
+    // Quick DYLD env check (getenv only)
+    [self log:@"\n── DYLD env check ──"];
+    const char *dsr = getenv("DYLD_SHARED_REGION");
+    const char *dsc = getenv("DYLD_SHARED_CACHE_DIR");
+    [self log:[NSString stringWithFormat:@"DYLD_SHARED_REGION=%s", dsr ?: "(unset)"]];
+    [self log:[NSString stringWithFormat:@"DYLD_SHARED_CACHE_DIR=%s", dsc ?: "(unset)"]];
 }
 
 // ── Probe: test posix_spawn(RESLIDE+SUSPENDED) + task_for_pid viability ──
