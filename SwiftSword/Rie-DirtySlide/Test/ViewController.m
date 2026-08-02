@@ -142,7 +142,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v1 ==="];
+    [self log:@"=== Rie DirtySlide v2 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -486,13 +486,16 @@ typedef struct {
 
         if (fd_main >= 0) {
             rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
-            fs.fs_file_start = 0;
+            // Read code signature offset/size from the file's own dyld header
             uint8_t hb[0x40]; pread(fd_main, hb, 0x40, 0);
-            fs.fs_blob_start = (void*)(uintptr_t)(*(uint64_t*)(hb+0x28));
-            fs.fs_blob_size = (size_t)(*(uint64_t*)(hb+0x30));
+            uint64_t cs_off = *(uint64_t*)(hb+0x28);
+            uint64_t cs_sz  = *(uint64_t*)(hb+0x30);
+            fs.fs_file_start = (off_t)cs_off;   // offset IN FILE where CS blob is
+            fs.fs_blob_start = NULL;            // read from file, not memory
+            fs.fs_blob_size  = (size_t)cs_sz;
             int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
-            [self log:[NSString stringWithFormat:@"F_ADDFILESIGS rc=%d cs_off=0x%llx cs_sz=0x%zx",
-                rc, *(uint64_t*)(hb+0x28), fs.fs_blob_size]];
+            [self log:[NSString stringWithFormat:@"F_ADDFILESIGS rc=%d cs_off=0x%llx cs_sz=0x%llx file_start=%lld",
+                rc, cs_off, cs_sz, (long long)fs.fs_file_start]];
         }
 
         // ── Build file entries ──
