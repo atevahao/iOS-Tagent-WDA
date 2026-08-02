@@ -29,22 +29,48 @@ jobs:
           xxd -l 64 "$KC"
           echo ""
 
-          # ipsw kernel dec handles IMG4 + decompression directly
-          echo "=== Running ipsw kernel dec ==="
-          ipsw kernel dec "$KC" -o kc_decrypted 2>&1
+          # Step 1: Extract IM4P payload from IMG4 container
+          echo "=== Step 1: ipsw img4 extract ==="
+          ipsw img4 extract "$KC" -o kc_im4p 2>&1
+          echo ""
+
+          echo "=== IM4P output ==="
+          ls -lh kc_im4p* 2>&1
+          echo ""
+
+          # Find the IM4P payload file
+          if [ -f kc_im4p ]; then
+            KC_PAYLOAD=kc_im4p
+          else
+            KC_PAYLOAD=$(find . -maxdepth 1 -name "kc_im4p*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$KC_PAYLOAD" ]; then
+            echo "FATAL: IMG4 extract produced no output"
+            exit 1
+          fi
+
+          echo "=== Payload: $KC_PAYLOAD ($(wc -c < "$KC_PAYLOAD") bytes) ==="
+          file "$KC_PAYLOAD" 2>&1 || true
+          xxd -l 32 "$KC_PAYLOAD"
+          echo ""
+
+          # Step 2: Decompress bvx2 → raw kernelcache Mach-O
+          echo "=== Step 2: ipsw kernel dec ==="
+          ipsw kernel dec "$KC_PAYLOAD" -o kc_decrypted 2>&1
           echo ""
 
           echo "=== Decrypted output ==="
           ls -lhR kc_decrypted* 2>&1 || true
           echo ""
 
-          # Find the actual Mach-O (might be file or in directory)
+          # Find the actual Mach-O
           if [ -f kc_decrypted ]; then
             KC_MACHO=kc_decrypted
           elif [ -d kc_decrypted ]; then
             KC_MACHO=$(find kc_decrypted -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
           else
-            KC_MACHO=$(find . -name "kc_decrypted*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
+            KC_MACHO=$(find . -maxdepth 1 -name "kc_decrypted*" -type f ! -name "*.a" ! -name "*.dylib" 2>/dev/null | head -1)
           fi
 
           if [ -z "$KC_MACHO" ]; then
@@ -57,8 +83,6 @@ jobs:
           echo "=== Mach-O: $KC_MACHO ==="
           file "$KC_MACHO"
           ls -lh "$KC_MACHO"
-
-          # Set output for next step
           echo "kc_macho=$KC_MACHO" >> $GITHUB_ENV
 
       - name: Extract kexts
