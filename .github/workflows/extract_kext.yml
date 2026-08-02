@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ipsw
-        run: brew install blacktop/tap/ipsw
+        run: HOMEBREW_NO_REQUIRE_TAP_TRUST=1 brew install blacktop/tap/ipsw
 
       - name: Download kernelcache
         run: |
