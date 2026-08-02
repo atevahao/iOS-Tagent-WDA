@@ -330,8 +330,17 @@ typedef struct {
     Rie_VMReadOverwriteFn vmr = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
     if (!vmr) { [self log:@"!! no vmr"]; return; }
 
-    // Read main cache header from shared region (cache starts at MWS[0]=0x180000000)
-    uint64_t cacheBase = 0x180000000ULL;
+    // Read main cache header from shared region
+    // check_np returns first cache header address (e.g. 0x199f10000),
+    // NOT the MWS[0] mapping address (0x180000000)
+    long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
+    uint64_t cacheBase = 0;
+    long cr = sc(294, &cacheBase);
+    if (cr != 0 || cacheBase == 0) {
+        [self log:@"!! check_np failed, cannot find cache header"];
+        return;
+    }
+    [self log:[NSString stringWithFormat:@"cacheBase from check_np: 0x%llx", cacheBase]];
     uint8_t hdr[0x1000];
     rie_mach_vm_size_t got = 0;
     if (vmr(mach_task_self(), cacheBase, sizeof(hdr),
