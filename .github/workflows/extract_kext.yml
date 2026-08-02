@@ -31,7 +31,7 @@ jobs:
 
           # Step 1: Extract IM4P payload from IMG4 container
           echo "=== Step 1: ipsw img4 extract ==="
-          ipsw img4 extract "$KC" -o kc_im4p 2>&1
+          ipsw img4 extract "$KC" --im4p -o kc_im4p 2>&1
           echo ""
 
           echo "=== IM4P output ==="
