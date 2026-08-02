@@ -9456,7 +9456,7 @@ static uint64_t rie_find_exec_base(task_t task,
             [self appendLog:@"!! vm_region_recurse or vm_read_overwrite not available"];
         } else {
             #define RIE_SR_BASE   0x180000000ULL
-            #define RIE_SR_LIMIT  (RIE_SR_BASE + 0x72000000ULL)
+            #define RIE_SR_LIMIT  (RIE_SR_BASE + 0x82000000ULL)
             rie_mach_vm_address_t walk = RIE_SR_BASE;
             rie_mach_vm_size_t segSize = 0;
             natural_t segDepth = 1;
