@@ -402,30 +402,6 @@ typedef struct {
     }
 }
 
-            uint32_t insn = *(uint32_t*)(textBuf + j);
-            if (insn == 0xD4000081) {
-                uint64_t insnAddr = textAddr + scanOff + j;
-                uint32_t prev = (j >= 4) ? *(uint32_t*)(textBuf + j - 4) : 0;
-                uint16_t movzVal = 0;
-                if ((prev & 0xFFE00000) == 0xD2800000) {
-                    movzVal = (uint16_t)((prev >> 5) & 0xFFFF);
-                }
-                [self log:[NSString stringWithFormat:@"SVC[%zu] @0x%llx insn=0x%08x prev=0x%08x movz_x16=%u(0x%x)",
-                    svcFound, (unsigned long long)insnAddr, insn, prev, movzVal, movzVal]];
-                svcFound++;
-            }
-        }
-    }
-    free(textBuf);
-
-    if (svcFound == 0) {
-        [self log:@"!! No SVC #0x80 found in dyld __TEXT (first 256KB)"];
-    } else {
-        [self log:[NSString stringWithFormat:@"Found %zu SVC instructions in dyld __TEXT", svcFound]];
-    }
-}
-
-
 // ── Probe: test posix_spawn(RESLIDE+SUSPENDED) + task_for_pid viability ──
 - (void)probeChildSpawn {
     [self log:@"\n── Testing child spawn + task_for_pid... ──"];
