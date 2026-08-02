@@ -23,14 +23,14 @@ jobs:
           KC=$(find . -maxdepth 1 -name "kernelcache.*" -type f | head -1)
           echo "Kernelcache: $KC"
           ls -lh "$KC"
-          ipsw kernel dec -i "$KC" -o kc_decrypted 2>&1
+          ipsw kernel dec "$KC" -o kc_decrypted 2>&1
           ls -lh kc_decrypted*
 
       - name: Extract AppleJPEGDriver
         run: |
           KC=$(find . -name "kc_decrypted" -type f | head -1)
           rm -rf kexts && mkdir -p kexts
-          ipsw kernel extract --kexts -i "$KC" -o kexts/ 2>&1
+          ipsw kernel extract --kexts "$KC" -o kexts/ 2>&1
           echo "=== JPEG kexts ==="
           find kexts/ -iname "*jpeg*" -o -iname "*AppleJPEG*" 2>&1
 
