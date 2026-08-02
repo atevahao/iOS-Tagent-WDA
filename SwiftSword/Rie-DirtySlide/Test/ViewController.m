@@ -417,11 +417,30 @@ typedef struct {
         return;
     }
 
-    // Read dyld's Mach-O header
-    uint8_t mhdr[0x4000];
-    if (vmr(mach_task_self(), dyldAddr, sizeof(mhdr),
-            (rie_mach_vm_address_t)(uintptr_t)mhdr, &got) != KERN_SUCCESS || got < sizeof(uint32_t)*4) {
-        [self log:@"!! cannot read dyld Mach-O"];
+    // Read dyld's Mach-O header (try page at a time)
+    uint8_t mhdr[0x1000];
+    kern_return_t kr = vmr(mach_task_self(), dyldAddr, sizeof(mhdr),
+            (rie_mach_vm_address_t)(uintptr_t)mhdr, &got);
+    if (kr != KERN_SUCCESS) {
+        [self log:[NSString stringWithFormat:@"!! vmr(dyld) failed: kr=%d(%s)", kr, mach_error_string(kr)]];
+        // Try vm_read as fallback
+        vm_offset_t vdata = 0;
+        mach_msg_type_number_t vsize = 0;
+        if (vm_read(mach_task_self(), dyldAddr, 0x1000, &vdata, &vsize) == KERN_SUCCESS) {
+            memcpy(mhdr, (void*)vdata, vsize < sizeof(mhdr) ? vsize : sizeof(mhdr));
+            got = vsize;
+            vm_deallocate(mach_task_self(), vdata, vsize);
+            if (got < sizeof(uint32_t)*4) {
+                [self log:[NSString stringWithFormat:@"!! vm_read only got %llu bytes", got]];
+                return;
+            }
+        } else {
+            [self log:@"!! vm_read also failed"];
+            return;
+        }
+    }
+    if (got < sizeof(uint32_t)*4) {
+        [self log:[NSString stringWithFormat:@"!! read too small: %llu bytes", got]];
         return;
     }
 
