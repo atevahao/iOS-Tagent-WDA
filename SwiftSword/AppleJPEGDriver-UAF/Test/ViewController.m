@@ -62,6 +62,12 @@ kern_return_t IOConnectCallStructMethod(io_connect_t connect,
                                         size_t inputStructCnt,
                                         void *outputStruct,
                                         size_t *outputStructCnt);
+kern_return_t IOConnectCallScalarMethod(io_connect_t connect,
+                                        uint32_t selector,
+                                        const uint64_t *input,
+                                        uint32_t inputCnt,
+                                        uint64_t *output,
+                                        uint32_t *outputCnt);
 kern_return_t IOConnectCallMethod(io_connect_t connect,
                                   uint32_t selector,
                                   const uint64_t *input,
