@@ -29,9 +29,16 @@ jobs:
           xxd -l 64 "$KC"
           echo ""
 
-          # Step 1: Extract IM4P payload from IMG4 container
-          echo "=== Step 1: ipsw img4 extract ==="
-          ipsw img4 extract "$KC" --im4p -o kc_im4p 2>&1
+          # Step 1: Extract IM4P payload
+          # The downloaded file is an IM4P file (not IMG4 container).
+          # Try img4 extract first, fall back to im4p extract.
+          echo "=== Step 1: Extract IM4P payload ==="
+          if ipsw img4 extract "$KC" --im4p -o kc_im4p 2>&1; then
+            echo "img4 extract succeeded"
+          else
+            echo "img4 extract failed, trying im4p extract..."
+            ipsw img4 im4p extract "$KC" -o kc_im4p 2>&1
+          fi
           echo ""
 
           echo "=== IM4P output ==="
@@ -46,7 +53,7 @@ jobs:
           fi
 
           if [ -z "$KC_PAYLOAD" ]; then
-            echo "FATAL: IMG4 extract produced no output"
+            echo "FATAL: IM4P extract produced no output"
             exit 1
           fi
 
