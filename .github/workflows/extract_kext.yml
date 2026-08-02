@@ -38,7 +38,7 @@ jobs:
         run: |
           KC=$(find . -name "kc_decrypted" -type f | head -1)
           rm -rf kexts && mkdir -p kexts
-          ipsw kernel extract --kexts "$KC" -o kexts/ 2>&1
+          ipsw kernel extract "$KC" --all -o kexts/ 2>&1
           echo "=== JPEG kexts ==="
           find kexts/ -iname "*jpeg*" -o -iname "*AppleJPEG*" 2>&1
 
