@@ -24,6 +24,7 @@
 #import <sys/stat.h>
 #import <sys/wait.h>
 #import <spawn.h>
+#import <mach-o/loader.h>
 
 // ── Rie types (same as reference exploit sr_cfg.h) ──
 #ifndef _POSIX_SPAWN_RESLIDE
