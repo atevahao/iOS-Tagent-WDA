@@ -619,6 +619,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 }
 
 #pragma mark - Status
+
+- (void)setStatus:(NSString *)text {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.statusLabel.text = text;
     });
