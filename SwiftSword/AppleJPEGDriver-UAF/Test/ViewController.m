@@ -10,8 +10,21 @@
 //
 
 #import "ViewController.h"
-#import <IOSurface/IOSurfaceRef.h>
 #import <mach/mach.h>
+
+// ── IOSurface declarations (private framework, no public headers) ──
+typedef struct __IOSurface *IOSurfaceRef;
+typedef uint32_t IOSurfaceID;
+extern const CFStringRef kIOSurfaceWidth;
+extern const CFStringRef kIOSurfaceHeight;
+extern const CFStringRef kIOSurfaceBytesPerElement;
+extern const CFStringRef kIOSurfacePixelFormat;
+IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
+IOSurfaceID  IOSurfaceGetID(IOSurfaceRef surface);
+kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+void        *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+size_t       IOSurfaceGetAllocSize(IOSurfaceRef surface);
 
 // ── IOKit declarations (not in public iOS headers) ──
 extern const mach_port_t kIOMainPortDefault;
