@@ -12,31 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone base
-        run: git clone --depth=1 https://github.com/zeroxjf/CVE-2026-28992-IOHIDFamily-FastPathUserClient-Race-Conditions.git base
-
-      - name: Copy JPEGUAF files
-        run: |
-          cp SwiftSword/AppleJPEGDriver-UAF/ViewController.m base/UAFPoc/UAFPoc/ViewController.m
-          cp SwiftSword/AppleJPEGDriver-UAF/ViewController.h base/UAFPoc/UAFPoc/ViewController.h
-          cp SwiftSword/AppleJPEGDriver-UAF/AppDelegate.m    base/UAFPoc/UAFPoc/AppDelegate.m
-          cp SwiftSword/AppleJPEGDriver-UAF/AppDelegate.h    base/UAFPoc/UAFPoc/AppDelegate.h
-          cp SwiftSword/AppleJPEGDriver-UAF/SceneDelegate.m  base/UAFPoc/UAFPoc/SceneDelegate.m
-          cp SwiftSword/AppleJPEGDriver-UAF/SceneDelegate.h  base/UAFPoc/UAFPoc/SceneDelegate.h
-          cp SwiftSword/AppleJPEGDriver-UAF/Info.plist       base/UAFPoc/UAFPoc/Info.plist
-          cp SwiftSword/AppleJPEGDriver-UAF/main.m           base/UAFPoc/UAFPoc/main.m
-          rm -f base/UAFPoc/UAFPoc/SwordIntents.swift
-
       - name: Build
         run: |
-          cd base/UAFPoc
-          xcodebuild -project UAFPoc.xcodeproj -scheme UAFPoc \
+          cd SwiftSword/AppleJPEGDriver-UAF
+          xcodebuild -project JPEGUAF.xcodeproj -scheme Test \
             -sdk iphoneos -configuration Debug \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            SWIFT_VERSION=5.0 \
-            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
-            OTHER_LDFLAGS="-framework IOKit -framework IOSurface" \
             -derivedDataPath DerivedData 2>&1 | tee build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           grep -iE "error|warning" build.log | head -40
@@ -49,7 +31,7 @@ jobs:
           [ -z "$APP" ] && { echo "No .app"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          codesign -s - -f Payload/UAFPoc.app 2>&1 || true
+          codesign -s - -f Payload/Test.app 2>&1 || true
           zip -0 -r JPEGUAF_iOS26.ipa Payload/
           ls -lh JPEGUAF_iOS26.ipa
 
