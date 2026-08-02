@@ -121,6 +121,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @interface ViewController ()
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *panicButton;
+@property (nonatomic, strong) UIButton *reclaimButton;
+@property (nonatomic, strong) UIButton *triggerButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -140,6 +142,26 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     self.panicButton.contentVerticalAlignment = UIControlContentVerticalAlignmentFill;
     self.panicButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.panicButton addTarget:self action:@selector(panicPressed) forControlEvents:UIControlEventTouchUpInside];
+
+    // Reclaim button (UAF Characterize)
+    self.reclaimButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.reclaimButton setTitle:@"UAF Reclaim" forState:UIControlStateNormal];
+    self.reclaimButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.reclaimButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.reclaimButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:0.9 alpha:1.0];
+    self.reclaimButton.layer.cornerRadius = 12;
+    self.reclaimButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.reclaimButton addTarget:self action:@selector(reclaimPressed) forControlEvents:UIControlEventTouchUpInside];
+
+    // Trigger button (Path 3B)
+    self.triggerButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.triggerButton setTitle:@"Path 3B Trigger" forState:UIControlStateNormal];
+    self.triggerButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.triggerButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.triggerButton.backgroundColor = [UIColor colorWithRed:0.9 green:0.4 blue:0.1 alpha:1.0];
+    self.triggerButton.layer.cornerRadius = 12;
+    self.triggerButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.triggerButton addTarget:self action:@selector(triggerPressed) forControlEvents:UIControlEventTouchUpInside];
 
     // Status label
     self.statusLabel = [[UILabel alloc] init];
@@ -161,19 +183,29 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     self.logView.alpha = 0;
 
     [self.view addSubview:self.panicButton];
+    [self.view addSubview:self.reclaimButton];
+    [self.view addSubview:self.triggerButton];
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [self.panicButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.panicButton.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-40],
+        [self.panicButton.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-80],
         [self.panicButton.widthAnchor constraintEqualToConstant:260],
         [self.panicButton.heightAnchor constraintEqualToConstant:260],
-        [self.statusLabel.topAnchor constraintEqualToAnchor:self.panicButton.bottomAnchor constant:30],
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.panicButton.bottomAnchor constant:16],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:20],
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-20],
-        [self.logView.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:12],
+        [self.reclaimButton.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
+        [self.reclaimButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:30],
+        [self.reclaimButton.trailingAnchor constraintEqualToAnchor:self.view.centerXAnchor constant:-8],
+        [self.reclaimButton.heightAnchor constraintEqualToConstant:50],
+        [self.triggerButton.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
+        [self.triggerButton.leadingAnchor constraintEqualToAnchor:self.view.centerXAnchor constant:8],
+        [self.triggerButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-30],
+        [self.triggerButton.heightAnchor constraintEqualToConstant:50],
+        [self.logView.topAnchor constraintEqualToAnchor:self.reclaimButton.bottomAnchor constant:12],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
@@ -187,7 +219,6 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 - (void)panicPressed {
     if (self.running) return;
 
-    // Animate button press
     [UIView animateWithDuration:0.1 animations:^{
         self.panicButton.transform = CGAffineTransformMakeScale(0.9, 0.9);
     } completion:^(BOOL finished) {
@@ -196,13 +227,50 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         }];
     }];
 
-    // Show log area
     [UIView animateWithDuration:0.3 animations:^{
         self.logView.alpha = 1.0;
     }];
 
     [self setStatus:@"Spraying..."];
     [self sprayLeak:1000];
+}
+
+- (void)reclaimPressed {
+    if (self.running) return;
+
+    [UIView animateWithDuration:0.1 animations:^{
+        self.reclaimButton.transform = CGAffineTransformMakeScale(0.9, 0.9);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.1 animations:^{
+            self.reclaimButton.transform = CGAffineTransformIdentity;
+        }];
+    }];
+
+    [UIView animateWithDuration:0.3 animations:^{
+        self.logView.alpha = 1.0;
+    }];
+
+    [self setStatus:@"Reclaim test..."];
+    [self uafCharacterize];
+}
+
+- (void)triggerPressed {
+    if (self.running) return;
+
+    [UIView animateWithDuration:0.1 animations:^{
+        self.triggerButton.transform = CGAffineTransformMakeScale(0.9, 0.9);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.1 animations:^{
+            self.triggerButton.transform = CGAffineTransformIdentity;
+        }];
+    }];
+
+    [UIView animateWithDuration:0.3 animations:^{
+        self.logView.alpha = 1.0;
+    }];
+
+    [self setStatus:@"Path 3B running..."];
+    [self triggerPath3B];
 }
 
 #pragma mark - Status
