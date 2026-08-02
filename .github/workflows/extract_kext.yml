@@ -20,69 +20,110 @@ jobs:
 
       - name: Decrypt kernelcache
         run: |
+          set -e
           KC=$(find . -maxdepth 1 -name "kernelcache.*" -type f | head -1)
-          echo "Kernelcache: $KC"
+          echo "=== File info ==="
           ls -lh "$KC"
-          echo "=== First 256 bytes (hex) ==="
-          xxd -l 256 "$KC"
-          echo "=== IMG4 info ==="
-          ipsw img4 info "$KC" 2>&1 || true
-          echo "=== Trying img4 extract ==="
-          ipsw img4 extract "$KC" -o kc_raw 2>&1 || true
-          ls -lh kc_raw* 2>&1 || true
-          echo "=== Trying kernel dec directly ==="
-          ipsw kernel dec "$KC" -o kc_decrypted 2>&1 || true
-          ls -lh kc_decrypted* 2>&1 || true
-
-      - name: Extract AppleJPEGDriver
-        run: |
-          # Find the actual kernelcache Mach-O file
-          echo "=== All files ==="
-          find . -name "kc_decrypted*" -o -name "kernelcache*" 2>&1 | head -20
-          echo ""
-          echo "=== Recursive listing ==="
-          find . -name "kc*" -type f 2>&1 | while read f; do
-            echo "--- $f ---"
-            file "$f"
-            ls -lh "$f"
-          done
-          # The dec tool outputs to a dir; find the real kernelcache inside
-          KC_DIR=$(find . -name "kc_decrypted*" -type d | head -1)
-          if [ -n "$KC_DIR" ]; then
-            KC=$(find "$KC_DIR" -type f | head -1)
-          else
-            KC=""
-          fi
-          if [ -z "$KC" ]; then
-            KC=$(find . -name "kernelcache" -type f | head -1)
-          fi
-          echo ""
-          echo "=== Using: $KC ==="
           file "$KC"
+          echo ""
+          echo "=== First 64 bytes hex ==="
+          xxd -l 64 "$KC"
+          echo ""
+
+          # Try IMG4 extraction first
+          echo "=== IMG4 info ==="
+          ipsw img4 info "$KC" 2>&1 || echo "(img4 info failed)"
+
+          echo "=== IMG4 extract ==="
+          if ipsw img4 extract "$KC" -o kc_payload 2>&1; then
+            echo "IMG4 extract succeeded"
+            ls -lh kc_payload* 2>&1
+            if [ -f kc_payload ]; then
+              KC_PAYLOAD=kc_payload
+            else
+              KC_PAYLOAD=$(find kc_payload* -type f 2>/dev/null | head -1)
+            fi
+            file "$KC_PAYLOAD" 2>&1 || true
+            echo "=== Trying kernel dec on payload ==="
+            ipsw kernel dec "$KC_PAYLOAD" -o kc_out 2>&1 || echo "(kernel dec failed)"
+          else
+            echo "IMG4 extract failed, trying direct dec..."
+            ipsw kernel dec "$KC" -o kc_out 2>&1 || echo "(kernel dec failed)"
+          fi
+
+          echo ""
+          echo "=== Output files ==="
+          find . -name "kc_*" -o -name "kc_payload*" 2>&1
+          ls -lhR kc_out* 2>&1 || true
+
+      - name: Extract kexts
+        run: |
+          set -e
+          # Find the kernelcache Mach-O
+          # Could be: kc_out/kernelcache, kc_out (file), or kc_payload file
+          KC_MACHO=""
+          for candidate in $(find . -name "kc_out*" -o -name "kc_decrypted*" 2>/dev/null); do
+            if [ -f "$candidate" ] && ! echo "$candidate" | grep -qE "\.a$|\.dylib$"; then
+              ft=$(file "$candidate" 2>/dev/null)
+              if echo "$ft" | grep -qi "mach-o"; then
+                KC_MACHO="$candidate"
+                break
+              fi
+            fi
+          done
+          # Check inside kc_out/ directory
+          if [ -z "$KC_MACHO" ] && [ -d kc_out ]; then
+            KC_MACHO=$(find kc_out -type f 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$KC_MACHO" ]; then
+            echo "ERROR: No kernelcache Mach-O found"
+            echo "=== All files in workspace ==="
+            find . -type f 2>&1 | head -30
+            exit 1
+          fi
+
+          echo "=== Kernelcache Mach-O: $KC_MACHO ==="
+          file "$KC_MACHO"
+          ls -lh "$KC_MACHO"
+
+          echo "=== Extracting all kexts ==="
           rm -rf kexts && mkdir -p kexts
-          ipsw kernel extract "$KC" --all -o kexts/ 2>&1
-          echo "=== JPEG kexts ==="
-          find kexts/ -iname "*jpeg*" -o -iname "*AppleJPEG*" 2>&1
+          ipsw kernel extract "$KC_MACHO" --all -o kexts/ 2>&1 || true
+
+          echo "=== Looking for AppleJPEGDriver ==="
+          find kexts/ -iname "*jpeg*" -o -iname "*AppleJPEG*" 2>&1 || true
+          ls kexts/ 2>&1 | head -20 || true
 
       - name: Disassemble
         run: |
-          JPEG_KEXT=$(find kexts/ -iname "*AppleJPEG*" -type f | head -1)
+          JPEG_KEXT=$(find kexts/ -iname "*AppleJPEG*" -type f 2>/dev/null | head -1)
+          if [ -z "$JPEG_KEXT" ]; then
+            JPEG_KEXT=$(find kexts/ -iname "*.jpeg*" -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$JPEG_KEXT" ]; then
+            echo "No AppleJPEGDriver found. Available kexts:"
+            ls kexts/ 2>&1
+            exit 1
+          fi
+
           echo "=== File: $JPEG_KEXT ==="
           file "$JPEG_KEXT"
           echo ""
           echo "=== Key Symbols ==="
-          nm "$JPEG_KEXT" 2>&1 | grep -iE "finish|speed|queue|startDecoder|gated|fullSpeed|interrupt" | head -50
+          nm "$JPEG_KEXT" 2>&1 | grep -iE "finish|speed|queue|startDecoder|gated|fullSpeed|interrupt|begin_io" | head -50
           echo ""
           echo "=== finish_io_gated ==="
-          otool -tV "$JPEG_KEXT" 2>&1 | grep -A 100 "finish_io_gated:" | head -120
+          otool -tV "$JPEG_KEXT" 2>&1 | grep -A 120 "finish_io_gated:" | head -140
           echo ""
           echo "=== fullSpeedRequestExist ==="
-          otool -tV "$JPEG_KEXT" 2>&1 | grep -A 100 "fullSpeedRequestExist:" | head -120
+          otool -tV "$JPEG_KEXT" 2>&1 | grep -A 120 "fullSpeedRequestExist:" | head -140
 
       - uses: actions/upload-artifact@v4
         with:
           name: AppleJPEGDriver-kext
           path: |
             kexts/
-            kc_decrypted
+            kc_out
+            kc_payload
           retention-days: 7
