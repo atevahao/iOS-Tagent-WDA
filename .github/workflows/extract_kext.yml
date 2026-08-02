@@ -1,0 +1,45 @@
+name: Extract AppleJPEGDriver Kext
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ipsw
+        run: brew install blacktop/tap/ipsw
+
+      - name: Download kernelcache
+        run: |
+          ipsw download kernelcache --device iPhone14,5 --build 23C55 \
+            --output kernelcache.release 2>&1
+
+      - name: Extract AppleJPEGDriver
+        run: |
+          ipsw kernel dec -i kernelcache.release -o kc_decrypted 2>&1
+          ipsw macho dump-kext AppleJPEGDriver -i kc_decrypted \
+            -o AppleJPEGDriver.kext 2>&1 || true
+          # Alternative: extract all kexts and find AppleJPEGDriver
+          ipsw kernel extract --kexts -i kernelcache.release -o kexts/ 2>&1 || true
+          find . -name "*AppleJPEG*" -o -name "*jpeg*" 2>&1 || true
+          ls -la kexts/ 2>&1 | head -20 || true
+
+      - name: Dump disassembly
+        run: |
+          find . -name "*AppleJPEG*" -type f 2>&1
+          for f in $(find . -name "*AppleJPEG*" -type f); do
+            otool -tV "$f" 2>&1 | head -500 || true
+            nm "$f" 2>&1 | grep -iE "finish|speed|queue|startDecoder|gated" || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppleJPEGDriver-kext
+          path: |
+            AppleJPEGDriver.kext
+            kexts/
+          retention-days: 7
