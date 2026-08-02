@@ -36,7 +36,10 @@ jobs:
 
       - name: Extract AppleJPEGDriver
         run: |
-          KC=$(find . -name "kc_decrypted" -type f | head -1)
+          KC=$(find . -path "*/kc_decrypted*" -type f -not -name "*.development*" | head -1)
+          if [ -z "$KC" ]; then KC=$(find . -name "kc_decrypted" -type d | head -1); fi
+          echo "KC: $KC"
+          ls -lh "$KC" 2>&1 || file "$KC"
           rm -rf kexts && mkdir -p kexts
           ipsw kernel extract "$KC" --all -o kexts/ 2>&1
           echo "=== JPEG kexts ==="
