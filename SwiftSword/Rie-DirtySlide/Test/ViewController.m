@@ -144,8 +144,20 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v8 ==="];
+    [self log:@"=== Rie DirtySlide v9 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
+
+    // Check if we were re-exec'd with custom env
+    BOOL isReexec = NO;
+    NSArray *progArgs = [[NSProcessInfo processInfo] arguments];
+    for (NSString *a in progArgs) {
+        if ([a containsString:@"--rie-reexec"]) { isReexec = YES; break; }
+    }
+    if (isReexec) {
+        [self log:@"!! RE-EXEC DETECTED — execve works on iOS!"];
+        const char *dsr = getenv("DYLD_SHARED_REGION");
+        [self log:[NSString stringWithFormat:@"DYLD_SHARED_REGION=%s", dsr ?: "(null)"]];
+    }
     [self log:@""];
 
     // Auto-detect: if relaunched, show info immediately
@@ -311,6 +323,86 @@ typedef struct {
 
     // Test child spawn viability
     [self probeChildSpawn];
+
+    // Test DYLD_SHARED_REGION=private
+    [self probeDyldPrivate];
+}
+
+// ── Probe: DYLD_SHARED_REGION=private + re-exec ──
+- (void)probeDyldPrivate {
+    [self log:@"\n── probeDyldPrivate: DYLD_SHARED_REGION? ──"];
+
+    // 1. Check known DYLD_* env vars
+    const char *dyldVars[] = {
+        "DYLD_SHARED_REGION", "DYLD_SHARED_CACHE_DIR",
+        "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+        "DYLD_INSERT_LIBRARIES", "DYLD_PRINT_ENV",
+        "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX",
+        "DYLD_FORCE_FLAT_NAMESPACE", "DYLD_PRINT_LIBRARIES",
+        "DYLD_SHARED_CACHE_DONT_VALIDATE",
+    };
+    int nVars = sizeof(dyldVars)/sizeof(dyldVars[0]);
+    int foundAny = 0;
+    for (int i = 0; i < nVars; i++) {
+        const char *val = getenv(dyldVars[i]);
+        if (val) {
+            [self log:[NSString stringWithFormat:@"  getenv(%s)=%s", dyldVars[i], val]];
+            foundAny++;
+        }
+    }
+    if (!foundAny) {
+        [self log:@"  No DYLD_* env vars set."];
+    }
+
+    // Also try NSProcessInfo for full env
+    NSDictionary *env = [[NSProcessInfo processInfo] processEnvironment];
+    [self log:[NSString stringWithFormat:@"  NSProcessInfo env count: %lu", (unsigned long)env.count]];
+    NSArray *dyldKeys = [[env allKeys] filteredArrayUsingPredicate:
+        [NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'DYLD'"]];
+    for (NSString *k in [dyldKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        [self log:[NSString stringWithFormat:@"  ENV[%@]=%@", k, env[k]]];
+    }
+
+    // 2. Try setenv + getenv (process-local test)
+    int sr = setenv("DYLD_SHARED_REGION", "private", 1);
+    const char *check = getenv("DYLD_SHARED_REGION");
+    [self log:[NSString stringWithFormat:@"setenv(DYLD_SHARED_REGION=private): rc=%d getenv=%s", sr, check ?: "(null)"]];
+
+    // 3. Try execve to re-launch ourselves with this env var
+    [self probeReexec];
+}
+
+- (void)probeReexec {
+    [self log:@"\n── probeReexec: execve self with DYLD_SHARED_REGION=private? ──"];
+
+    NSString *ownPath = [[NSBundle mainBundle] executablePath];
+    const char *bin = [ownPath UTF8String];
+
+    // Build custom envp
+    extern char **environ;
+    int envCount = 0;
+    while (environ[envCount]) envCount++;
+
+    char **newEnv = (char **)malloc((envCount + 2) * sizeof(char *));
+    for (int i = 0; i < envCount; i++) {
+        newEnv[i] = environ[i];
+    }
+    newEnv[envCount] = "DYLD_SHARED_REGION=private";
+    newEnv[envCount + 1] = NULL;
+
+    char *argv[] = { (char *)bin, "--rie-reexec", NULL };
+
+    // Flush flag so relaunch works
+    fflush(stdout); fflush(stderr);
+    usleep(50000);
+
+    [self log:@"  Calling execve() — if this works, you won't see this log..."];
+    execve(bin, argv, newEnv);
+
+    int saved = errno;
+    [self log:[NSString stringWithFormat:@"  execve failed: %s (errno=%d)", strerror(saved), saved]];
+    [self log:[NSString stringWithFormat:@"  Sandbox=%d, EPERM=%d", (saved == EPERM), EPERM]];
+    free(newEnv);
 }
 
 // ── Probe: test posix_spawn(RESLIDE+SUSPENDED) + task_for_pid viability ──
@@ -423,7 +515,7 @@ typedef struct {
 // ── Stage 3: First-mapper exploit via syscall 536 (v8: child spawn probe) ──
 - (void)runFirstMapper {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"\n── Stage 3: Rie v8 First-Mapper ──"];
+        [self log:@"\n── Stage 3: Rie v9 First-Mapper ──"];
         [self clearRelaunchFlag];
 
         long (*sc)(int, ...) = dlsym(RTLD_DEFAULT, "syscall");
