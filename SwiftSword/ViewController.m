@@ -9447,13 +9447,33 @@ static uint64_t rie_find_exec_base(task_t task,
         // ── Phase E: Direct syscall 536 — parse cache from SR memory, build blob ──
         [self appendLog:@"\n── Phase E: direct syscall 536 (no child, fd=-1 inject) ──"];
 
-        // Step 1: read dyld cache header from shared region memory @ 0x180000000
-        const uint8_t *sr_base = (const uint8_t *)0x180000000ULL;
-        uint32_t hdrMagic; memcpy(&hdrMagic, sr_base, 4);
-        [self appendLog:[NSString stringWithFormat:@"SR[0x180000000] magic=0x%08x '%.4s'", hdrMagic, (char*)&hdrMagic]];
-        if (hdrMagic != 0x64796c64) {
-            [self appendLog:@"!! not a dyld_v1 header at 0x180000000"];
+        // On iOS, 0x180000000 is a VM submap — direct deref causes SIGSEGV/SIGBUS.
+        // Use mach_vm_read_overwrite to read through the submap via kernel VM.
+        Rie_VMReadOverwriteFn rie_vmRead = (Rie_VMReadOverwriteFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        if (!rie_vmRead) {
+            [self appendLog:@"!! mach_vm_read_overwrite not available — skipping Phase E"];
         } else {
+            #define RIE_SR_BUF_SIZE 0x4000
+            uint8_t *sr_heap = (uint8_t *)malloc(RIE_SR_BUF_SIZE);
+            if (!sr_heap) {
+                [self appendLog:@"!! sr_heap alloc failed"];
+            } else {
+                memset(sr_heap, 0, RIE_SR_BUF_SIZE);
+                rie_mach_vm_size_t rie_outSize = 0;
+                kern_return_t rie_kr = rie_vmRead(mach_task_self(), 0x180000000ULL,
+                    RIE_SR_BUF_SIZE, (rie_mach_vm_address_t)(uintptr_t)sr_heap, &rie_outSize);
+                if (rie_kr != KERN_SUCCESS) {
+                    [self appendLog:[NSString stringWithFormat:@"!! vm_read SR failed: kr=%d", rie_kr]];
+                } else {
+                    [self appendLog:[NSString stringWithFormat:@"vm_read SR: got %llu bytes",
+                        (unsigned long long)rie_outSize]];
+                    const uint8_t *sr_base = sr_heap;
+                    uint32_t hdrMagic; memcpy(&hdrMagic, sr_base, 4);
+                    [self appendLog:[NSString stringWithFormat:@"SR[0x180000000] magic=0x%08x '%.4s'",
+                        hdrMagic, (char*)&hdrMagic]];
+                    if (hdrMagic != 0x64796c64) {
+                        [self appendLog:@"!! not a dyld_v1 header at 0x180000000"];
+                    } else {
             #define RIE_RD32(off) (*(uint32_t*)(sr_base + (off)))
             #define RIE_RD64(off) (*(uint64_t*)(sr_base + (off)))
             uint32_t mws_off  = RIE_RD32(0x138);
@@ -9622,9 +9642,14 @@ static uint64_t rie_find_exec_base(task_t task,
                     }
                     close(cacheFD);
                 }
-                #undef MWS_SIZE
-            }
-        }
+                        #undef MWS_SIZE
+                    }
+                }
+                }  // close vm_read success else
+                free(sr_heap);
+            }  // close sr_heap else
+            #undef RIE_SR_BUF_SIZE
+        }  // close rie_vmRead else
 
         // ── Phase B: API availability scan ──
         [self appendLog:@"\n── Phase B: API availability scan ──"];
