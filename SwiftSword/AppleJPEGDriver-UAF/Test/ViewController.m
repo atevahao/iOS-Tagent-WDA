@@ -43,7 +43,6 @@ typedef io_object_t io_connect_t;
 typedef io_object_t io_iterator_t;
 
 extern const mach_port_t kIOMainPortDefault;
-#define IO_OBJECT_NULL ((io_object_t)0)
 
 kern_return_t IOServiceGetMatchingServices(mach_port_t mainPort,
                                            CFDictionaryRef matching,
@@ -84,10 +83,6 @@ kern_return_t IORegistryEntryCreateCFProperties(io_object_t entry,
                                                 CFMutableDictionaryRef *properties,
                                                 CFAllocatorRef allocator,
                                                 uint32_t options);
-kern_return_t IORegistryEntryGetParentIterator(io_object_t entry,
-                                                const char *plane,
-                                                io_iterator_t *iterator);
-extern const char *kIOServicePlane;
 
 // AppleJPEGDriverIOStruct: 0x58 (88) bytes
 // Reverse-engineered from startDecoder (sub_FFFFFE00096470A4) and
@@ -448,40 +443,6 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
             }
         }
 
-        // 1b: Parent IORegistry properties (IOService plane above JPEG)
-        {
-            io_iterator_t parents = IO_OBJECT_NULL;
-            kr = IORegistryEntryGetParentIterator(svc, kIOServicePlane, &parents);
-            [self log:@"Parent iter: kr=0x%x", kr];
-            if (kr == KERN_SUCCESS && parents) {
-                io_object_t parent;
-                int pidx = 0;
-                while ((parent = IOIteratorNext(parents)) && pidx < 4) {
-                    CFMutableDictionaryRef pprops = NULL;
-                    kr = IORegistryEntryCreateCFProperties(parent, &pprops,
-                        kCFAllocatorDefault, 0);
-                    if (pprops) {
-                        NSDictionary *pd = (__bridge_transfer NSDictionary *)pprops;
-                        [self log:@"Parent[%d]: %lu entries", pidx, (unsigned long)pd.count];
-                        for (NSString *key in pd) {
-                            id val = pd[key];
-                            if ([val isKindOfClass:[NSNumber class]]) {
-                                int64_t v = [(NSNumber *)val longLongValue];
-                                if (v != 0) {
-                                    uint64_t uv = (uint64_t)v;
-                                    uint64_t hi = uv >> 40;
-                                    if (hi == 0xfffffe || hi == 0xffffff)
-                                        [self log:@"  %@ = 0x%016llx *** KP", key, uv];
-                                }
-                            }
-                        }
-                    }
-                    IOObjectRelease(parent);
-                    pidx++;
-                }
-                IOObjectRelease(parents);
-            }
-        }
 
         // ========================================================
         // PHASE 2: Decode with real JPEG, dump output struct
